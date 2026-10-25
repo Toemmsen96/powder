@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# powder-launcher: open the Powder launcher on Linux. With no arguments it opens the GTK4/Libadwaita GUI;
+# any arguments pass straight through to the launcher's command line (show, list-mods, enable-mod, launch, ...).
+#
+# The launcher is the Python package in linux/launcher, run as `python -m launcher` with linux/ on PYTHONPATH.
+# It picks which server to run (python | rust), whether to inject the in-game overlay, the Steep folder and the
+# game command, which server mods are enabled, and the list of Powder servers; it launches Steep through
+# linux/powder-wrap (this wrapper is the window around that one). The admin / overlay Server tab needs the
+# Rust server (POWDER_SERVER=rust).
+#
+#   Desktop entry:  linux/powder-launcher.desktop  (edit its Exec= to this file's absolute path)
+#   By hand:        linux/powder-launcher                 # the GUI
+#                   linux/powder-launcher list-mods       # the CLI
+#
+# The Python interpreter is chosen like powder-wrap: the repo's .venv, else uv, else the system python3.
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+REPO=$(cd "$(dirname "$SELF")/.." && pwd)
+export PYTHONPATH="$REPO/linux${PYTHONPATH:+:$PYTHONPATH}"
+
+die() { printf 'powder-launcher: %s\n' "$*" >&2; exit 1; }
+
+# the Python to run the launcher with, into the array PY (same precedence as powder-wrap)
+if [ -x "$REPO/.venv/bin/python" ]; then
+    PY=("$REPO/.venv/bin/python")
+elif command -v uv >/dev/null; then
+    PY=(uv run --frozen --offline --project "$REPO" -- python)
+elif command -v python3 >/dev/null; then
+    PY=(python3)
+else
+    die "no Python found (install Python 3, or run 'uv sync' in $REPO)"
+fi
+
+# The GUI (no arguments) needs PyGObject + GTK4 + Libadwaita; the CLI subcommands do not, so only check then.
+if [ $# -eq 0 ] && ! "${PY[@]}" -c 'import gi' 2>/dev/null; then
+    die "the GUI needs PyGObject (python-gobject) with GTK 4 and Libadwaita (gtk4, libadwaita); install those
+        (e.g. on Arch: pacman -S python-gobject gtk4 libadwaita), or use the command line: $SELF list-mods"
+fi
+
+exec "${PY[@]}" -m launcher "$@"

@@ -497,6 +497,26 @@ Steep itself needs its certificate check intercepted; on Windows the launcher in
 Linux powder-wrap deploys a version.dll proxy of it into the game (native/version_proxy.c, experimental),
 so for now the session gets Ubisoft Connect online, and the game reports its services unavailable.
 
+### Launcher
+
+`linux/powder-launcher` is a small GTK4/Libadwaita app that drives all of this from a window instead of
+environment variables: it picks the server implementation (`python` or `rust`), toggles the in-game overlay,
+chooses which server mods are enabled, manages your list of Powder servers (a name and a Join address
+`host#<fingerprint>`), and launches Steep — through `linux/powder-wrap`, so everything above still holds (a
+per-session namespace, a private `/etc/hosts`, the local CA trusted only while the session lasts). Run it with
+no arguments for the GUI:
+
+```
+linux/powder-launcher
+```
+
+The same wrapper is also a command line for the parts you want to script (`linux/powder-launcher list-mods`,
+`linux/powder-launcher launch`, and so on). It runs the Python package in `linux/launcher` with the repo's
+`.venv` if there is one, else `uv`, else the system `python3`; the GUI needs PyGObject with GTK 4 and
+Libadwaita installed (on Arch: `python-gobject gtk4 libadwaita`). `linux/powder-launcher.desktop` is a desktop
+entry for a menu or launcher — edit its `Exec=` to the absolute path of `linux/powder-launcher`. The overlay
+and its admin Server tab need the Rust server (`POWDER_SERVER=rust`).
+
 ## Mods
 
 The Rust server replaces the Python plugins with **mods**, in the `mods/` folder next to `config.toml`

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Powder Launcher
+Comment=Launch Steep against a self-hosted Powder server
+# Edit Exec= to the absolute path of linux/powder-launcher in your clone of the repository,
+# e.g. Exec=/home/you/powder/linux/powder-launcher  (or put the script on your PATH and use Exec=powder-launcher).
+Exec=/path/to/powder/linux/powder-launcher
+Terminal=false
+Categories=Game;
+Icon=applications-games
+Keywords=Steep;Ubisoft;Powder;game;
