@@ -28,14 +28,15 @@ pub struct ServerConfig {
     pub country: String,
     pub region: String,
     pub log_level: String,
-    /// Refuse UbiServices/NEX tickets this server did not issue.
+    /// Refuse UbiServices/NEX tickets this server did not issue (always so when `public`); off, an unknown one
+    /// (e.g. after a restart) is the latest session from the same address.
     pub strict_tickets: bool,
     /// The server's name, shown by the launcher and in /_powder/status.
     pub name: String,
     /// A short text for players (rules, contact), shown by the launcher.
     pub motd: String,
-    /// An internet-facing server: sign-ins always need an account, and /_powder/status shows a caller only
-    /// its own connections (no other players' addresses).
+    /// An internet-facing server: sign-ins always need an account, tickets are strict (strict_tickets), and
+    /// /_powder/status shows a caller only its own connections (no other players' addresses).
     pub public: bool,
     /// Profile ids of the server's admins (`admin accounts` lists them): who may use admin tools such as
     /// the admin mod's page. Ids, not emails or names, which players can change.

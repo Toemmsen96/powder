@@ -12,7 +12,12 @@
 //! Lenient mode (default, [server] strict_tickets = false): a ticket we do not know (e.g. the server was
 //! restarted while the game kept running) is not rejected; the request is attributed to the latest session from
 //! the same address (or, without accounts, via the AccountResolver) and a warning is logged. Strict mode refuses
-//! it.
+//! it; a public server ([server] public) is always strict.
+//!
+//! The game's own login (`uplaypc_v1`, a ticket Ubisoft Connect made that we cannot read) is the player whose
+//! Connect signed in last from the same address. Nothing we serve ties that ticket to one Connect session (the
+//! demux hands Connect a random "Uplay PC ticket", not checked to be the one the game sends), so players behind
+//! one NAT address who start their games at the same time can be taken for each other there.
 //!
 //! Passwords are hashed with scrypt (`scrypt$N$r$p$<salt hex>$<key hex>`, the Python server's format) and never
 //! logged or stored in clear. Hashing takes tens of milliseconds: async callers should run register,
@@ -392,10 +397,16 @@ impl AccountService {
         }
     }
 
+    /// Unknown tickets are refused: [server] strict_tickets, and always on a public server (the lenient
+    /// fallback would make players behind one NAT address each other).
+    pub fn strict_tickets(&self) -> bool {
+        self.config.server.strict_tickets || self.config.server.public
+    }
+
     /// HTTPS `Ubi_v1 t=` ticket or NEX LoginWithToken token -> session (lenient fallback, see the module doc).
     pub fn session_for_ticket(&self, ticket: &str, client_ip: &str) -> anyhow::Result<Option<Arc<PlayerSession>>> {
         let s = if ticket.is_empty() { None } else { self.sessions.by_token(ticket) };
-        if s.is_some() || self.config.server.strict_tickets {
+        if s.is_some() || self.strict_tickets() {
             return Ok(s);
         }
         if self.required()? {
@@ -586,5 +597,15 @@ mod tests {
         assert!(acc.required().unwrap());
         assert!(matches!(acc.login(&LoginRequest::new("10.0.0.2", "uplaypc_v1", "jwe")), Err(Error::Auth(_))));
         assert!(acc.session_for_ticket("stale", "10.0.0.2").unwrap().is_none());
+        // strict tickets: an unknown ticket is never the latest session from its address (one NAT, two players)
+        assert!(acc.strict_tickets());
+        acc.create_account("ann@example.org", "correct horse", "Ann").unwrap();
+        let c = acc.login(&basic("10.0.0.2", "ann@example.org", "correct horse", CONNECT_APP_ID)).unwrap();
+        assert!(acc.session_for_ticket("stale", "10.0.0.2").unwrap().is_none());
+        assert!(acc.session_for_ticket("", "10.0.0.2").unwrap().is_none());
+        assert_eq!(acc.session_for_ticket(&c.ticket, "10.0.0.9").unwrap().unwrap().session_id, c.session_id);
+        // the game's own login still follows Connect on the same address
+        let g = acc.login(&LoginRequest::new("10.0.0.2", "uplaypc_v1", "jwe")).unwrap();
+        assert_eq!(g.profile_id(), c.profile_id());
     }
 }

@@ -5,6 +5,7 @@
 //! Request pipeline (outermost first), as in the Python server:
 //!   access log      one line per request; uploaded remotelog/events bodies are kept (they explain client errors)
 //!   CORS            Ubisoft Connect's web UI calls UbiServices from its embedded browser: preflights, Allow-Origin
+//!                   (Ubisoft's origins only; other origins may only GET / HEAD, see connect_origin)
 //!   mods            `api.before_http` hooks may answer a request themselves
 //!   session         `Authorization: Ubi_v1 t=<ticket>` -> the player's session (handed to the routes)
 //!   routes          method + path pattern -> handler, in the Python server's registration order:
@@ -223,6 +224,18 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
         keep_upload(state, req);
     }
     let origin = req.header("Origin").map(str::to_string);
+    if let Some(foreign) = origin.as_deref().filter(|o| !connect_origin(o)) {
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            // a web page elsewhere (the hosts file sends the player's browser here too): no preflight, no writes
+            log::warn!(target: "powder.https", "{} {} from {} refused: origin {foreign:?} is not Ubisoft Connect's",
+                       req.method, req.path(), req.client_ip());
+            let reply = Reply::json(&json!({"errorCode": 1, "message": "origin not allowed", "httpCode": 403}),
+                                    "cors-refused", 403);
+            access_log(req, &reply.how, reply.status, &reply.body.len().to_string());
+            return reply;
+        }
+    }
+    let origin = origin.filter(|o| connect_origin(o));
     let mut reply = match &origin {
         Some(_) if req.method == "OPTIONS" && req.headers.contains_key("Access-Control-Request-Method") => {
             let mut r = Reply { status: 200, headers: vec![], body: vec![], how: "cors-preflight".into() };
@@ -247,6 +260,21 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
     }
     access_log(req, &reply.how, reply.status, &reply.body.len().to_string());
     reply
+}
+
+/// Whether a request's Origin is Ubisoft Connect's embedded browser: its UI and overlay come from Ubisoft's CDN
+/// (https://connect.cdn.ubisoft.com, https://<env>connect.cdn.ubisoft.com, ...), so https and a ubisoft.com /
+/// ubi.com host. Only these get CORS headers (with credentials); a foreign origin's GET / HEAD is answered
+/// without them (the browser hides the reply), anything else from one is refused. The game, the launcher and
+/// Connect's own client send no Origin.
+fn connect_origin(origin: &str) -> bool {
+    let Some(rest) = origin.get(..8).filter(|s| s.eq_ignore_ascii_case("https://")).map(|_| &origin[8..]) else {
+        return false;
+    };
+    let host = rest.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(rest, |(h, _)| h).to_ascii_lowercase();
+    let valid = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    valid && ["ubisoft.com", "ubi.com"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 /// One line per request (the size is "-" for a websocket, as aiohttp's content_length is None).
@@ -620,11 +648,46 @@ mod tests {
         assert_eq!(r.how, "gamedata:exact");
         assert_eq!(r.body, br#"{"a": 1}"#);
         assert_eq!(header(&r, "access-control-allow-origin"), Some("https://connect.cdn.ubisoft.com"));
-        let pre = handle(&st, &req("OPTIONS", "/v1/spaces/x", &[("origin", "https://o"),
+        let pre = handle(&st, &req("OPTIONS", "/v1/spaces/x", &[("origin", "https://uat-connect.cdn.ubisoft.com"),
                                                               ("access-control-request-method", "POST"),
                                                               ("access-control-request-headers", "ubi-appid")]));
         assert_eq!((pre.status, pre.how.as_str()), (200, "cors-preflight"));
         assert_eq!(header(&pre, "access-control-allow-headers"), Some("ubi-appid"));
+    }
+
+    /// Only Ubisoft Connect's origins get CORS (with credentials): a web page elsewhere, which the hosts file
+    /// also sends here, can neither read replies nor send anything but GET / HEAD.
+    #[test]
+    fn cors_only_for_connects_origins() {
+        for ok in ["https://connect.cdn.ubisoft.com", "https://uat-connect.cdn.ubisoft.com", "https://ubisoft.com",
+                   "https://store.ubi.com", "HTTPS://Connect.CDN.Ubisoft.com:443"] {
+            assert!(connect_origin(ok), "{ok}");
+        }
+        for foreign in ["null", "http://connect.cdn.ubisoft.com", "https://evil.com", "https://ubisoft.com.evil.com",
+                        "https://evilubisoft.com", "https://evil.com/.ubisoft.com", "https://a@ubisoft.com", "",
+                        "file://", "https://ubisoft.com:x"] {
+            assert!(!connect_origin(foreign), "{foreign}");
+        }
+        let st = state(vec![], None);
+        let evil = [("Origin", "https://evil.example"), ("Access-Control-Request-Method", "POST"),
+                    ("Access-Control-Request-Headers", "authorization")];
+        let pre = handle(&st, &req("OPTIONS", "/v3/profiles/sessions", &evil));
+        assert_eq!((pre.status, pre.how.as_str()), (403, "cors-refused"));
+        assert!(header(&pre, "access-control-allow-origin").is_none());
+        assert!(header(&pre, "access-control-allow-headers").is_none());
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            let r = handle(&st, &req(method, "/_powder/account/register", &evil[..1]));
+            assert_eq!((r.status, body(&r)), (403, json!({"errorCode": 1, "message": "origin not allowed",
+                                                            "httpCode": 403})), "{method}");
+        }
+        let r = handle(&st, &req("GET", "/v1/nothing", &evil[..1]));
+        assert_eq!((r.status, r.how.as_str()), (200, "UNMATCHED"), "a GET is answered, without CORS");
+        for name in ["access-control-allow-origin", "access-control-allow-credentials", "access-control-expose-headers"] {
+            assert!(header(&r, name).is_none(), "{name}");
+        }
+        let r = handle(&st, &req("GET", "/_powder/overlay/powder.js", &evil[..1]));
+        assert_eq!(header(&r, "access-control-allow-origin"), Some("*"), "the overlay part's own stays");
+        assert!(header(&r, "access-control-allow-credentials").is_none());
     }
 
     #[test]

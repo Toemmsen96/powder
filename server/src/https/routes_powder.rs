@@ -350,9 +350,10 @@ mod tests {
         let script = String::from_utf8(r.body).unwrap();
         assert!(script.contains(r#"Powder.apiVersion = "1.1.0""#) && script.contains(r#"_export("default", Powder)"#));
         // from Connect's overlay (an Origin): its origin replaces the "*", as aiohttp's CORS middleware does
-        let r = handle(&st, &req("GET", "/_powder/overlay/powder.js", &[("Origin", "https://overlay")]));
+        let overlay = "https://connect.cdn.ubisoft.com";
+        let r = handle(&st, &req("GET", "/_powder/overlay/powder.js", &[("Origin", overlay)]));
         let allowed: Vec<_> = r.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"))
             .map(|(_, v)| v.as_str()).collect();
-        assert_eq!(allowed, ["https://overlay"]);
+        assert_eq!(allowed, [overlay]);
     }
 }
