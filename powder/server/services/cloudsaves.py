@@ -30,6 +30,7 @@ log = logging.getLogger("powder.cloudsaves")
 TYPE = "cloudSave"
 NAME = re.compile(r"^upcCloudSaveUplayId_(\d{1,10})$")
 SLOT = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+PROFILE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")   # lower-case GUID
 LINK_LIFETIME_S = 3600
 # One cloud save for several products: Steep's Ubisoft Connect version (3279) and Steam version (3280) keep
 # their saves in the same format (same header and slot layout), so a player keeps one save across both.
@@ -96,10 +97,17 @@ class CloudSaveService:
         return {**e, "name": entity_name(product)}          # under the name Connect asked for (shared saves)
 
     # ---- files ------------------------------------------------------------------------------------
+    def folder(self, profile_id: str) -> Path:
+        """A player's folder; the profile id is checked to be a GUID (it is joined into a path)."""
+        pid = str(profile_id).lower()
+        if not PROFILE.fullmatch(pid):
+            raise CloudSaveError(f"bad profile id {str(profile_id)[:40]!r}")
+        return self.root / pid
+
     def path(self, profile_id: str, product: int, slot: str) -> Path:
         if not SLOT.match(slot):
             raise CloudSaveError(f"bad slot name {slot!r}")
-        return self.root / profile_id.lower() / str(shared(product)) / f"{slot}.savegame"
+        return self.folder(profile_id) / str(shared(int(product))) / f"{slot}.savegame"
 
     def link(self, profile_id: str, product: int, slot: str, md5: str | None = None, method: str = "PUT") -> str:
         """A one-hour token for one slot of this player's save: uploading (PUT), downloading (GET), DELETE."""
@@ -166,7 +174,7 @@ class CloudSaveService:
             if product is not None and item["product"] != product:
                 continue
             self.repos.entities.delete(item["entity"]["entityId"])
-            folder = self.root / profile_id.lower() / str(item["product"])
+            folder = self.folder(profile_id) / str(int(item["product"]))
             for f in folder.glob("*") if folder.exists() else ():
                 f.unlink()
             if folder.exists():

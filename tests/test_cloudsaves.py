@@ -197,3 +197,14 @@ def test_admin_listing_and_deleting(services, player):
     assert item["product"] == PRODUCT and item["complete"]
     assert services.cloudsaves.delete(me) == 1
     assert services.cloudsaves.all(me) == [] and not services.cloudsaves.path(me, PRODUCT, "1").exists()
+
+
+def test_profile_ids_are_checked_before_they_become_paths(services):
+    from powder.server.services.cloudsaves import CloudSaveError
+    me = services.default_player_id()
+    assert services.cloudsaves.path(me.upper(), PRODUCT, "1") == services.cloudsaves.path(me, PRODUCT, "1")
+    for bad in ("../../etc", "..", "", "00000000-0000-4000-8000-00000000000/", "c:\\x", me + "/.."):
+        with pytest.raises(CloudSaveError, match="bad profile id"):
+            services.cloudsaves.path(bad, PRODUCT, "1")
+        with pytest.raises(CloudSaveError):
+            services.cloudsaves.link(bad, PRODUCT, "1")
