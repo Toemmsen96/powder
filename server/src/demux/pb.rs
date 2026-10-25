@@ -86,32 +86,33 @@ pub fn decode(b: &[u8]) -> Result<Vec<F>> {
             }
             LEN => {
                 let (n, next) = read_varint(b, i)?;
-                let n = n as usize;
-                if next + n > b.len() {
-                    bail!("truncated length-delimited field");
-                }
-                i = next + n;
-                V::Bytes(b[next..next + n].to_vec())
+                let (start, end) = (next, end_of(next, n, b.len(), "truncated length-delimited field")?);
+                i = end;
+                V::Bytes(b[start..end].to_vec())
             }
             FIXED64 => {
-                if i + 8 > b.len() {
-                    bail!("truncated field");
-                }
-                i += 8;
-                V::Fixed64(b[i - 8..i].try_into()?)
+                let (start, end) = (i, end_of(i, 8, b.len(), "truncated field")?);
+                i = end;
+                V::Fixed64(b[start..end].try_into()?)
             }
             FIXED32 => {
-                if i + 4 > b.len() {
-                    bail!("truncated field");
-                }
-                i += 4;
-                V::Fixed32(b[i - 4..i].try_into()?)
+                let (start, end) = (i, end_of(i, 4, b.len(), "truncated field")?);
+                i = end;
+                V::Fixed32(b[start..end].try_into()?)
             }
             _ => bail!("unsupported wire type {wt}"),
         };
         out.push(F(num, value));
     }
     Ok(out)
+}
+
+/// `start + n` if that is within `len`: a length read off the wire may be anything (a huge varint must not wrap).
+fn end_of(start: usize, n: u64, len: usize, what: &str) -> Result<usize> {
+    match usize::try_from(n).ok().and_then(|n| start.checked_add(n)) {
+        Some(end) if end <= len => Ok(end),
+        _ => bail!("{what}"),
+    }
 }
 
 /// The fields of `b`, or None when it isn't a message.
@@ -261,5 +262,18 @@ mod tests {
         assert_eq!(int(&replaced, 1), Some(7));
         assert_eq!(unframe(&frame(b"abc")).unwrap(), b"abc");
         assert!(try_decode(&[0x0a, 0x05, 0x01]).is_none());
+    }
+
+    /// A length that would overflow `next + n` (it wrapped in release builds, then the slice panicked).
+    #[test]
+    fn huge_lengths_are_errors_not_panics() {
+        for n in [u64::MAX, u64::MAX - 1, usize::MAX as u64 - 1] {
+            let mut raw = vec![0x0a];
+            varint(n, &mut raw);
+            raw.push(0x01);
+            assert!(decode(&raw).unwrap_err().to_string().contains("truncated"), "{n}");
+            assert!(try_decode(&raw).is_none());
+        }
+        assert!(decode(&[0x09, 1, 2, 3]).is_err() && decode(&[0x0d, 1, 2, 3]).is_err(), "short fixed64 / fixed32");
     }
 }

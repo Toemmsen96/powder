@@ -23,7 +23,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_MESSAGE: usize = 16 << 20;
+/// The largest upstream message accepted; a longer one closes the connection. Connect's own are small (the
+/// largest, the sign-in with its ticket, is a few KB; cloud saves go over HTTPS links), so 1 MiB is generous.
+/// (The big replies, owned games and product configurations, go the other way and are not limited.)
+pub const MAX_MESSAGE: usize = 1 << 20;
+/// A message's buffer grows as its bytes arrive, from this much: a length header alone allocates little.
+const READ_CHUNK: usize = 64 << 10;
 /// Never fetched: there is no newer version.
 pub const PATCH_BASE_URL: &str = "https://static3.cdn.ubi.com/orbit/releases/0/patches/";
 
@@ -42,6 +47,24 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin + Send>(mut stream: S, peer: 
                                      | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe) => Ok(()),
         other => Ok(other?),
     }
+}
+
+/// The next upstream message (unframed); None: its length is over [`MAX_MESSAGE`] (logged; the connection is
+/// closed). Read as it arrives, so a length header with nothing behind it costs no more than what was sent.
+async fn read_message<S: AsyncRead + Unpin>(stream: &mut S, peer: &str) -> std::io::Result<Option<Vec<u8>>> {
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    let n = u32::from_be_bytes(head) as usize;
+    if n > MAX_MESSAGE {
+        log::warn!(target: "powder.demux", "{peer}: message of {n} bytes (at most {MAX_MESSAGE}), closing");
+        return Ok(None);
+    }
+    let mut msg = Vec::with_capacity(n.min(READ_CHUNK));
+    (&mut *stream).take(n as u64).read_to_end(&mut msg).await?;
+    if msg.len() < n {
+        return Err(ErrorKind::UnexpectedEof.into());
+    }
+    Ok(Some(msg))
 }
 
 /// The state of one connection; [`Connection::handle`] turns one upstream message into the downstream ones.
@@ -69,15 +92,7 @@ impl Connection {
 
     async fn serve<S: AsyncRead + AsyncWrite + Unpin>(&mut self, stream: &mut S) -> std::io::Result<()> {
         loop {
-            let mut head = [0u8; 4];
-            stream.read_exact(&mut head).await?;
-            let n = u32::from_be_bytes(head) as usize;
-            if n > MAX_MESSAGE {
-                log::warn!(target: "powder.demux", "{}: message of {n} bytes, closing", self.peer);
-                return Ok(());
-            }
-            let mut msg = vec![0u8; n];
-            stream.read_exact(&mut msg).await?;
+            let Some(msg) = read_message(stream, &self.peer).await? else { return Ok(()) };
             let out = self.handle(&msg);
             if !out.is_empty() {
                 for m in out {
@@ -292,5 +307,32 @@ impl Connection {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn messages_are_read_within_the_limit() {
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        client.write_all(&pb::frame(b"\x08\x01")).await.unwrap();
+        assert_eq!(read_message(&mut server, "p").await.unwrap().unwrap(), b"\x08\x01");
+        // over the limit: refused from the header alone
+        client.write_all(&((MAX_MESSAGE + 1) as u32).to_be_bytes()).await.unwrap();
+        assert!(read_message(&mut server, "p").await.unwrap().is_none());
+        // a header announcing much more than follows: an EOF, after buffering only what arrived
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        client.write_all(&(MAX_MESSAGE as u32).to_be_bytes()).await.unwrap();
+        client.write_all(b"0123456789").await.unwrap();
+        drop(client);
+        assert_eq!(read_message(&mut server, "p").await.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        // exactly the limit is fine
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let big = vec![7u8; MAX_MESSAGE];
+        let writer = tokio::spawn(async move { client.write_all(&pb::frame(&big)).await.unwrap() });
+        assert_eq!(read_message(&mut server, "p").await.unwrap().unwrap().len(), MAX_MESSAGE);
+        writer.await.unwrap();
     }
 }
