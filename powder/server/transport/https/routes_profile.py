@@ -16,7 +16,7 @@ from aiohttp import web
 from ...constants import APP_ID, SPACE_ID
 from ...services import friends
 from ...util import clip, iso_now
-from .keys import HOW, SERVICES, SESSION
+from .keys import HOW, SERVICES
 from .routes_ubi import acting, json_response, reader
 
 log = logging.getLogger("powder.https")
