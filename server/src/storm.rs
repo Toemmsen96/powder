@@ -68,8 +68,22 @@ const CONNECT: u8 = 0x44;
 const CONFIRM: u8 = 0x40; // 0x1340: registration confirmed
 const ID_LEN: usize = 16;
 const KEY_LEN: usize = 8;
-/// Forgotten without keep-alives.
+/// Forgotten without keep-alives (the game sends one every ~8 s).
 pub const PEER_TTL_S: f64 = 120.0;
+/// The same for a peer that has not answered with its key (see `Peer::confirmed`).
+pub const UNCONFIRMED_TTL_S: f64 = 30.0;
+/// Peers at most, in all and per IP (a game registers from one socket or two; a LAN party shares an IP). When
+/// full, the oldest unconfirmed peer makes room; with none, a REGISTER goes unanswered.
+pub const MAX_PEERS: usize = 4096;
+pub const MAX_PEERS_PER_IP: usize = 32;
+/// Datagrams we send to one IP: a burst of REPLY_BURST, then REPLIES_PER_S. The game's own: a keep-alive every
+/// ~8 s per socket, about two connect requests a second while joining, a few detections at start.
+pub const REPLY_BURST: f64 = 40.0;
+pub const REPLIES_PER_S: f64 = 20.0;
+/// Most bytes of addresses a connect request may pass on to its target (the game sends three 8-byte items).
+pub const MAX_CONNECT_ADDRESSES: usize = 128;
+/// How often forgotten peers are swept.
+const SWEEP_S: f64 = 1.0;
 
 /// Ports, as offsets from the base port (11000): detect 1 and its other port, detect 2 and its other port.
 pub const DETECT_PORTS: [u8; 4] = [0, 1, 2, 3];
@@ -114,6 +128,10 @@ pub struct Peer {
     /// Its game socket, once seen.
     pub game_addr: Option<SocketAddrV4>,
     seen: f64,
+    /// We handed out its id and it answered with the key (a spoofed REGISTER never sees the key). Unconfirmed
+    /// peers (also those taken as they say after a restart) expire sooner and make room first.
+    confirmed: bool,
+    issued: bool,
     /// Target id -> when its request was last logged.
     connects: HashMap<[u8; ID_LEN], f64>,
 }
@@ -123,8 +141,20 @@ pub type Out = (Vec<u8>, SocketAddrV4, u8);
 
 /// Detection and traversal state, transport-free: `received` returns what to send. Times are seconds on any
 /// monotonic clock.
+///
+/// Bounded (unlike the Python server): a message naming a known peer must carry its key (else it is ignored, so
+/// nobody can move another game's address or speak for it), peers are capped in all and per IP, we send at most
+/// REPLIES_PER_S datagrams a second to one IP (whatever a spoofed source asks for: REGISTER's answer is ~5x its
+/// request), and forgotten peers are swept every SWEEP_S, found by address through an index.
 pub struct Storm {
     pub peers: HashMap<[u8; ID_LEN], Peer>,
+    /// Registration socket -> peer id.
+    by_addr: HashMap<SocketAddrV4, [u8; ID_LEN]>,
+    /// Peers per registration IP.
+    per_ip: HashMap<Ipv4Addr, usize>,
+    /// Destination IP -> (datagrams left, when counted).
+    budgets: HashMap<Ipv4Addr, (f64, f64)>,
+    last_sweep: f64,
     next_id: u32,
 }
 
@@ -137,7 +167,8 @@ impl Default for Storm {
 impl Storm {
     pub fn new() -> Storm {
         // unlike ids games kept over a restart
-        Storm { peers: HashMap::new(), next_id: 1 + rand::random::<u32>() % (1 << 30) }
+        Storm { peers: HashMap::new(), by_addr: HashMap::new(), per_ip: HashMap::new(), budgets: HashMap::new(),
+                last_sweep: f64::NEG_INFINITY, next_id: 1 + rand::random::<u32>() % (1 << 30) }
     }
 
     fn new_id(&mut self) -> [u8; ID_LEN] {
@@ -150,8 +181,90 @@ impl Storm {
         id
     }
 
+    fn insert_peer(&mut self, peer: Peer) {
+        *self.per_ip.entry(*peer.addr.ip()).or_default() += 1;
+        self.by_addr.insert(peer.addr, peer.id);
+        if let Some(old) = self.peers.insert(peer.id, peer) {
+            self.unindex(&old);
+        }
+    }
+
+    fn unindex(&mut self, peer: &Peer) {
+        if self.by_addr.get(&peer.addr) == Some(&peer.id) {
+            self.by_addr.remove(&peer.addr);
+        }
+        if let Some(n) = self.per_ip.get_mut(peer.addr.ip()) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(peer.addr.ip());
+            }
+        }
+    }
+
+    fn remove_peer(&mut self, id: &[u8; ID_LEN]) {
+        if let Some(peer) = self.peers.remove(id) {
+            self.unindex(&peer);
+        }
+    }
+
+    /// Room for one more peer from `ip`: under the caps, or after forgetting the oldest unconfirmed peer (of that
+    /// IP when it is the IP that is full).
+    fn make_room(&mut self, ip: Ipv4Addr) -> bool {
+        let ip_full = self.per_ip.get(&ip).copied().unwrap_or(0) >= MAX_PEERS_PER_IP;
+        if !ip_full && self.peers.len() < MAX_PEERS {
+            return true;
+        }
+        let oldest = self.peers.values().filter(|p| !p.confirmed && (!ip_full || *p.addr.ip() == ip))
+            .min_by(|a, b| a.seen.total_cmp(&b.seen)).map(|p| p.id);
+        match oldest {
+            Some(id) => {
+                self.remove_peer(&id);
+                true
+            }
+            None => {
+                log::warn!(target: "powder.storm", "storm: no room for a peer from {ip} ({} peers, at most {MAX_PEERS}, \
+                           {MAX_PEERS_PER_IP} per IP)", self.peers.len());
+                false
+            }
+        }
+    }
+
+    fn sweep(&mut self, now: f64) {
+        if now - self.last_sweep < SWEEP_S {
+            return;
+        }
+        self.last_sweep = now;
+        let expired: Vec<[u8; ID_LEN]> = self.peers.values()
+            .filter(|p| now - p.seen > if p.confirmed { PEER_TTL_S } else { UNCONFIRMED_TTL_S })
+            .map(|p| p.id).collect();
+        for id in expired {
+            self.remove_peer(&id);
+        }
+        // a full budget needs no entry
+        self.budgets.retain(|_, (left, at)| *left + (now - *at).max(0.0) * REPLIES_PER_S < REPLY_BURST);
+    }
+
+    /// One datagram to `ip`, if its budget allows.
+    fn take_budget(&mut self, ip: Ipv4Addr, now: f64) -> bool {
+        let (left, at) = self.budgets.entry(ip).or_insert((REPLY_BURST, now));
+        *left = (*left + (now - *at).max(0.0) * REPLIES_PER_S).min(REPLY_BURST);
+        *at = now;
+        if *left < 1.0 {
+            log::debug!(target: "powder.storm", "storm: datagram to {ip} dropped (over {REPLIES_PER_S}/s)");
+            return false;
+        }
+        *left -= 1.0;
+        true
+    }
+
     /// A datagram on one of our ports (port: offset from the base port).
     pub fn received(&mut self, now: f64, port: u8, data: &[u8], addr: SocketAddrV4) -> Vec<Out> {
+        self.sweep(now);
+        let out = self.handle(now, port, data, addr);
+        out.into_iter().filter(|(_, to, _)| self.take_budget(*to.ip(), now)).collect()
+    }
+
+    fn handle(&mut self, now: f64, port: u8, data: &[u8], addr: SocketAddrV4) -> Vec<Out> {
         let (msg, framed) = unframe(data);
         if msg.len() < 4 || !(msg[0] == REQUEST || msg[0] == ANSWER) {
             log::debug!(target: "powder.storm", "storm: {} bytes from {addr} on +{port} ignored", data.len());
@@ -174,17 +287,20 @@ impl Storm {
         if port != TRAVERSAL_PORT {
             return vec![];
         }
-        self.peers.retain(|_, p| now - p.seen <= PEER_TTL_S);
         if kind == REQUEST && mtype == REGISTER {
-            let existing = self.peers.values().find(|p| p.addr == addr).map(|p| p.id);
-            let id = match existing {
+            let id = match self.by_addr.get(&addr).copied() {
                 Some(id) => id,
                 None => {
+                    if !self.make_room(*addr.ip()) {
+                        return vec![];
+                    }
                     let id = self.new_id();
                     let mut key = [0x02, 0x02, 0, 0, 0, 0, 0, 0];
                     key[4..].copy_from_slice(&rand::random::<[u8; 4]>());
-                    self.peers.insert(id, Peer { id, key, addr, game_addr: None, seen: now, connects: HashMap::new() });
-                    log::info!(target: "powder.storm", "storm: {} registered as peer {}", addr.ip(), hex::encode(&id[12..]));
+                    self.insert_peer(Peer { id, key, addr, game_addr: None, seen: now, confirmed: false, issued: true,
+                                            connects: HashMap::new() });
+                    log::debug!(target: "powder.storm", "storm: {} registers as peer {}", addr.ip(),
+                                hex::encode(&id[12..]));
                     id
                 }
             };
@@ -196,8 +312,11 @@ impl Storm {
         if body.len() < ID_LEN + KEY_LEN {
             return vec![];
         }
-        let peer = self.peer(now, &body[..ID_LEN], &body[ID_LEN..ID_LEN + KEY_LEN], addr, framed);
-        let (id, key) = (peer.id, peer.key);
+        let id: [u8; ID_LEN] = body[..ID_LEN].try_into().unwrap();
+        let key: [u8; KEY_LEN] = body[ID_LEN..ID_LEN + KEY_LEN].try_into().unwrap();
+        if !self.peer(now, id, key, addr, framed) {
+            return vec![];
+        }
         if kind == ANSWER && mtype == REGISTERED {
             reply(REPLY, CONFIRM, &[&key, &id])
         } else if kind == REQUEST && mtype == KEEPALIVE {
@@ -206,6 +325,11 @@ impl Storm {
         } else if kind == REQUEST && mtype == CONNECT && body.len() >= 2 * ID_LEN + KEY_LEN {
             let target_id: [u8; ID_LEN] = body[ID_LEN + KEY_LEN..2 * ID_LEN + KEY_LEN].try_into().unwrap();
             let addresses = &body[2 * ID_LEN + KEY_LEN..];
+            if addresses.len() > MAX_CONNECT_ADDRESSES {
+                log::debug!(target: "powder.storm", "storm: connect request with {} bytes of addresses ignored",
+                            addresses.len());
+                return vec![];
+            }
             let Some(target_addr) = self.peers.get(&target_id).map(|t| t.addr) else {
                 log::warn!(target: "powder.storm", "storm: peer {} asks for unknown peer {}", hex::encode(&id[12..]),
                            hex::encode(&target_id[12..]));
@@ -225,20 +349,40 @@ impl Storm {
         }
     }
 
-    /// The registered peer; one we don't know (e.g. the server restarted) is taken as it says.
-    fn peer(&mut self, now: f64, id: &[u8], key: &[u8], addr: SocketAddrV4, framed: bool) -> &mut Peer {
-        let id: [u8; ID_LEN] = id.try_into().unwrap();
-        let peer = self.peers.entry(id).or_insert_with(|| {
-            log::info!(target: "powder.storm", "storm: {} continues as peer {}", addr.ip(), hex::encode(&id[12..]));
-            Peer { id, key: key.try_into().unwrap(), addr, game_addr: None, seen: now, connects: HashMap::new() }
-        });
+    /// Note a message from a peer: a known one must give its key; one we don't know (e.g. the server restarted) is
+    /// taken as it says. False: ignore the message.
+    fn peer(&mut self, now: f64, id: [u8; ID_LEN], key: [u8; KEY_LEN], addr: SocketAddrV4, framed: bool) -> bool {
+        match self.peers.get(&id) {
+            Some(peer) if peer.key != key => {
+                log::debug!(target: "powder.storm", "storm: {addr} names peer {} with a wrong key, ignored",
+                            hex::encode(&id[12..]));
+                return false;
+            }
+            Some(_) => {}
+            None => {
+                if !self.make_room(*addr.ip()) {
+                    return false;
+                }
+                log::info!(target: "powder.storm", "storm: {} continues as peer {}", addr.ip(), hex::encode(&id[12..]));
+                self.insert_peer(Peer { id, key, addr, game_addr: None, seen: now, confirmed: false, issued: false,
+                                        connects: HashMap::new() });
+            }
+        }
+        let peer = self.peers.get_mut(&id).expect("known or inserted");
+        peer.seen = now;
+        if peer.issued && !peer.confirmed {
+            peer.confirmed = true;
+            log::info!(target: "powder.storm", "storm: {} registered as peer {}", addr.ip(), hex::encode(&id[12..]));
+        }
         if framed {
             peer.game_addr = Some(addr);
-        } else {
-            peer.addr = addr;
+        } else if peer.addr != addr {
+            let mut moved = self.peers.remove(&id).expect("known");
+            self.unindex(&moved);
+            moved.addr = addr;
+            self.insert_peer(moved);
         }
-        peer.seen = now;
-        peer
+        true
     }
 }
 
@@ -363,6 +507,87 @@ mod tests {
         s.received(0.0, TRAVERSAL_PORT, &h("1040000101010300"), a(GAME_A));
         s.received(PEER_TTL_S + 1.0, TRAVERSAL_PORT, &h("1040000101010300"), a(GAME_B));
         assert_eq!(s.peers.values().map(|p| p.addr).collect::<Vec<_>>(), vec![a(GAME_B)]);
+    }
+
+    fn id16(v: &[u8]) -> [u8; 16] {
+        v.try_into().unwrap()
+    }
+
+    /// REGISTER, then the game's 0x1141 with the key.
+    fn register_confirmed(s: &mut Storm, now: f64, addr: SocketAddrV4) -> (Vec<u8>, Vec<u8>) {
+        let out = s.received(now, TRAVERSAL_PORT, &h("1040000101010300"), addr);
+        let (id, key) = (out[0].0[4..20].to_vec(), out[0].0[20..28].to_vec());
+        assert_eq!(s.received(now, TRAVERSAL_PORT, &[h("11410002"), id.clone(), key.clone()].concat(), addr).len(), 1);
+        (id, key)
+    }
+
+    #[test]
+    fn a_known_peer_needs_its_key() {
+        let mut s = Storm::new();
+        let (a_id, a_key) = register_confirmed(&mut s, 0.0, a(GAME_A));
+        let (b_id, b_key) = register(&mut s, a(GAME_B));
+        let attacker = a("198.51.100.9:4000");
+        let wrong = [&a_key[..4], &[0, 0, 0, 0]].concat();
+        // a keep-alive in A's name: no answer, A's address stays
+        let keepalive = [h("10430003"), a_id.clone(), wrong.clone()].concat();
+        assert!(s.received(1.0, TRAVERSAL_PORT, &keepalive, attacker).is_empty());
+        let framed = [h("10430001"), a_id.clone(), wrong.clone(), TRAILER.to_vec()].concat();
+        assert!(s.received(1.0, TRAVERSAL_PORT, &framed, attacker).is_empty());
+        let p = &s.peers[&id16(&a_id)];
+        assert_eq!((p.addr, p.game_addr, p.seen), (a(GAME_A), None, 0.0));
+        // a connect request in A's name is not passed on to B
+        let req = [h("10440005"), a_id.clone(), wrong, b_id.clone(), address_item(attacker)].concat();
+        assert!(s.received(1.0, TRAVERSAL_PORT, &req, attacker).is_empty());
+        // with the key, A may move (its NAT gave it a new port): REGISTER from there finds it
+        let moved = a("192.0.2.10:50000");
+        let keepalive = [h("10430003"), a_id.clone(), a_key.clone()].concat();
+        assert_eq!(s.received(2.0, TRAVERSAL_PORT, &keepalive, moved).len(), 1);
+        assert_eq!(s.peers[&id16(&a_id)].addr, moved);
+        assert_eq!(register(&mut s, moved).0, a_id);
+        assert_ne!(register(&mut s, a(GAME_A)).0, a_id, "its old socket is no longer it");
+        // B's own key still works
+        assert_eq!(s.received(2.0, TRAVERSAL_PORT, &[h("11410002"), b_id.clone(), b_key].concat(), a(GAME_B)).len(), 1);
+    }
+
+    #[test]
+    fn peers_are_capped_and_confirmed_ones_kept() {
+        let mut s = Storm::new();
+        let (a_id, _) = register_confirmed(&mut s, 0.0, a(GAME_A));
+        // spoofed REGISTERs from A's IP, each from another port: the oldest unconfirmed make room, A stays
+        for port in 0..200u16 {
+            let from = SocketAddrV4::new([192, 0, 2, 10].into(), 1000 + port);
+            s.received(port as f64 * 0.1, TRAVERSAL_PORT, &h("1040000101010300"), from);
+        }
+        assert_eq!(s.per_ip[&Ipv4Addr::new(192, 0, 2, 10)], MAX_PEERS_PER_IP);
+        assert!(s.peers.contains_key(&id16(&a_id)));
+        assert_eq!(s.by_addr.len(), s.peers.len());
+        // unconfirmed peers go after UNCONFIRMED_TTL_S, confirmed ones after PEER_TTL_S
+        s.received(20.0 + UNCONFIRMED_TTL_S + 1.0, TRAVERSAL_PORT, &h("10010000"), a(GAME_B));
+        assert_eq!(s.peers.keys().collect::<Vec<_>>(), vec![&id16(&a_id)]);
+        assert_eq!((s.by_addr.len(), s.per_ip.len()), (1, 1));
+    }
+
+    #[test]
+    fn what_we_send_to_one_ip_is_rate_limited() {
+        let mut s = Storm::new();
+        let victim = a("203.0.113.5:3074");
+        let sent = |s: &mut Storm, now: f64, n: usize| -> usize {
+            (0..n).map(|_| s.received(now, 0, &h("10010000"), victim).len()).sum()
+        };
+        assert_eq!(sent(&mut s, 0.0, 100), REPLY_BURST as usize);
+        assert_eq!(sent(&mut s, 1.0, 100), REPLIES_PER_S as usize);
+        // another IP has its own budget
+        assert_eq!(s.received(1.0, 0, &h("10010000"), a(GAME_A)).len(), 1);
+    }
+
+    #[test]
+    fn a_connect_request_passes_on_a_bounded_address_list() {
+        let mut s = Storm::new();
+        let (a_id, a_key) = register(&mut s, a(GAME_A));
+        let (b_id, _) = register(&mut s, a(GAME_B));
+        let req = |n: usize| [h("10440005"), a_id.clone(), a_key.clone(), b_id.clone(), vec![2; n]].concat();
+        assert_eq!(s.received(0.0, TRAVERSAL_PORT, &req(MAX_CONNECT_ADDRESSES), a(GAME_A)).len(), 1);
+        assert!(s.received(0.0, TRAVERSAL_PORT, &req(MAX_CONNECT_ADDRESSES + 1), a(GAME_A)).is_empty());
     }
 
     #[test]
