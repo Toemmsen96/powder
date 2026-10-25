@@ -43,6 +43,28 @@ enum Command {
         #[command(subcommand)]
         cmd: AdminCommand,
     },
+    /// Build or check the game-data pack.
+    Gamedata {
+        #[command(subcommand)]
+        cmd: GamedataCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GamedataCommand {
+    /// Build a pack from your recordings (allow-list + privacy check).
+    Build { recordings: PathBuf, pack: PathBuf },
+    /// Check a pack's manifest and file hashes (default: the configured pack).
+    Verify { pack: Option<PathBuf> },
+    /// Pack the game-data pack into one .zip (to bring it to another PC).
+    Zip {
+        out: PathBuf,
+        /// Pack folder (default: the configured one).
+        #[arg(long)]
+        pack: Option<PathBuf>,
+    },
+    /// Install a game-data pack from a .zip or folder.
+    Install { source: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -79,7 +101,52 @@ fn main() -> Result<()> {
                 AdminCommand::Trust { action } => trust(action, &config),
             }
         }
+        Command::Gamedata { cmd } => {
+            logging::setup(None, &config.server.log_level);
+            gamedata(cmd, &config)
+        }
     }
+}
+
+fn gamedata(cmd: GamedataCommand, config: &Config) -> Result<()> {
+    use powder_server::gamedata::{build, pack};
+    let built = |m: &serde_json::Map<String, serde_json::Value>| m.get("built").cloned().unwrap_or_default();
+    match cmd {
+        GamedataCommand::Zip { out, pack: root } => {
+            let m = pack::zip_pack(root.as_deref().unwrap_or(config.gamedata_dir()), &out)?;
+            println!("wrote {} (pack built {})", out.display(), built(&m));
+        }
+        GamedataCommand::Install { source } => {
+            let m = pack::install(&source, config.gamedata_dir())?;
+            println!("installed the game-data pack (built {}) into {}", built(&m), config.gamedata_dir().display());
+        }
+        GamedataCommand::Build { recordings, pack: out } => {
+            let report = build::build(&recordings, &out)?;
+            for (name, n) in &report.kept {
+                println!("  {name:20} {n}");
+            }
+            if !report.findings.is_empty() {
+                println!("PRIVACY CHECK FAILED ({} findings); nothing written:", report.findings.len());
+                for f in report.findings.iter().take(40) {
+                    println!("  {f}");
+                }
+                std::process::exit(1);
+            }
+            println!("pack written to {} (privacy check passed)", out.display());
+        }
+        GamedataCommand::Verify { pack: root } => {
+            let root = root.as_deref().unwrap_or(config.gamedata_dir());
+            let manifest = pack::read_manifest(root)?;
+            let bad = pack::verify_files(root, &manifest);
+            let state = if bad.is_empty() { "OK".to_string() } else { format!("CHANGED: {}", bad.join(", ")) };
+            println!("pack {}: built {}, {}, {state}", root.display(), built(&manifest),
+                     manifest.get("sandbox").cloned().unwrap_or_default());
+            if !bad.is_empty() {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Ubisoft Connect checks certificates through the OS, so the local CA must be a trusted root.
