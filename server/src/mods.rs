@@ -2,7 +2,8 @@
 //! the Rust rework's take on the Python server's plugins (same config, see [`crate::config::ModsConfig`]).
 //!
 //! A mod is either `<mods>/<name>.lua` or `<mods>/<name>/mod.lua` (also `init.lua`); a name starting with
-//! `_` or `.` is skipped, so `_example/` ships as documentation. Each mod is a Lua chunk that hands the
+//! `_` or `.` is skipped, so `_example/` ships as documentation. A mod folder may also ship files for the
+//! players' games (`client/`, `mod.toml`): see client_mods.rs. Either part is optional. Each mod is a Lua chunk that hands the
 //! server a `setup` function — the recommended form returns it:
 //!
 //! ```lua
@@ -30,6 +31,7 @@
 //! bytes | nil`, where `nil` lets the server answer as usual and the first non-nil wins. Errors raised by a
 //! mod are logged and swallowed, never reaching the game.
 
+use crate::client_mods::{self, ClientMod};
 use crate::config::Config;
 use crate::repos::Repos;
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Variadic};
@@ -74,6 +76,7 @@ pub struct ModHost {
     reg: Arc<Mutex<Registrations>>,
     config: Json,
     loaded: Vec<String>,
+    client: Vec<ClientMod>,
 }
 
 impl ModHost {
@@ -86,29 +89,50 @@ impl ModHost {
             reg: Arc::new(Mutex::new(Registrations::default())),
             config: config_snapshot(config),
             loaded: vec![],
+            client: vec![],
         };
         let dir = &config.mods.dir;
         if !dir.is_dir() {
             log::debug!(target: "powder.mods", "no mods folder at {}", dir.display());
             return host;
         }
-        for (name, path) in discover(dir) {
-            if !config.mods.allows(&name) {
+        for found in discover(dir) {
+            let name = &found.name;
+            if !config.mods.allows(name) {
                 log::debug!(target: "powder.mods", "mod {name} is not enabled, skipped");
                 continue;
             }
-            match host.load_one(&name, &path) {
-                Ok(()) => log::info!(target: "powder.mods", "loaded mod {name}"),
-                Err(e) => log::error!(target: "powder.mods", "mod {name} failed to load: {e:#}"),
+            if let Some(entry) = &found.entry {
+                match host.load_one(name, entry) {
+                    Ok(()) => log::info!(target: "powder.mods", "loaded mod {name}"),
+                    Err(e) => log::error!(target: "powder.mods", "mod {name} failed to load: {e:#}"),
+                }
+            }
+            if let Some(dir) = &found.dir {
+                let client = client_mods::Manifest::load(dir).and_then(|m| client_mods::scan(name, dir, &m));
+                match client {
+                    Ok(Some(c)) => {
+                        log::info!(target: "powder.mods", "mod {name}: {} client file(s) for the launcher{}", c.files.len(),
+                                   if c.inject.is_empty() { String::new() } else { format!(" (injects {})", c.inject.join(", ")) });
+                        host.client.push(c);
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::error!(target: "powder.mods", "mod {name}: client files not published: {e:#}"),
+                }
             }
         }
-        log::info!(target: "powder.mods", "{} mod(s) loaded", host.loaded.len());
+        log::info!(target: "powder.mods", "{} mod(s) loaded, {} with client files", host.loaded.len(), host.client.len());
         host
     }
 
     /// Names of the mods that loaded, in load order.
     pub fn loaded(&self) -> &[String] {
         &self.loaded
+    }
+
+    /// The mods' client parts, published for the launcher (see client_mods.rs).
+    pub fn client_mods(&self) -> &[ClientMod] {
+        &self.client
     }
 
     /// What the loaded mods registered, for the CLI (`powder-server mods`) and the status page.
@@ -127,7 +151,8 @@ impl ModHost {
             .map(|(m, hs)| (m.clone(), hs.iter().map(|h| h.mod_name.clone()).collect()))
             .collect();
         rmc.sort();
-        ModReport { loaded: self.loaded.clone(), events, http, rmc }
+        let client = self.client.iter().map(|c| (c.name.clone(), c.files.len(), c.inject.clone())).collect();
+        ModReport { loaded: self.loaded.clone(), events, http, rmc, client }
     }
 
     fn load_one(&mut self, name: &str, path: &Path) -> mlua::Result<()> {
@@ -332,6 +357,8 @@ pub struct ModReport {
     pub events: Vec<(String, Vec<String>)>,
     pub http: Vec<(String, String, String)>,
     pub rmc: Vec<(String, Vec<String>)>,
+    /// (mod, client files, DLLs to inject)
+    pub client: Vec<(String, usize, Vec<String>)>,
 }
 
 /// A snapshot of the config a mod may read. Read-only: a mod changing this table changes nothing on the
@@ -350,9 +377,16 @@ fn config_snapshot(config: &Config) -> Json {
     })
 }
 
-/// Mods in a folder, as (name, entry file), sorted by name. `<name>.lua` or `<name>/{mod,init}.lua`; names
+/// A mod found in the mods folder: its Lua entry (server part) and/or its folder (mod.toml, client/).
+struct Found {
+    name: String,
+    entry: Option<PathBuf>,
+    dir: Option<PathBuf>,
+}
+
+/// Mods in a folder, sorted by name: `<name>.lua`, or `<name>/` with `{mod,init}.lua` and/or `client/`; names
 /// starting with `_` or `.` are skipped.
-fn discover(dir: &Path) -> Vec<(String, PathBuf)> {
+fn discover(dir: &Path) -> Vec<Found> {
     let mut out = vec![];
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
@@ -362,18 +396,15 @@ fn discover(dir: &Path) -> Vec<(String, PathBuf)> {
         }
         let path = entry.path();
         if path.is_dir() {
-            for cand in ["mod.lua", "init.lua"] {
-                let p = path.join(cand);
-                if p.is_file() {
-                    out.push((fname.clone(), p));
-                    break;
-                }
+            let lua = ["mod.lua", "init.lua"].iter().map(|c| path.join(c)).find(|p| p.is_file());
+            if lua.is_some() || path.join("client").is_dir() {
+                out.push(Found { name: fname, entry: lua, dir: Some(path) });
             }
         } else if let Some(stem) = fname.strip_suffix(".lua") {
-            out.push((stem.to_string(), path));
+            out.push(Found { name: stem.to_string(), entry: Some(path), dir: None });
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -527,6 +558,26 @@ mod tests {
         assert_eq!(r.events, vec![("login".to_string(), vec!["r".to_string()])]);
         assert_eq!(r.rmc, vec![("P::M_V1".to_string(), vec!["r".to_string()])]);
         assert_eq!(r.http, vec![("r".to_string(), "GET".to_string(), "/x/*".to_string())]);
+    }
+
+    #[test]
+    fn client_only_and_mixed_mods_publish_their_client_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mods_dir = dir.path().join("mods");
+        std::fs::create_dir_all(mods_dir.join("hud/client")).unwrap();
+        std::fs::write(mods_dir.join("hud/client/hud.dll"), b"MZ").unwrap();
+        std::fs::create_dir_all(mods_dir.join("both/client")).unwrap();
+        std::fs::write(mods_dir.join("both/client/data.bin"), b"d").unwrap();
+        std::fs::write(mods_dir.join("both/mod.lua"), "return function(api) end").unwrap();
+        std::fs::create_dir_all(mods_dir.join("empty")).unwrap(); // neither part: not a mod
+        let db = Arc::new(Db::memory().unwrap());
+        db.migrate().unwrap();
+        let mut config = Config::default();
+        config.mods.dir = mods_dir;
+        let host = ModHost::load(&config, Arc::new(Repos::new(db)));
+        assert_eq!(host.loaded(), &["both".to_string()]);
+        let r = host.report();
+        assert_eq!(r.client, vec![("both".to_string(), 1, vec![]), ("hud".to_string(), 1, vec!["hud.dll".to_string()])]);
     }
 
     #[test]

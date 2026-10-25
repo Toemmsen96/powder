@@ -5,6 +5,7 @@
 
 pub mod assets;
 pub mod builtin;
+pub mod client_mods;
 pub mod config;
 pub mod constants;
 pub mod core;
