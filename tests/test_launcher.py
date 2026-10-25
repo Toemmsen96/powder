@@ -499,6 +499,21 @@ def test_wait_unpacked_follows_the_protector(monkeypatch):
     assert attach.wait_unpacked(7, 0x1000, 64, want, timeout=0.05, poll=0.01) == attach.TIMEOUT
 
 
+def test_no_start_while_an_old_helper_log_cannot_be_deleted(tmp_path, monkeypatch):
+    from powder.launcher import attach
+    import powder.launcher.session as session_mod
+    stuck = tmp_path / "hook_guard.log"
+    stuck.mkdir()                                                   # unlink() fails on it, like a locked file
+    monkeypatch.setattr(attach, "LOG", stuck)
+    monkeypatch.setattr(session_mod.os, "startfile", lambda url: pytest.fail("the game must not start"),
+                        raising=False)
+    s = Session(LauncherConfig(), tmp_path)
+    s.steps = session_mod.play_steps()
+    s.install = locate.Install(locate.STEAM, Path("C:/Games/Steep/Steep.exe"))
+    assert s.run_game() is False
+    assert s.step("game").state == "failed" and "earlier Steep" in s.step("game").text
+
+
 def test_no_attach_when_the_code_never_appears(tmp_path, monkeypatch):
     from powder.launcher import attach
     import powder.launcher.session as session_mod

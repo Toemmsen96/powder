@@ -3,6 +3,10 @@
 ; Per-user install (no admin rights). Program files go to %LOCALAPPDATA%\Programs\Powder; everything Powder
 ; generates (progress, game-data pack, local CA, logs) lives in %LOCALAPPDATA%\Powder and is only removed
 ; when the user says so during uninstall.
+; Known limit: that program folder is writable by the user, and the hosts-file step runs powder-cli.exe from it
+; elevated (UAC), so a program running as the user could swap it and get admin rights at the next hosts change.
+; A per-machine install (PrivilegesRequired=admin, DefaultDirName={autopf}\Powder: admin-only) would close
+; that; it needs the data folder to stay per user ({localappdata}) and a test on Windows first.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -72,13 +76,16 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    { Undo what the launcher set up on this PC (hosts entries, the local CA) while Powder.exe still
-      exists. Restore system explains every Windows prompt before it appears and can be skipped. }
-    if (not UninstallSilent) and FileExists(ExpandConstant('{app}\Powder.exe')) then
+    { Undo what the launcher set up on this PC (hosts entries, the servers' CAs, firewall rules) while
+      Powder.exe still exists. Restore system explains every Windows prompt before it appears and can be
+      skipped. Also when uninstalling silently (the window still appears and the uninstall waits for it):
+      a trusted CA or hosts entries must not be left behind unnoticed. }
+    if FileExists(ExpandConstant('{app}\Powder.exe')) then
     begin
-      MsgBox('Powder will now open "Restore system" to undo what it set up on this PC: the hosts-file ' +
-             'entries and its certificate. Follow the steps in that window, then close it to finish ' +
-             'uninstalling.', mbInformation, MB_OK);
+      if not UninstallSilent then
+        MsgBox('Powder will now open "Restore system" to undo what it set up on this PC: the hosts-file ' +
+               'entries, its certificates and firewall rules. Follow the steps in that window, then close ' +
+               'it to finish uninstalling.', mbInformation, MB_OK);
       Exec(ExpandConstant('{app}\Powder.exe'), '--restore --window', '', SW_SHOW, ewWaitUntilTerminated,
            ResultCode);
     end;
