@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# powder-wrap: run Ubisoft Connect / Steep (Wine, Proton, Lutris) against a Powder server, changing nothing
+# on the system. Everything lasts only as long as the wrapped command:
+#
+#   - a private network namespace: the session sees loopback only, so the game and Connect cannot reach
+#     Ubisoft (or anything else), and nothing outside sees the session
+#   - the Ubisoft hostnames point at 127.0.0.1 through a bind-mounted /etc/hosts, inside the session only
+#     (no /etc/hosts edit, no sysctl: port 443 can be bound inside the namespace)
+#   - the Powder server runs inside the session and stops with it
+#   - the local CA is added to the Wine prefix's own root store for the session and removed afterwards
+#     (the system's CA store is not touched)
+#
+# Lutris: Configure the game > System options > Command prefix:  /path/to/powder/linux/powder-wrap
+# By hand:   WINEPREFIX=~/Games/ubisoft-connect powder-wrap <command...>
+#
+# Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (python | rust, default
+# python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version).
+# Close Ubisoft Connect before starting: a Connect already running outside the session would be reused.
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+REPO=$(cd "$(dirname "$SELF")/.." && pwd)
+CONFIG=${POWDER_CONFIG:-$REPO/config.toml}
+SERVER=${POWDER_SERVER:-python}
+LOG=${XDG_RUNTIME_DIR:-/tmp}/powder-wrap.log
+HOSTS=(public-ubiservices.ubi.com msr-public-ubiservices.ubi.com public-im-ubiservices.ubi.com
+       public-ws-ubiservices.ubi.com steep-prod-pc.steep.olympus.ubi.com
+       dmx.upc.ubisoft.com channel-service.upc.ubi.com static3.cdn.ubi.com)
+
+say() { printf 'powder-wrap: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+# [server] https_port from the config (443 if unset or no config)
+https_port() {
+    python3 -I - "$CONFIG" <<'EOF'
+import sys, tomllib
+try:
+    print(tomllib.load(open(sys.argv[1], "rb")).get("server", {}).get("https_port", 443))
+except FileNotFoundError:
+    print(443)
+EOF
+}
+
+# the server's data folder: [server] data_dir, relative to the config file (default data/)
+data_dir() {
+    python3 -I - "$CONFIG" <<'EOF'
+import sys, tomllib, pathlib
+cfg = pathlib.Path(sys.argv[1])
+try:
+    d = tomllib.load(open(cfg, "rb")).get("server", {}).get("data_dir", "data")
+except FileNotFoundError:
+    d = "data"
+print((cfg.parent / d).resolve())
+EOF
+}
+
+server_command() {
+    case $SERVER in
+    python)
+        if [ -x "$REPO/.venv/bin/powder-server" ]; then echo "$REPO/.venv/bin/powder-server"
+        else command -v uv >/dev/null || die "no $REPO/.venv (run 'uv sync' in $REPO)"; echo "uv run --frozen --offline powder-server"
+        fi ;;
+    rust)
+        for b in "$REPO/target/release/powder-server" "$REPO/target/debug/powder-server"; do
+            [ -x "$b" ] && { echo "$b"; return; }
+        done
+        die "no Rust server built (cargo build --release in $REPO)" ;;
+    *) die "POWDER_SERVER must be python or rust, not $SERVER" ;;
+    esac
+}
+
+# The wine the prefix runs with: POWDER_WINE, Proton's (PROTONPATH, as Lutris/umu set it, or the Proton
+# version the prefix records), else wine on PATH.
+find_wine() {
+    [ -n "${POWDER_WINE:-}" ] && { echo "$POWDER_WINE"; return; }
+    [ -n "${PROTONPATH:-}" ] && [ -x "$PROTONPATH/files/bin/wine" ] && { echo "$PROTONPATH/files/bin/wine"; return; }
+    local version
+    version=$(cat "$WINEPREFIX/version" 2>/dev/null || true)
+    if [ -n "$version" ]; then
+        for d in "$HOME/.local/share/Steam/compatibilitytools.d" "$HOME/.steam/root/compatibilitytools.d" \
+                 "$HOME/.local/share/lutris/runners/proton" "$HOME/.local/share/lutris/runners/wine"; do
+            for w in "$d/$version"*/files/bin/wine; do
+                [ -x "$w" ] && { echo "$w"; return; }
+            done
+        done
+    fi
+    command -v wine || die "no wine found for $WINEPREFIX (set POWDER_WINE)"
+}
+
+# .reg adding/naming the CA in the prefix's root store, the layout Wine uses itself (see server/src/trust.rs)
+ca_key() {
+    python3 -I - "$1" <<'EOF'
+import hashlib, ssl, sys
+der = ssl.PEM_cert_to_DER_cert(open(sys.argv[1]).read())
+print(r"HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates" + "\\" + hashlib.sha1(der).hexdigest().upper())
+EOF
+}
+ca_reg() {
+    python3 -I - "$1" "$2" <<'EOF'
+import hashlib, ssl, struct, sys
+der = ssl.PEM_cert_to_DER_cert(open(sys.argv[1]).read())
+prop = lambda i, d: struct.pack("<III", i, 1, len(d)) + d
+blob = prop(3, hashlib.sha1(der).digest()) + prop(0x20, der)
+h = [f"{b:02x}" for b in blob]
+lines = [",".join(h[i:i + 25]) for i in range(0, len(h), 25)]
+sys.stdout.write(f'Windows Registry Editor Version 5.00\r\n\r\n[{sys.argv[2]}]\r\n"Blob"=hex:' + ",\\\r\n  ".join(lines) + "\r\n")
+EOF
+}
+
+case ${POWDER_WRAP_STAGE:-outer} in
+
+outer)  # ---- as the user: check, then enter a new user + mount + network namespace -------------------------
+    [ $# -gt 0 ] || die "usage: powder-wrap <command...>   (e.g. as Lutris' command prefix; see the top of $SELF)"
+    [ -n "${WINEPREFIX:-}" ] || die "WINEPREFIX is not set (Lutris sets it; by hand: WINEPREFIX=... powder-wrap ...)"
+    command -v unshare >/dev/null || die "unshare (util-linux) is needed"
+    command -v ip >/dev/null || die "ip (iproute2) is needed"
+    server_command >/dev/null
+    : > "$LOG"
+    say "session log: $LOG"
+    export POWDER_WRAP_STAGE=net POWDER_WRAP_UID=$(id -u) POWDER_WRAP_GID=$(id -g)
+    exec unshare --user --map-root-user --mount --net --fork -- "$SELF" "$@"
+    ;;
+
+net)    # ---- namespace root: loopback, hosts, the server; then back to the user's id for the command --------
+    ip link set lo up
+    hosts=$(mktemp)
+    { echo "127.0.0.1 localhost"; echo "::1 localhost ip6-localhost"
+      for h in "${HOSTS[@]}"; do echo "127.0.0.1 $h"; done; } > "$hosts"
+    mount --bind "$hosts" /etc/hosts
+    port=$(https_port)
+    # shellcheck disable=SC2046
+    $(server_command) -c "$CONFIG" run >> "$LOG" 2>&1 &
+    server=$!
+    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts"' EXIT
+    for _ in $(seq 100); do
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+        kill -0 "$server" 2>/dev/null || die "the Powder server stopped; see $LOG"
+        sleep 0.1
+    done
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || die "the Powder server does not answer on port $port; see $LOG"
+    say "Powder server up (pid $server, $SERVER), network: this session only"
+    export POWDER_WRAP_STAGE=user
+    set +e
+    unshare --user --map-user="$POWDER_WRAP_UID" --map-group="$POWDER_WRAP_GID" -- "$SELF" "$@"
+    rc=$?
+    exit $rc
+    ;;
+
+user)   # ---- the user's id again: CA into the prefix, the command, CA out -------------------------------
+    wine=$(find_wine)
+    wineserver="$(dirname "$wine")/wineserver"
+    [ -x "$wineserver" ] || wineserver=wineserver
+    ca="$(data_dir)/tls/ca.pem"
+    [ -f "$ca" ] || die "no local CA at $ca (the server makes it on its first start)"
+    key=$(ca_key "$ca")
+    reg=$(mktemp --suffix=.reg)
+    ca_reg "$ca" "$key" > "$reg"
+    winereg() { WINEDEBUG=-all "$wine" reg "$@" >/dev/null 2>&1; }
+    winereg import "$reg" || die "could not add the local CA to $WINEPREFIX (wine: $wine)"
+    rm -f "$reg"
+    "$wineserver" -w
+    say "local CA trusted in $WINEPREFIX for this session"
+    cleanup() {
+        "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
+        winereg delete "$key" /f || say "could not remove the local CA from $WINEPREFIX"
+        "$wineserver" -w 2>/dev/null || true
+        say "local CA removed from $WINEPREFIX"
+    }
+    trap cleanup EXIT
+    set +e
+    "$@"
+    rc=$?
+    exit $rc
+    ;;
+esac

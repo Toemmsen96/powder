@@ -95,4 +95,7 @@ Linux (Arch); Steep is installed through Lutris (Wine). Under Wine, Ubisoft Conn
 (that is why `trust.rs` has a Linux path), but an existing prefix only checks the copy of the roots it made
 when it was set up (registry `HKLM\Software\Microsoft\SystemCertificates\Root\Certificates`): use
 `admin trust install --wine-prefix <prefix> --wine <the prefix's wine>`. Symptom when missing: `tls ok`, then the
-client closes without a request (no access-log line). The game itself can only be tested by the user.
+client closes without a request (no access-log line). Preferred on Linux: `linux/powder-wrap` (Lutris command prefix): a private user+mount+net namespace with its own
+/etc/hosts, the server inside, the CA in the prefix only for the session (tested with umu-run/GE-Proton offline).
+Still missing on Linux: injecting the game's TLS helper (`native/`) under Wine. The game itself can only be
+tested by the user.
