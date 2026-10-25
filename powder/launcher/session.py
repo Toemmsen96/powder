@@ -890,10 +890,19 @@ class Session:
     def run_game(self) -> bool:
         inst = self.install
         self.set("game", RUNNING, f"starting Steep through {inst.label}")
+        # the armer and the launcher wait for lines in this log: an old one would make them go on too early
         try:
             attach.LOG.unlink(missing_ok=True)
-        except OSError:
-            pass
+            gone = not attach.LOG.exists()
+        except OSError as e:
+            gone, why = False, str(e)
+        else:
+            why = "it is still there"
+        if not gone:
+            log.warning("TLS helper log %s not removed: %s", attach.LOG, why)
+            self.set("game", FAILED, f"the TLS helper's log from an earlier start ({attach.LOG}) can't be deleted "
+                                     f"({why}). Is an earlier Steep still running? Close it, then press Play again.")
+            return False
         os.startfile(launch_url(inst, self.cfg.steam_app_id))
         observer = attach.ProcessObserver(log)
         timeout = 180
