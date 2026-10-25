@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import struct
 import zlib
@@ -34,8 +35,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+log = logging.getLogger("powder.nex")
+
 ECK1 = b"ECK1"  # BCRYPT_ECDH_PUBLIC_P256_MAGIC
 ECS1 = b"ECS1"  # BCRYPT_ECDSA_PUBLIC_P256_MAGIC
+MAX_INFLATED = 64 * 1024   # most a compressed payload may inflate to (the game's fragments are under 1 KB)
 
 
 def to_blob(pub: ec.EllipticCurvePublicKey, magic: bytes) -> bytes:
@@ -51,14 +55,29 @@ def from_blob(blob: bytes) -> ec.EllipticCurvePublicKey:
 
 
 def load_or_create_signing_key(path: Path) -> ec.EllipticCurvePrivateKey:
-    """Load the server's ECDSA key (PRIVATE: never publish it), creating it on first run."""
+    """Load the server's ECDSA key (PRIVATE: never publish it), creating it on first run. On POSIX the file
+    is the owner's only (0600; an existing file's mode is tightened when loaded)."""
     if path.exists():
+        _private_mode(path)
         return serialization.load_pem_private_key(path.read_bytes(), password=None)
     key = ec.generate_private_key(ec.SECP256R1())
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                       serialization.NoEncryption()))
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(pem)
     return key
+
+
+def _private_mode(path: Path) -> None:
+    """Make a private file readable by its owner only (POSIX; on Windows the folder's ACL decides)."""
+    if os.name != "posix":
+        return
+    mode = path.stat().st_mode
+    if mode & 0o077:
+        path.chmod(0o600)
+        log.info("%s: was readable by others (mode %o), now 0600", path, mode & 0o777)
 
 
 def config_public_key(signing_key: ec.EllipticCurvePrivateKey) -> str:
@@ -114,7 +133,17 @@ def decrypt_payload(key: bytes, data: bytes, seq: int | None = None) -> bytes:
     plain = u.update(d.update(ct) + d.finalize()) + u.finalize()
     # game order (FUN_7ff661b08c00): decrypt -> decompress -> check/strip trailing u16 seq
     ratio, body = plain[0], plain[1:]
-    inner = body if ratio == 0 else zlib.decompress(body)
+    if ratio == 0:
+        inner = body
+    else:   # bounded: a few KB of zlib could otherwise inflate to many MB
+        z = zlib.decompressobj()
+        inner = z.decompress(body, MAX_INFLATED + 1)
+        if len(inner) > MAX_INFLATED:
+            raise ValueError(f"compressed payload inflates past {MAX_INFLATED} bytes")
+        if not z.eof:
+            raise ValueError("truncated compressed payload")
+    if len(inner) < 2:
+        raise ValueError(f"payload of {len(inner)} bytes has no seq trailer")
     data, trailer = inner[:-2], struct.unpack("<H", inner[-2:])[0]
     if seq is not None and trailer != seq & 0xFFFF:
         raise ValueError(f"seq trailer {trailer} != packet seq {seq}")

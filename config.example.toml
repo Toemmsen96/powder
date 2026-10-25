@@ -18,6 +18,10 @@ country = "US"              # what Ubisoft Connect is told about the player's lo
 region = "NA"
 log_level = "INFO"
 strict_tickets = false      # true: refuse requests with tickets the server did not issue
+nex_check_signatures = "log" # NEX (UDP) packets after the SYN carry the signature the server's SYN-ACK
+                            # gave, which a forged sender address never sees. "log": never refuse, log the
+                            # first mismatch per connection as "wrong signature" (and an info when it
+                            # matched); "enforce": ignore packets without it; "off": no check
 
 [players]
 # Players sign in with accounts (registered in the launcher). Only while a server has no account yet:

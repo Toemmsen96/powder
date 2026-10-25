@@ -1,5 +1,6 @@
 """PRUDP, secure channel and RMC codecs (self-made packets and keys)."""
 import base64
+import os
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -80,6 +81,26 @@ def test_handshake_and_payloads():
         assert secure.decrypt_payload(key, secure.encrypt_payload(key, 7, msg, compress=compress), 7) == msg
     with pytest.raises(ValueError):
         secure.decrypt_payload(key, secure.encrypt_payload(key, 7, msg), 8)
+
+
+def test_a_payload_inflating_past_the_limit_is_refused():
+    key = bytes([7]) * 16
+    fits = b"x" * (secure.MAX_INFLATED - 2)
+    assert secure.decrypt_payload(key, secure.encrypt_payload(key, 1, fits, compress=True), 1) == fits
+    bomb = secure.encrypt_payload(key, 1, bytes(16 * 1024 * 1024), compress=True)
+    assert len(bomb) < 64 * 1024, f"16 MB of zeros compress to {len(bomb)} bytes"
+    with pytest.raises(ValueError, match="inflates past"):
+        secure.decrypt_payload(key, bomb, 1)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file modes are POSIX")
+def test_signing_key_file_is_private(tmp_path):
+    path = tmp_path / "data" / "nex_signing_key.pem"
+    a = secure.load_or_create_signing_key(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.chmod(0o644)                                      # a key file from before: made private when loaded
+    b = secure.load_or_create_signing_key(path)
+    assert path.stat().st_mode & 0o777 == 0o600 and secure.config_public_key(a) == secure.config_public_key(b)
 
 
 def test_rmc_request_response_error():

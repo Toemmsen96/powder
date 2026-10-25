@@ -27,6 +27,10 @@ class ServerConfig:
     region: str = "NA"
     log_level: str = "INFO"
     strict_tickets: bool = False        # True: reject unknown UbiServices/NEX tickets
+    nex_check_signatures: str = "log"   # NEX packets after the SYN must carry the signature our SYN-ACK gave
+                                        # (a spoofed source never sees it). "log": never refuse, log the first
+                                        # mismatch per connection ("wrong signature") and an info when it
+                                        # matched; "enforce": ignore packets without it; "off": no check
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,10 @@ class Config:
             value = getattr(srv, name)
             if not value.is_absolute():
                 srv = dataclasses.replace(srv, **{name: (base / value).resolve()})
+
+        if srv.nex_check_signatures not in ("log", "enforce", "off"):
+            raise ValueError('[server] nex_check_signatures must be "log", "enforce" or "off", '
+                             f"not {srv.nex_check_signatures!r}")
 
         players_raw = dict(raw.get("players", {}))
         players = PlayersConfig(default=players_raw.get("default"),
