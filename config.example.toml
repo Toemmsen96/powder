@@ -17,16 +17,25 @@ recordings_dir = "recordings"   # your own recorded sessions; only read by `game
 country = "US"              # what Ubisoft Connect is told about the player's location
 region = "NA"
 log_level = "INFO"
-strict_tickets = false      # true: refuse requests with tickets the server did not issue
+strict_tickets = false      # true: refuse requests with tickets the server did not issue (always so on a
+                            # public = true server); false: one it lost (restart) is the latest session from its address
 nex_check_signatures = "log" # NEX (UDP) packets after the SYN carry the signature the server's SYN-ACK
                             # gave, which a forged sender address never sees. "log": never refuse, log the
                             # first mismatch per connection as "wrong signature" (and an info when it
                             # matched); "enforce": ignore packets without it; "off": no check
+# name = "Powder"           # the server's name, shown by the launcher
+# motd = ""                 # a short text for players (rules, contact), shown by the launcher
+# public = false            # true: an internet-facing server: sign-ins always need an account, tickets are
+#                           # strict, /_powder/status shows a caller only its own connections
+# admins = ["<profile id>"]  # Rust server: who may use admin tools (mods/admin: https://<server>/_powder/admin);
+#                            # profile ids from `powder-server admin accounts`
 
 [players]
 # Players sign in with accounts (registered in the launcher). Only while a server has no account yet:
 # default = "<profile id>"  # the player every login becomes. Unset: the imported player, or else the
-#                           # first player, created on the first login. The first account takes it over.
+#                           # first player, created on the first login. The first account takes it over
+#                           # if registered on this PC (launcher) or made with `admin account-create`.
+# registration = "open"     # "closed": only the host creates accounts (`admin account-create`)
 # [players.bind]            # (legacy, before accounts) a client IP -> its own player
 # "192.168.1.20" = "<profile id>"
 

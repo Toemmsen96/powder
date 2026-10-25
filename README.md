@@ -159,12 +159,17 @@ Every player has an account on the server: an email and a password, registered i
 **Account** row or the Account step of Play) and used to sign in to Ubisoft Connect. The email can be
 changed later; the password is stored only as a scrypt hash, never logged. Wrong passwords are
 rate-limited per address. The first account on a server takes over the player already there (e.g. your
-imported progress); every further account starts like a new Ubisoft account: level 1, empty inventory,
-`starting_credits`. A server without any account accepts every sign-in, as before accounts existed, until
-the first player registers. If someone forgets their password, the host sets a new one:
+imported progress) if it is registered on the server's own PC (or made with `admin account-create`); every
+further account, and one registered from another PC, starts like a new Ubisoft account: level 1, empty
+inventory, `starting_credits`. A server without any account accepts every sign-in, as before accounts existed,
+until the first player registers (a `[server] public = true` server never does). Once accounts exist, every
+game and Connect call that acts for a player needs that player's session, and a player changes only its own
+inventory, rider card, saves and photos. `[players] registration = "closed"`: only the host creates accounts.
+If someone forgets their password, the host sets a new one:
 
 ```
 uv run powder-server admin accounts                    # email -> player
+uv run powder-server admin account-create <email> <name>   # asks for the password
 uv run powder-server admin account-password <email>    # asks for the new password
 uv run powder-server admin account-email <email> <new email>
 uv run powder-server admin account-link <email> <player id>   # the account owns that player instead
@@ -319,9 +324,11 @@ uv run powder-server admin trust remove
 What is not emulated (cloud saves, friends, Connect's news and store pages): see [Game features](#game-features).
 
 The server's own endpoints: `GET /_powder/status` (connected Connect clients and game sessions, and the
-caller's address), `GET /_powder/ca.pem` (the CA certificate) and `/_powder/account/*` (the launcher
-registers and changes accounts there; every call carries the account's password). Meant for a local
-network of friends: don't expose the server to the internet.
+caller's address; other players' addresses only for the server's own PC, and on a public server only the
+caller's own connections), `GET /_powder/ca.pem` (the CA certificate) and `/_powder/account/*` (the
+launcher registers and changes accounts there; every call carries the account's password). Web pages from
+other sites (the hosts file sends the browser here too) may only GET; CORS is for Ubisoft Connect's origins.
+A server reachable from the internet should set `[server] public = true`.
 
 ## Admin
 

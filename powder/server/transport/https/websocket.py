@@ -29,7 +29,8 @@ async def websocket(request: web.Request) -> web.StreamResponse:
     ws = web.WebSocketResponse(protocols=(first,) if first else (), heartbeat=None, autoping=True)
     check = ws.can_prepare(request)
     if not check.ok:
-        log.warning("websocket handshake not acceptable; headers: %s", dict(request.headers))
+        # header names only: the values carry the player's ticket (Authorization)
+        log.warning("websocket handshake not acceptable; headers: %s", ", ".join(request.headers.keys()))
         request[HOW] = "ws-rejected"
         return web.Response(status=400)
     await ws.prepare(request)

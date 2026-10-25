@@ -2,9 +2,10 @@
 
 Request pipeline (outermost first):
   log_middleware      access log + keeps uploaded remotelog/events bodies (they explain client errors)
-  cors_middleware     CORS for Ubisoft Connect's web UI (preflights, Allow-Origin)
+  cors_middleware     CORS for Ubisoft Connect's web UI (preflights, Allow-Origin); Ubisoft's origins only,
+                      other origins may only GET / HEAD (see connect_origin)
   plugin_middleware   plugins.before_http hooks may answer a request themselves
-  session_middleware  `Authorization: Ubi_v1 t=<ticket>` -> request[SESSION]
+  session_middleware  `Authorization: Ubi_v1 t=<ticket>` -> request[SESSION]; answers a route's Refused
   routes              routes_ubi.py (real logic), routes_profile.py (player-related, generated),
                       routes_powder.py (/_powder/), websocket.py
   fallback            game-data pack reply (configs) or `{}` + UNMATCHED warning
@@ -26,7 +27,7 @@ from ...constants import APP_ID
 from ...core.identity import parse_authorization
 from . import routes_profile, routes_powder, routes_ubi, routes_ugc
 from .keys import DATA_DIR, FALLBACK, HOW, NEX_PUBLIC_KEY, PLUGINS, SERVICES, SESSION
-from .routes_ubi import client_ip
+from .routes_ubi import Refused, client_ip
 from .websocket import websocket
 
 log = logging.getLogger("powder.https")
@@ -61,15 +62,49 @@ async def log_middleware(request: web.Request, handler):
 
 CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
 CORS_EXPOSE = "X-Total-Count, Ubi-TransactionId"
+CONNECT_DOMAINS = ("ubisoft.com", "ubi.com")
+HOSTNAME = re.compile(r"[A-Za-z0-9.-]+")
+
+
+def connect_origin(origin: str) -> bool:
+    """Whether a request's Origin is Ubisoft Connect's embedded browser: its UI and overlay come from Ubisoft's
+    CDN (https://connect.cdn.ubisoft.com, https://<env>connect.cdn.ubisoft.com, ...), so https and a
+    ubisoft.com / ubi.com host (a port allowed). The game, the launcher and Connect's own client send no
+    Origin."""
+    if origin[:8].lower() != "https://":
+        return False
+    host, sep, port = origin[8:].rpartition(":")
+    if not sep or not all(c in "0123456789" for c in port):
+        host = origin[8:]
+    host = host.lower()
+    return bool(HOSTNAME.fullmatch(host)) and any(host == d or host.endswith("." + d) for d in CONNECT_DOMAINS)
+
+
+def same_origin(request: web.Request, origin: str) -> bool:
+    """A page this server served itself (e.g. a plugin's) calling it back: the browser sets Origin to the page's
+    own scheme + host, which no other site can claim."""
+    host = request.headers.get("Host", "")
+    return bool(host) and origin.lower() == f"https://{host}".lower()
 
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
     """Ubisoft Connect's UI is a web page (origin https://connect.cdn.ubisoft.com) calling UbiServices
-    from its embedded browser, which needs CORS: answer preflights and allow the origin, like Ubisoft."""
+    from its embedded browser, which needs CORS: answer preflights and allow the origin, like Ubisoft. Only
+    its origins get CORS headers (with credentials). Another origin's GET / HEAD is answered without them
+    (the browser hides the reply), and so is a page of this server's own; anything else from a foreign
+    origin is refused: the hosts file sends the player's browser here too, so a web page could otherwise post
+    to the server (e.g. register the first account on a server without accounts)."""
     origin = request.headers.get("Origin")
     if not origin:
         return await handler(request)
+    if not connect_origin(origin):
+        if request.method in ("GET", "HEAD") or same_origin(request, origin):
+            return await handler(request)
+        log.warning("%s %s from %s refused: origin %r is not Ubisoft Connect's", request.method, request.path,
+                    client_ip(request), origin)
+        return routes_ubi.json_response(request, {"errorCode": 1, "message": "origin not allowed", "httpCode": 403},
+                                        "cors-refused", 403)
     if request.method == "OPTIONS" and "Access-Control-Request-Method" in request.headers:
         request[HOW] = "cors-preflight"
         response = web.Response(status=200)
@@ -101,7 +136,10 @@ async def session_middleware(request: web.Request, handler):
     scheme, ticket = parse_authorization(request.headers.get("Authorization"))
     if scheme.lower() == "ubi_v1" and ticket:
         request[SESSION] = request.app[SERVICES].accounts.session_for_ticket(ticket, client_ip(request))
-    return await handler(request)
+    try:
+        return await handler(request)
+    except Refused as refused:                          # no session, or someone else's data (routes_ubi.py)
+        return refused.response
 
 
 async def fallback(request: web.Request) -> web.Response:

@@ -1,7 +1,8 @@
 """Player-related UbiServices endpoints answered from the player record (no recordings): the game's and
 Ubisoft Connect's profile, social, news and telemetry calls. Most only need a well-formed answer: empty
 lists for news and other people's content; neutral values for account details. Friends: every other player of
-the server (services/friends.py).
+the server (services/friends.py). "me" is the session's player; without a session the default player, until
+accounts are required (then a 401; routes_ubi.py, "who may act").
 """
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ from aiohttp import web
 from ...constants import APP_ID, SPACE_ID
 from ...services import friends
 from ...util import iso_now
-from .keys import HOW, SERVICES, SESSION
-from .routes_ubi import json_response
+from .keys import HOW, SERVICES
+from .routes_ubi import acting, json_response, reader
 
 log = logging.getLogger("powder.https")
 
@@ -25,12 +26,10 @@ def _services(request: web.Request):
     return request.app[SERVICES]
 
 
-def _me(request: web.Request) -> str | None:
-    """The requesting player's profile id (from the ticket, else the default player)."""
-    session = request.get(SESSION)
-    if session:
-        return session.profile_id
-    return _services(request).default_player_id()
+def _me(request: web.Request) -> str:
+    """The requesting player's profile id: the ticket's; without one the default player while accounts are not
+    required, else Refused (401)."""
+    return acting(request).pid
 
 
 def _pid(request: web.Request) -> str:
@@ -176,6 +175,7 @@ async def actions(request: web.Request) -> web.Response:
 async def profiles_lookup(request: web.Request) -> web.Response:
     """GET /v3/profiles?profileIds=|userIds=|idOnPlatform=&platformType=: players this server knows."""
     q = request.query
+    reader(request)
     wanted = {x.lower() for key in ("profileIds", "userIds", "idOnPlatform", "idsOnPlatform", "nameOnPlatform")
               for x in q.get(key, "").split(",") if x}
     out = []
@@ -245,6 +245,7 @@ async def iplocation(request: web.Request) -> web.Response:
 
 
 async def online_statuses(request: web.Request) -> web.Response:
+    reader(request)
     ids = [u for u in request.query.get("UserIds", request.query.get("userIds", "")).split(",") if u]
     services = _services(request)
     now = friends.online_profiles(services)
@@ -268,6 +269,7 @@ async def game_friends(request: web.Request) -> web.Response:
 
 async def connect_friends(request: web.Request) -> web.Response:
     """Ubisoft Connect's friends list; the enriched one (harboursocial) also has each one's online status."""
+    reader(request)
     since, enriched = iso_now(), request.path.endswith("/enriched")
     online = friends.online_profiles(_services(request)) if enriched else set()
     out = []
@@ -291,6 +293,7 @@ STEEP_MESSAGE_TYPES = ["STEEP_LIVEREPLAY", "STEEP_SPECTATOR", "STEEP_MAINTENANCE
 async def profile_connections(request: web.Request) -> web.Response:
     """GET /v1/profiles/connections?profileIds=..&applications=<Steep>: which friends are in Steep now (the game
     asks every minute; only a friend with a connection is "online" in its social tab and can be invited)."""
+    reader(request)
     wanted = [p.lower() for p in request.query.get("profileIds", "").split(",") if p]
     apps = [a.lower() for a in request.query.get("applications", "").split(",") if a]
     if apps and APP_ID not in apps:

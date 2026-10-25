@@ -15,6 +15,8 @@
   powder-server admin offers TEXT
   powder-server admin trust (status|install|remove)   local CA in Windows' trusted roots (Ubisoft Connect)
   powder-server admin accounts                      accounts (players register in the launcher)
+  powder-server admin account-create EMAIL NAME     a new account (asks for its password; also while
+                                                    [players] registration = "closed")
   powder-server admin account-email EMAIL NEW_EMAIL
   powder-server admin account-password EMAIL        set a new password (asks for it)
   powder-server admin account-rename EMAIL NAME
@@ -78,6 +80,9 @@ def add_parser(sub) -> None:
     q = a.add_parser("trust", help="the local CA in Windows' trusted roots (needed by Ubisoft Connect)")
     q.add_argument("action", choices=("status", "install", "remove"))
     a.add_parser("accounts", help="list accounts (email -> player)")
+    q = a.add_parser("account-create", help="create an account (the first one takes over the default player)")
+    q.add_argument("email")
+    q.add_argument("name")
     q = a.add_parser("account-email", help="change an account's email")
     q.add_argument("email")
     q.add_argument("new_email")
@@ -103,6 +108,18 @@ def accounts(args, s: Services) -> int:
         if not s.accounts.required:
             print("no accounts: every sign-in is accepted until the first player registers in the launcher")
         return 0
+    if args.admin_cmd == "account-create":
+        password = _new_password()
+        if password is None:
+            return 1
+        try:
+            account = s.accounts.create_account(args.email, password, args.name)
+        except AccountError as e:
+            print(e)
+            return 1
+        print(f"account {account.email} -> player {s.repos.players.get(account.profile_id).name} "
+              f"({account.profile_id})")
+        return 0
     account = s.repos.accounts.by_email(args.email)
     if account is None:
         print(f"no account with the email {args.email}")
@@ -111,10 +128,8 @@ def accounts(args, s: Services) -> int:
         if args.admin_cmd == "account-email":
             s.accounts.change_email(account, args.new_email)
         elif args.admin_cmd == "account-password":
-            import getpass
-            password = getpass.getpass("new password: ")
-            if password != getpass.getpass("again: "):
-                print("the passwords differ")
+            password = _new_password()
+            if password is None:
                 return 1
             s.accounts.change_password(account, password)
         elif args.admin_cmd == "account-rename":
@@ -128,6 +143,15 @@ def accounts(args, s: Services) -> int:
         return 1
     print("done")
     return 0
+
+
+def _new_password() -> str | None:
+    import getpass
+    password = getpass.getpass("new password: ")
+    if password != getpass.getpass("again: "):
+        print("the passwords differ")
+        return None
+    return password
 
 
 def _grant_args(args) -> None:
