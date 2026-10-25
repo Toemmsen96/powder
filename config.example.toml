@@ -19,6 +19,10 @@ region = "NA"
 log_level = "INFO"
 strict_tickets = false      # true: refuse requests with tickets the server did not issue (always so on a
                             # public = true server); false: one it lost (restart) is the latest session from its address
+nex_check_signatures = "log" # NEX (UDP) packets after the SYN carry the signature the server's SYN-ACK
+                            # gave, which a forged sender address never sees. "log": never refuse, log the
+                            # first mismatch per connection as "wrong signature" (and an info when it
+                            # matched); "enforce": ignore packets without it; "off": no check
 # admins = ["<profile id>"]  # Rust server: who may use admin tools (mods/admin: https://<server>/_powder/admin);
 #                            # profile ids from `powder-server admin accounts`
 

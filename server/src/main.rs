@@ -386,7 +386,8 @@ async fn run(config: Config) -> Result<()> {
     let mut dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
     let handler_deps = powder_server::nex::handlers::HandlerDeps::new(services.clone());
     powder_server::nex::handlers::register(&mut dispatcher, handler_deps);
-    let nex = powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port).await?;
+    let nex = powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port,
+                                                   s.nex_check_signatures).await?;
     // a closed game leaves its matchmaking sessions; codes 1 and 2 are resent every second
     powder_server::nex::handlers::matchmaking::attach(&nex, services.matchmaking.clone());
     log::info!(target: "powder", "NEX listening on udp {}:{} (game reaches it at {})", s.bind, s.nex_port, s.public_host);

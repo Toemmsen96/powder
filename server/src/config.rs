@@ -41,6 +41,8 @@ pub struct ServerConfig {
     /// Profile ids of the server's admins (`admin accounts` lists them): who may use admin tools such as
     /// the admin mod's page. Ids, not emails or names, which players can change.
     pub admins: Vec<String>,
+    /// NEX packets after the SYN carry the signature its SYN-ACK gave (see [`CheckSignatures`]).
+    pub nex_check_signatures: CheckSignatures,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +67,7 @@ impl Default for ServerConfig {
             motd: String::new(),
             public: false,
             admins: vec![],
+            nex_check_signatures: CheckSignatures::Log,
         }
     }
 }
@@ -107,6 +110,19 @@ pub enum Registration {
     #[default]
     Open,
     Closed,
+}
+
+/// `[server] nex_check_signatures`: what NEX does with a packet that lacks the signature our SYN-ACK gave.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckSignatures {
+    /// Never refuse; log the first mismatch per connection ("wrong signature") and an info when it matched,
+    /// so a live session shows how the game signs (the default until that is confirmed).
+    #[default]
+    Log,
+    /// Ignore such packets (no ack, no reply): a forged sender address never sees the signature.
+    Enforce,
+    Off,
 }
 
 #[derive(Clone, Debug, Deserialize)]

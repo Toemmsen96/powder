@@ -144,7 +144,7 @@ don't run commands against the user's real prefix or data: test on scratch copie
 2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
    Python server in the user's sessions.
    Watch for the hardening (2026-10-25) locking out real clients: "wrong signature" in the log means the
-   game fills PRUDP's signature field differently than our vectors (switch: `CHECK_SIGNATURES` in
+   game fills PRUDP's signature field differently than our vectors (`[server] nex_check_signatures`: "log", the default, only logs; "enforce" refuses; see
    nex/connection.rs); also 401/403 "cors-refused" / "origin not allowed" for Connect's UI, 413 bodies, demux
    frames over 1 MiB, NEX messages over 1 MiB, more than 128 HTTPS connections from one address.
 3. In-game UI from mods (asked for with the admin mod, 2026-10-25). Today: `mods/admin/` is a web page;

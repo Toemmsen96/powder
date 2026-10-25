@@ -7,12 +7,13 @@
 //!
 //! Hardened against spoofed source addresses and floods (unlike the Python server): a SYN only makes a half-open
 //! connection (kept aside, so it can't replace a live one), answered with a SYN-ACK no larger than the SYN; a
-//! CONNECT must follow a SYN and carry the signature its SYN-ACK gave (see connection::CHECK_SIGNATURES) and a key
+//! CONNECT must follow a SYN and carry the signature its SYN-ACK gave (see [server] nex_check_signatures) and a key
 //! exchange (Steep always sends one; a plaintext channel is refused); key exchanges are rate-limited per source
 //! IP; connections and half-open ones are capped in all and per IP. Everything we send reliably (and so
 //! retransmit) goes to a connection whose key exchange completed, which a spoofed source never gets to.
 
-use super::connection::{Connection, Outbox, SendFn, CHECK_SIGNATURES};
+use super::connection::{Connection, Outbox, SendFn};
+use crate::config::CheckSignatures;
 use super::dispatch::{Ctx, Dispatcher};
 use super::prudp::{Packet, CONNECT, DATA, DISCONNECT, FLAG_ACK, FLAG_KEY_EXCHANGE, FLAG_NEED_ACK, PING, SYN};
 use super::{rmc, secure};
@@ -74,6 +75,8 @@ pub struct NexServer {
     /// Called with the player's profile id when a logged-in game's connection closes (e.g. to take it out of
     /// its matchmaking sessions).
     pub on_disconnect: Option<DisconnectFn>,
+    /// `[server] nex_check_signatures` (Enforce unless the server's config says otherwise).
+    pub check: CheckSignatures,
 }
 
 impl NexServer {
@@ -81,7 +84,8 @@ impl NexServer {
                -> NexServer {
         NexServer { conns: HashMap::new(), syns: HashMap::new(), dispatcher, signing_key,
                     public_host: public_host.into(), port, send_fn, next_pid: 0x1001, handshakes: HashMap::new(),
-                    wake: Arc::new(Notify::new()), on_disconnect: None }
+                    wake: Arc::new(Notify::new()), on_disconnect: None,
+                    check: CheckSignatures::Enforce }
     }
 
     pub fn received(&mut self, now: f64, data: &[u8], addr: SocketAddr) {
@@ -114,7 +118,7 @@ impl NexServer {
             log::debug!(target: "powder.nex", "{addr}: type {} for unknown connection ignored", p.kind);
             return;
         };
-        if !c.signed(&p) {
+        if !c.signed(&p, self.check) {
             return;
         }
         c.last_seen = now;
@@ -194,17 +198,21 @@ impl NexServer {
             true
         } else if live == Some(p.signature) {
             false
-        } else if !CHECK_SIGNATURES && (half_open.is_some() || live.is_some()) {
-            half_open.is_some()
         } else {
-            if let Some(c) = self.syns.get_mut(&addr) {
-                c.signed(p); // logs the wrong signature
-            } else if let Some(c) = self.conns.get_mut(&addr) {
-                c.signed(p);
-            } else {
-                log::debug!(target: "powder.nex", "{addr}: CONNECT without a SYN before it ignored");
+            // a wrong signature: logged, and taken anyway unless the check is enforced
+            let check = self.check;
+            let taken = match (self.syns.get_mut(&addr), self.conns.get_mut(&addr)) {
+                (Some(c), _) => c.signed(p, check).then_some(true),
+                (None, Some(c)) => c.signed(p, check).then_some(false),
+                (None, None) => {
+                    log::debug!(target: "powder.nex", "{addr}: CONNECT without a SYN before it ignored");
+                    None
+                }
+            };
+            match taken {
+                Some(to_half_open) => to_half_open,
+                None => return,
             }
-            return;
         };
         if !to_half_open {
             let c = self.conns.get_mut(&addr).expect("live");
@@ -330,15 +338,17 @@ fn guarded(what: &str, step: impl FnOnce()) {
 }
 
 /// Bind the NEX port and serve it until the process ends (one receive loop and the timers).
-pub async fn start(dispatcher: Dispatcher, signing_key: SigningKey, bind: &str, public_host: &str, port: u16)
-                   -> Result<Arc<Mutex<NexServer>>> {
+pub async fn start(dispatcher: Dispatcher, signing_key: SigningKey, bind: &str, public_host: &str, port: u16,
+                   check: CheckSignatures) -> Result<Arc<Mutex<NexServer>>> {
     let sock = Arc::new(UdpSocket::bind(format!("{bind}:{port}")).await
         .with_context(|| format!("NEX on udp {bind}:{port}"))?);
     let out = sock.clone();
     let send_fn: SendFn = Arc::new(move |data, to| {
         let _ = out.try_send_to(data, to);
     });
-    let server = Arc::new(Mutex::new(NexServer::new(dispatcher, signing_key, public_host, port, send_fn)));
+    let mut nex = NexServer::new(dispatcher, signing_key, public_host, port, send_fn);
+    nex.check = check;
+    let server = Arc::new(Mutex::new(nex));
     let started = Instant::now();
     let (srv, rx) = (server.clone(), sock);
     tokio::spawn(async move {
@@ -508,6 +518,21 @@ mod tests {
         assert_eq!(sent.lock().len(), n + 2, "ack + reply");
     }
 
+    /// The default setting: a packet without our signature is logged and taken anyway (the game is not confirmed
+    /// to sign as our vectors do); "off" does not look at it.
+    #[test]
+    fn log_and_off_take_unsigned_packets() {
+        for check in [CheckSignatures::Log, CheckSignatures::Off] {
+            let (mut srv, sent) = server(echo_dispatcher());
+            srv.check = check;
+            let game: SocketAddr = "192.0.2.50:3074".parse().unwrap();
+            let (_, key) = handshake(&mut srv, &sent, game, 0.0);
+            let n = sent.lock().len();
+            srv.received(0.1, &echo_call([0u8; 4], &key, 2, 7).encode(), game);
+            assert_eq!(sent.lock().len(), n + 2, "{check:?}: ack + reply");
+        }
+    }
+
     #[test]
     fn a_new_syn_does_not_cut_off_the_live_connection() {
         let (mut srv, sent) = server(echo_dispatcher());
@@ -592,7 +617,7 @@ mod tests {
         d.handle("TestProtocol::Panic_V1", Box::new(|_, _| panic!("a bug in a handler")));
         let port = 34000 + (std::process::id() % 8000) as u16;
         let key = SigningKey::random(&mut rand::thread_rng());
-        start(d, key, "127.0.0.1", "127.0.0.1", port).await.unwrap();
+        start(d, key, "127.0.0.1", "127.0.0.1", port, CheckSignatures::Enforce).await.unwrap();
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.connect(("127.0.0.1", port)).await.unwrap();
         let recv = |want: u8| {

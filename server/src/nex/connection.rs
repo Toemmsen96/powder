@@ -13,7 +13,8 @@
 //! that does not decrypt, is dropped without an ack (the game sends it again); a connection whose buffered
 //! message passes MAX_MESSAGE_BYTES is closed.
 
-use super::prudp::{Packet, DATA, FLAG_ACK, FLAG_NEED_ACK, FLAG_RELIABLE};
+use crate::config::CheckSignatures;
+use super::prudp::{Packet, CONNECT, DATA, FLAG_ACK, FLAG_NEED_ACK, FLAG_RELIABLE};
 use super::{rmc, secure};
 use crate::core::sessions::{NexChannel, PlayerSession};
 use parking_lot::Mutex;
@@ -35,13 +36,6 @@ pub const REORDER_WINDOW: u16 = 256;
 /// Largest client message (all fragments of one RMC request, plus what is buffered out of order). The game's
 /// requests are a few KB (LoginWithToken ~3 KB, PostEvents batches); files go over HTTPS.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-
-/// Whether client packets after the SYN must carry the signature we gave the client: prudp.rs's layout (from the
-/// game's traffic) has a packet's `signature` be the peer's connection signature, our SYN-ACK's for the game.
-/// Unlike Python, a CONNECT, DATA, ACK, PING or DISCONNECT without it is ignored: a spoofed source address never
-/// sees our SYN-ACK, so it can neither start a key exchange nor disturb a connection. Should the real game send
-/// something else there (logged as "wrong signature"), this switch lets it in again.
-pub const CHECK_SIGNATURES: bool = true;
 
 /// Sends one datagram (non-blocking; UDP may drop it anyway).
 pub type SendFn = Arc<dyn Fn(&[u8], SocketAddr) + Send + Sync>;
@@ -114,6 +108,7 @@ pub struct Connection {
     buffered: usize,
     /// A packet with a wrong signature was logged (the first one is a warning).
     warned_signature: bool,
+    logged_match: bool,
     next_seq: u16,
     /// seq -> (raw, last sent, tries)
     unacked: HashMap<u16, (Vec<u8>, f64, u32)>,
@@ -139,7 +134,7 @@ impl Connection {
             session_id: if random[4] == 0 { 1 } else { random[4] },
             client_sig: [0; 4],
             key: None, connect_ack: None, expected_seq: 0,
-            pending: HashMap::new(), fragments: vec![], buffered: 0, warned_signature: false, next_seq: 1,
+            pending: HashMap::new(), fragments: vec![], buffered: 0, warned_signature: false, logged_match: false, next_seq: 1,
             unacked: HashMap::new(),
             last_seen: now, closed: false, profile_id: None, session: None,
             outbox: Arc::new(Outbox::new(Arc::new(Notify::new()))),
@@ -152,20 +147,30 @@ impl Connection {
                  session_id: self.session_id, signature: self.client_sig, ..Default::default() }
     }
 
-    /// Whether a client packet carries the signature our SYN-ACK gave the client (see CHECK_SIGNATURES).
-    pub fn signed(&mut self, p: &Packet) -> bool {
-        if !CHECK_SIGNATURES || p.signature == self.server_sig {
+    /// Whether a client packet carries the signature our SYN-ACK gave the client (see `[server] nex_check_signatures`).
+    /// `mode` Log takes it anyway (and says so once per connection, either way), Off does not look.
+    pub fn signed(&mut self, p: &Packet, mode: CheckSignatures) -> bool {
+        if mode == CheckSignatures::Off {
             return true;
         }
+        if p.signature == self.server_sig {
+            if mode == CheckSignatures::Log && p.kind != CONNECT && !self.logged_match {
+                self.logged_match = true;
+                log::info!(target: "powder.nex", "{}: the game's packets carry our signature (type {}; \
+                           nex_check_signatures)", self.addr, p.kind);
+            }
+            return true;
+        }
+        let what = if mode == CheckSignatures::Enforce { "ignored" } else { "taken anyway" };
         if self.warned_signature {
-            log::debug!(target: "powder.nex", "{}: type {} with a wrong signature ignored", self.addr, p.kind);
+            log::debug!(target: "powder.nex", "{}: type {} with a wrong signature {what}", self.addr, p.kind);
         } else {
             self.warned_signature = true;
-            log::warn!(target: "powder.nex", "{}: type {} with a wrong signature ({}, ours {}) ignored (spoofed, or \
-                       the game signs differently: see CHECK_SIGNATURES)", self.addr, p.kind, hex::encode(p.signature),
-                       hex::encode(self.server_sig));
+            log::warn!(target: "powder.nex", "{}: type {} with a wrong signature ({}, ours {}) {what} (spoofed, or \
+                       the game signs differently: see [server] nex_check_signatures)", self.addr, p.kind,
+                       hex::encode(p.signature), hex::encode(self.server_sig));
         }
-        false
+        mode != CheckSignatures::Enforce
     }
 
     pub fn send_raw(&self, raw: &[u8]) {
