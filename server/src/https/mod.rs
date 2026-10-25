@@ -17,6 +17,7 @@
 //! Not ported yet: the profile, UGC, /_powder/ and websocket routes, and routes_ubi's inventory, store, entity
 //! and cloud-save routes; until they are, what they would answer falls through to the pack.
 
+pub mod routes_powder;
 pub mod routes_ubi;
 
 use crate::assets::Assets;
@@ -184,8 +185,9 @@ impl Route {
 }
 
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
-/// routes_ugc, the websocket; only routes_ubi's sign-in part is ported).
-static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(routes_ubi::routes);
+/// routes_ugc, the websocket; ported so far: routes_ubi's sign-in part, routes_powder's client mods).
+static ROUTES: LazyLock<Vec<Route>> =
+    LazyLock::new(|| routes_powder::routes().into_iter().chain(routes_ubi::routes()).collect());
 
 /// `Authorization: Ubi_v1 t=<ticket>` -> the session it belongs to (Python's session_middleware).
 pub fn session_of(state: &HttpState, req: &Req) -> anyhow::Result<Option<Arc<PlayerSession>>> {

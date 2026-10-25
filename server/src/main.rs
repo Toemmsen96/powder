@@ -257,8 +257,8 @@ async fn run(config: Config) -> Result<()> {
     let sessions = Arc::new(SessionRegistry::new());
     let accounts = Arc::new(AccountService::new(config.clone(), repos.clone(), sessions.clone()));
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
-    log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX handlers, demux \
-                                  (use the Python server to play)");
+    log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX stats and \
+                                  matchmaking, the demux (use the Python server to play)");
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))
@@ -267,7 +267,9 @@ async fn run(config: Config) -> Result<()> {
     // The NEX handshake is signed with this key; its public half goes into the rendezvous config.
     let signing_key = powder_server::nex::secure::load_or_create_signing_key(&config.data_dir().join("nex_signing_key.pem"))?;
     let nex_public_key = powder_server::nex::secure::config_public_key(&signing_key);
-    let dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
+    let mut dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
+    let handler_deps = powder_server::nex::handlers::HandlerDeps::new(accounts.clone(), Some(mods.clone()));
+    powder_server::nex::handlers::register(&mut dispatcher, handler_deps);
     powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port).await?;
     log::info!(target: "powder", "NEX listening on udp {}:{} (game reaches it at {})", s.bind, s.nex_port, s.public_host);
 
@@ -303,11 +305,18 @@ fn check_mods(config: &Config) -> Result<()> {
     let report = host.report();
 
     println!("mods folder: {}", config.mods.dir.display());
-    if report.loaded.is_empty() {
+    if report.loaded.is_empty() && report.client.is_empty() {
         println!("no mods loaded.");
         return Ok(());
     }
     println!("{} mod(s) loaded: {}", report.loaded.len(), report.loaded.join(", "));
+    if !report.client.is_empty() {
+        println!("\nclient files for the launcher (/_powder/mods):");
+        for (name, files, inject) in &report.client {
+            let inject = if inject.is_empty() { String::new() } else { format!(", injects {}", inject.join(", ")) };
+            println!("  {name:<16} {files} file(s){inject}");
+        }
+    }
     if !report.events.is_empty() {
         println!("\nevents:");
         for (event, mods) in &report.events {
