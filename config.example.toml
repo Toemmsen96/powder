@@ -43,6 +43,8 @@ reward_credit_multiplier = 1.0   # scale credits from challenge rewards
 # [gameplay.player."<profile id>"]
 # free_purchases = true
 
-[plugins]
-enabled = ["*"]             # plugin file names (without .py) in ./plugins, "*" = all
+[mods]
+dir = "mods"                # folder of server mods, relative to this file
+enabled = ["*"]             # mod names (a <name>.lua file, or a <name>/ folder with mod.lua), "*" = all
 disabled = []
+# (the old [plugins] section still works, with the same keys.)

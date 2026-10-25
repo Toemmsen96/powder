@@ -1,0 +1,16 @@
+//! Powder server library: the pieces the `powder-server` binary and the modding tools build on.
+//!
+//! The binary (main.rs) wires these together; keeping them in a library lets the tests and the modding
+//! host reach them without going through the binary.
+
+pub mod assets;
+pub mod config;
+pub mod constants;
+pub mod db;
+pub mod demux;
+pub mod gamedata;
+pub mod logging;
+pub mod mods;
+pub mod nex;
+pub mod repos;
+pub mod util;

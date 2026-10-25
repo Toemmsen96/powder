@@ -2,7 +2,7 @@
 //! refused, so a typo doesn't silently do nothing.
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +65,7 @@ impl Default for ServerConfig {
 }
 
 /// Gameplay settings; read per call via Config::toggles(profile_id), never cached.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Toggles {
     pub unlimited_heli_tickets: bool,

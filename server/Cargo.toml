@@ -21,7 +21,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 log = { version = "0.4", features = ["std"] }
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
 parking_lot = "0.12"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

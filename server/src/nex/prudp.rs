@@ -134,7 +134,7 @@ impl Packet {
             p.connection_signature = body[off..off + 4].try_into()?;
             off += 4;
         }
-        let mut field = |off: &mut usize| -> Result<Vec<u8>> {
+        let field = |off: &mut usize| -> Result<Vec<u8>> {
             need(*off, 2)?;
             let n = u16::from_le_bytes([body[*off], body[*off + 1]]) as usize;
             need(*off + 2, n)?;

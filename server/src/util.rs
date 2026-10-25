@@ -159,7 +159,7 @@ mod tests {
     fn dumps_like_python() {
         let v = json!({"code": 1, "params": {"a": "x", "b": [1, 2.5]}, "facility": "Matchmaking", "n": null});
         assert_eq!(dumps(&v), r#"{"code": 1, "params": {"a": "x", "b": [1, 2.5]}, "facility": "Matchmaking", "n": null}"#);
-        assert_eq!(dumps(&json!("é\u{1F600}\"")), r#""é😀\"""#);
+        assert_eq!(dumps(&json!("é\u{1F600}\"")), r#""\u00e9\ud83d\ude00\"""#);
         assert_eq!(dumps_compact(&json!({"a": [1, true]})), r#"{"a":[1,true]}"#);
     }
 

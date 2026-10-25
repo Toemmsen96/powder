@@ -1,6 +1,8 @@
 //! Build a game-data pack from recordings of real sessions (your own captures):
 //!
-//!     powder-server gamedata build <recordings dir> <pack dir>
+//! ```text
+//! powder-server gamedata build <recordings dir> <pack dir>
+//! ```
 //!
 //! Only allow-listed, game-wide replies are copied; Ubisoft Club actions are rewritten to drop player state.
 //! The privacy check (privacy.rs) must then find no identifying value from the rest of the recordings in the
