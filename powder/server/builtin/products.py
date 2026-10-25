@@ -1,6 +1,7 @@
 """Steep's owned-games entries for Ubisoft Connect, without a game-data pack.
 
-Connect only starts a game it finds in the player's owned games. The entries' ids and numbers come from
+Connect only starts a game it finds in the player's owned games. With a game-data pack too: a pack only says
+which of these products to list (gamedata/validate.py), so what Connect is told to run is always this. The entries' ids and numbers come from
 product_table.py; their product configuration (YAML, field 17) is written here, with only what Connect
 needs to start Steep: how to launch it (Steam, or Steep.exe from Connect's install folder), its app and
 space ids, no cloud saves, and the achievement definitions file if the server has one. Names, images and
@@ -77,11 +78,15 @@ def _yaml(product_id: int, fields: list, cloud_saves: bool, achievements_file: s
     return text.replace("\n", "\r\n").encode()
 
 
-def entries(cloud_saves: bool = False, achievements_file: str | None = None) -> list[bytes]:
-    """The encoded product messages of Steep, its Steam entry and its add-ons."""
+def entries(cloud_saves: bool = False, achievements_file: str | None = None,
+            only: set[int] | None = None) -> list[bytes]:
+    """The encoded product messages of Steep, its Steam entry and its add-ons (`only`: of these ids; a game-data
+    pack's list)."""
     out = []
     for fields in PRODUCTS:
         pid = pb.first(fields, 1)
+        if only is not None and pid not in only:
+            continue
         config = _yaml(pid, fields, cloud_saves, achievements_file)
         out.append(pb.encode([(n, config if n == PRODUCT_CONFIG else v) for n, v in fields]))
     return out

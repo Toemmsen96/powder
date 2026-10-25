@@ -120,7 +120,21 @@ def _products(demux: dict) -> list[bytes]:
     for pid in STEEP_PRODUCTS:
         if pid in decoded:
             wanted.update(v for n, v, _ in pb.decode(decoded[pid]) if n == 16)
-    return [decoded[p] for p in sorted(wanted) if p in decoded]
+    return [_known_hash(decoded[p]) for p in sorted(wanted) if p in decoded]
+
+
+def _known_hash(entry: bytes) -> bytes:
+    """A product entry with its field 21 (40 hex digits) as Steep's known one (builtin/product_table.py), or
+    without it: another value could be per account (privacy.product_hash_findings)."""
+    fields = pb.decode(entry)
+    value = pb.first(fields, privacy.PRODUCT_HASH)
+    if not isinstance(value, bytes) or not privacy.HEX40.fullmatch(value):
+        return entry
+    known = privacy.known_product_hash(pb.first(fields, 1))
+    if value.upper() == known:
+        return entry
+    kept = [f for f in fields if f[0] != privacy.PRODUCT_HASH]
+    return pb.encode(kept if known is None else pb.replace(fields, privacy.PRODUCT_HASH, known))
 
 
 def build(recordings: Path, out: Path) -> Report:

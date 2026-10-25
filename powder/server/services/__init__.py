@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import io
-import json
 import logging
-import zipfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +16,7 @@ from ..db.repos import Repos
 from ..fixtures.catalog import OfferCatalog
 from ..fixtures.http import HttpFixtures
 from ..fixtures.rmc import RmcFixtures
-from ..gamedata import pack
+from ..gamedata import pack, validate
 from .accounts import AccountService
 from .channels import ChannelService
 from .cloudsaves import CloudSaveService
@@ -59,6 +56,7 @@ class Assets:
     connect_http: HttpFixtures = field(default_factory=lambda: HttpFixtures([]))
     products: pack.ConnectProducts = field(default_factory=pack.ConnectProducts)
     manifest: dict | None = None
+    _achievements: dict | None = field(default=None, repr=False)        # the definitions zip, read once
 
     @classmethod
     def load(cls, root: Path) -> "Assets":
@@ -74,14 +72,16 @@ class Assets:
         changed = pack.verify_files(root, manifest)
         if changed:
             log.warning("game-data pack files changed since it was built: %s", ", ".join(changed))
-        actions_path = root / "actions.json"
-        return cls(http=HttpFixtures.load(root / "http.json"), rmc=RmcFixtures.load(root / "rmc.json"),
-                   catalog=OfferCatalog.load(root / "offers.json"),
-                   actions=json.loads(actions_path.read_text(encoding="utf-8")).get("actions", [])
-                   if actions_path.exists() else [],
-                   connect_http=HttpFixtures.load(root / "connect" / "http.json"),
-                   products=pack.ConnectProducts.load(root / "connect" / "demux.json"),
-                   manifest=manifest)
+        try:
+            valid = validate.validated(root)
+        except pack.PackError as e:
+            log.warning("%s; running on built-in replies", e)
+            return cls()
+        assets = cls(http=HttpFixtures(valid.http), rmc=RmcFixtures(valid.rmc), catalog=OfferCatalog(valid.offers),
+                     actions=valid.actions, connect_http=HttpFixtures(valid.connect_http), manifest=manifest)
+        assets.products = pack.ConnectProducts.from_ids(valid.patch_info, valid.product_ids,
+                                                        assets.achievements_file())
+        return assets
 
     @property
     def empty(self) -> bool:
@@ -89,16 +89,18 @@ class Assets:
 
     def _achievement_file(self, name: str) -> bytes | None:
         """A file from Ubisoft Connect's achievement definitions in the pack (a zip with '<lang>_loc.txt'
-        files of 'id<TAB>name<TAB>description' lines and '<id>.png' icons)."""
-        for e in self.connect_http.entries:
-            if not (e.path.split("?")[0].endswith(".zip") and "/assets/" in e.path):
-                continue
-            try:
-                with zipfile.ZipFile(io.BytesIO(e.body)) as z:
-                    return z.read(name)
-            except (zipfile.BadZipFile, KeyError):
-                continue
-        return None
+        files of 'id<TAB>name<TAB>description' lines and '<id>.png' icons). The zip is read once (size-capped,
+        validate.read_zip), not on every icon or GraphQL request."""
+        if self._achievements is None:
+            self._achievements = {}
+            for e in self.connect_http.entries:
+                if e.path.split("?")[0].endswith(".zip") and "/assets/" in e.path:
+                    try:
+                        self._achievements = validate.read_zip(e.body)
+                        break
+                    except pack.PackError as err:
+                        log.warning("game-data pack: %s", err)
+        return self._achievements.get(name)
 
     def achievements_file(self) -> str | None:
         """File name of Ubisoft Connect's achievement definitions in the pack (referenced in Steep's product
