@@ -39,13 +39,22 @@ static DWORD WINAPI worker(LPVOID p) {
     }
     tls_log("armed: target=%p pid=%lu pin=%s", (void *)g_target, GetCurrentProcessId(),
             g_have_pin ? "yes" : "MISSING");
-    // keep it armed: the guard clears on each access, and certificate checks are infrequent
-    LONG seen = 0;
+    // The guard is one-shot: any access to this 4 KiB code page clears it. Re-arm as fast as possible until
+    // the first handshake is trapped (so the guard is set whenever ssl_verify_cert_chain runs), then back off.
+    // g_faults climbing means the handler fires (so the hook works); staying 0 means guard faults never reach
+    // our VEH under Wine, and a different hook is needed. Status is logged for the first seconds either way.
+    DWORD last = GetTickCount();
     for (;;) {
         tls_arm();
-        Sleep(REARM_SLEEP_MS);
-        LONG now = g_hits;
-        if (now != seen) { seen = now; }      // (a hit was logged by the handler)
+        DWORD now = GetTickCount();
+        if (now - last >= 2000) {
+            MEMORY_BASIC_INFORMATION mbi;
+            int guarded = VirtualQuery((void *)g_page, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD);
+            tls_log("status: guard faults=%ld, hook hits=%ld, guard currently %s", g_faults, g_hits,
+                    guarded ? "set" : "cleared");
+            last = now;
+        }
+        if (g_hits > 0) Sleep(REARM_SLEEP_MS);    // caught at least one: ease off the CPU
     }
     return 0;
 }

@@ -38,7 +38,8 @@ static const unsigned char TLS_PROLOGUE[TLS_PROLOGUE_LEN] = {
 
 static uintptr_t g_target = 0, g_page = 0;
 static SIZE_T g_pagesize = 0x1000;
-static volatile LONG g_hits = 0;
+static volatile LONG g_hits = 0;      // times ssl_verify_cert_chain itself was trapped
+static volatile LONG g_faults = 0;    // all guard faults on the page (any code on it): is the handler firing?
 static wchar_t g_log[MAX_PATH];
 static unsigned char g_pin[32];
 static int g_have_pin = 0;
@@ -111,6 +112,7 @@ static int tls_verify(const void *sk) {
 
 static LONG CALLBACK tls_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != TLS_GUARD_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement(&g_faults);
     CONTEXT *c = ep->ContextRecord;
     if (c->Rip == g_target) {
         // entering ssl_verify_cert_chain(s=rcx, sk=rdx): decide here and return to the caller without running it
