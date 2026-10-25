@@ -6,6 +6,7 @@
 pub mod assets;
 pub mod config;
 pub mod constants;
+pub mod core;
 pub mod db;
 pub mod demux;
 pub mod gamedata;
@@ -14,6 +15,7 @@ pub mod logging;
 pub mod mods;
 pub mod nex;
 pub mod repos;
+pub mod services;
 pub mod storm;
 pub mod tls;
 pub mod trust;

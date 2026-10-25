@@ -8,6 +8,16 @@ version = "0.0.0"                 # releases take their version from the git tag
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
+# password hashing (scrypt) is seconds per hash unoptimized: keep debug builds and tests usable
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 4
