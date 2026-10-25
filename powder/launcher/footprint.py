@@ -45,7 +45,7 @@ class Footprint:
 
 def hosts_lines(path: Path = dns.HOSTS_PATH) -> list[str]:
     try:
-        return dns.read_block(path.read_text(encoding="ascii", errors="replace"))
+        return dns.read_block(path.read_bytes().decode("latin-1"))
     except OSError:
         return []
 

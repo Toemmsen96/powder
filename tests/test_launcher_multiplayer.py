@@ -1,4 +1,5 @@
 """Launcher: hosting for / joining other PCs, firewall rules, the account (no Windows calls: all faked)."""
+import dataclasses
 import json
 from pathlib import Path
 
@@ -166,6 +167,51 @@ def test_firewall_script_allows_only_the_local_network():
     script = firewall.add_script([firewall.Program(GAME, firewall.GAME_RULE, ("UDP",))])
     assert script.count("New-NetFirewallRule") == 1 and "-RemoteAddress LocalSubnet" in script
     assert "-Group 'Powder'" in script and f"-Program '{GAME}'" in script and "Remove-NetFirewallRule" in script
+    assert "-Profile 'Domain, Private'" in script and "-Profile Any" not in script and "-Protocol UDP |" in script
+
+
+def test_hosting_rules_name_the_servers_ports(tmp_path, monkeypatch):
+    monkeypatch.setattr(network, "lan_addresses", lambda: ["192.0.2.10"])
+    (tmp_path / "config.toml").write_text("[server]\nhttps_port = 18443\ncrl_port = 18080\nnex_port = 16005\n"
+                                         "storm_port = 19000\n")
+    s = Scripted(LauncherConfig(server_config=str(tmp_path / "config.toml")), tmp_path)
+    s.set_mode(HOST)
+    srv, = s.firewall_programs()
+    assert srv.ports_for("TCP") == (18443, 18080) and 16005 in srv.ports_for("UDP")
+    script = firewall.add_script([srv])
+    assert script.count("New-NetFirewallRule") == 2
+    assert "-Protocol TCP -LocalPort 18080,18443 |" in script and "-Protocol UDP -LocalPort 16005," in script
+    exe = firewall.norm(srv.exe).lower()
+    tcp = firewall.Rule(firewall.SERVER_RULE, "Allow", True, exe, protocol="TCP", ports="18443 18080")
+    udp = firewall.Rule(firewall.SERVER_RULE, "Allow", True, exe, protocol="UDP",
+                        ports=" ".join(map(str, srv.ports_for("UDP"))))
+    assert firewall.allowed(srv, [tcp, udp], ["Private"])
+    assert not firewall.allowed(srv, [tcp], ["Private"])
+    assert not firewall.allowed(srv, [dataclasses.replace(tcp, ports="18443"), udp], ["Private"])  # port changed
+    assert firewall.allowed(srv, [dataclasses.replace(tcp, ports="18000-18500"), udp], ["Private"])
+    assert firewall.port_set("Any") is None and firewall.port_set("80 5000-5002") == {80, 5000, 5001, 5002}
+    with pytest.raises(ValueError):
+        firewall.add_script([firewall.Program(GAME, firewall.GAME_RULE, ("Any; Remove-Item C:\\",))])
+
+
+def test_elevated_powershell_is_the_systems_and_loads_only_its_modules(monkeypatch):
+    ran = []
+    monkeypatch.setattr(firewall.elevate, "run_elevated", lambda cmd: ran.append(cmd) or 0)
+    firewall.remove_ours()
+    exe, *args = ran[0]
+    assert exe.lower().endswith("\\system32\\windowspowershell\\v1.0\\powershell.exe") and "-NoProfile" in args
+    assert "$env:PSModulePath = Join-Path $PSHOME 'Modules'; Import-Module NetSecurity;" in args[-1]
+
+
+def test_a_public_network_is_reported_not_opened(tmp_path, monkeypatch):
+    pc = FakePC()
+    pc.install(monkeypatch)
+    monkeypatch.setattr(firewall, "rules_for", lambda programs: (list(pc.game_rules), ["Public"]))
+    s = Scripted(LauncherConfig(), tmp_path, answers=["Check again", "Continue anyway"])
+    s.install = type("I", (), {"exe": GAME})()
+    s.set_mode(JOIN, join_address="192.0.2.10")
+    assert s.check_firewall() and pc.calls == [] and "Public" in s.step("firewall").text
+    assert [k for k, _ in s.asked] == ["firewall", "firewall"]
 
 
 def test_firewall_rule_matching():

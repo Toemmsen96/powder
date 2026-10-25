@@ -27,19 +27,74 @@ def test_hosts_add_remove_keeps_other_lines(tmp_path, monkeypatch):
     hosts = tmp_path / "hosts"
     original = "# sample\n10.0.0.5 nas.local\n"
     hosts.write_text(original)
-    backups = tmp_path / "bak"
 
-    hostsfix.apply("add", "192.168.1.10", hosts, backups)
+    saved = hostsfix.apply("add", "192.168.1.10", hosts)
     text = hosts.read_text()
     assert "10.0.0.5 nas.local" in text and "192.168.1.10 dmx.upc.ubisoft.com" in text
-    assert len(list(backups.iterdir())) == 1                       # backup of the original
-    assert list(backups.iterdir())[0].read_text() == original
+    assert list(tmp_path.glob("hosts.powder-*.bak")) == [saved]     # backup of the original, next to it
+    assert saved.read_text() == original
 
-    hostsfix.apply("add", "192.168.1.10", hosts, backups)           # idempotent: one block only
+    assert hostsfix.apply("add", "192.168.1.10", hosts) is None      # idempotent: nothing to change
     assert hosts.read_text().count("dmx.upc.ubisoft.com") == 1
 
-    hostsfix.apply("remove", "192.168.1.10", hosts, backups)
+    hostsfix.apply("remove", None, hosts)
     assert hosts.read_text().strip() == original.strip()
+
+
+def test_hosts_other_lines_are_kept_byte_for_byte(tmp_path, monkeypatch):
+    monkeypatch.setattr(dns, "flush_dns", lambda: None)
+    hosts = tmp_path / "hosts"
+    original = hostsfix.UTF8_BOM + "# Café, Zürich: ünïcödé\r\n10.0.0.5 nas.local # Ä\r\n".encode() + b"# \xe9 ANSI\r\n"
+    hosts.write_bytes(original)
+    hostsfix.apply("add", "192.168.1.10", hosts)
+    assert hosts.read_bytes().startswith(original)
+    hostsfix.apply("remove", None, hosts)
+    assert hosts.read_bytes() == original
+    hosts.write_bytes("# x\r\n".encode("utf-16"))
+    with pytest.raises(RuntimeError, match="UTF-16"):
+        hostsfix.apply("add", "192.168.1.10", hosts)
+
+
+@pytest.mark.parametrize("address", [None, "", "pc.lan", "192.168.1.300", "1.2.3.4\n5.6.7.8 evil", "::1",
+                                     "1.2.3.4 a.b"])
+def test_hosts_add_needs_an_ipv4_address(tmp_path, address):
+    hosts = tmp_path / "hosts"
+    hosts.write_text("# sample\n")
+    with pytest.raises(ValueError):
+        hostsfix.apply("add", address, hosts)
+    assert hosts.read_text() == "# sample\n" and not list(tmp_path.glob("*.bak"))
+    assert hostsfix.main(["add", "--address", str(address)]) == 1
+
+
+def test_hosts_backups_are_pruned(tmp_path, monkeypatch):
+    monkeypatch.setattr(dns, "flush_dns", lambda: None)
+    hosts = tmp_path / "hosts"
+    hosts.write_text("# sample\n")
+    for i in range(hostsfix.KEEP_BACKUPS + 3):
+        hostsfix.apply("add" if i % 2 == 0 else "remove", "192.168.1.10", hosts)
+    assert len(list(tmp_path.glob("hosts.powder-*.bak"))) == hostsfix.KEEP_BACKUPS
+
+
+def test_elevated_hosts_step_gets_validated_arguments(monkeypatch):
+    from powder.launcher import elevate
+    ran = []
+    monkeypatch.setattr(elevate, "run_elevated", lambda cmd: ran.append(cmd) or 0)
+    assert elevate.hosts("add", "192.168.1.10") == 0 and elevate.hosts("remove") == 0
+    assert ran[0][-4:] == ["hostsfix", "add", "--address", "192.168.1.10"] and ran[1][-2:] == ["hostsfix", "remove"]
+    assert elevate.hosts("add", "pc.lan") == 1 and elevate.hosts("add", "1.2.3.4 x") == 1 and len(ran) == 2
+
+
+def test_dns_step_resolves_a_host_name_first(tmp_path, monkeypatch):
+    from powder.launcher import elevate
+    table = {"pc.lan": ["fe80::1", "192.0.2.10"], **{h: ["192.0.2.10"] for h in REDIRECT_HOSTS}}
+    monkeypatch.setattr(dns, "resolve", lambda h: table.get(h, []))
+    assert dns.ipv4_of("pc.lan") == "192.0.2.10" and dns.ipv4_of("192.0.2.7") == "192.0.2.7"
+    assert dns.ipv4_of("nowhere.lan") is None
+    monkeypatch.setattr(elevate, "hosts", lambda *a: pytest.fail("no hosts change needed"))
+    s = Session(LauncherConfig(server_mode="remote", server_address="pc.lan"), tmp_path)
+    assert s.check_dns() and "192.0.2.10" in s.step("dns").text
+    s = Session(LauncherConfig(server_mode="remote", server_address="nowhere.lan"), tmp_path)
+    assert not s.check_dns() and "IPv4" in s.step("dns").text
 
 
 def test_hosts_replaces_legacy_block(tmp_path, monkeypatch):
@@ -48,7 +103,7 @@ def test_hosts_replaces_legacy_block(tmp_path, monkeypatch):
     hosts = tmp_path / "hosts"
     hosts.write_text("# sample\n# steep-re emulator redirect (remove this block to restore online play)\n"
                      "127.0.0.1 public-ubiservices.ubi.com\n127.0.0.2 dmx.upc.ubisoft.com\n")
-    hostsfix.apply("add", "127.0.0.1", hosts, tmp_path / "bak")
+    hostsfix.apply("add", "127.0.0.1", hosts)
     text = hosts.read_text()
     assert "emulator redirect" not in text and "127.0.0.2" not in text
     assert text.splitlines().count("127.0.0.1 public-ubiservices.ubi.com") == 1
@@ -61,7 +116,7 @@ def test_hosts_block_from_before_the_rename_is_removed(tmp_path, monkeypatch):
     hosts.write_text("# sample\n# steep-re launcher redirect (remove this block to restore normal online play)\n"
                      "127.0.0.1 public-ubiservices.ubi.com\n")
     assert len(dns.read_block(hosts.read_text())) == 2
-    hostsfix.apply("remove", "127.0.0.1", hosts, tmp_path / "bak")
+    hostsfix.apply("remove", None, hosts)
     assert hosts.read_text().strip() == "# sample"
 
 
@@ -276,7 +331,7 @@ class FakePC:
         monkeypatch.setattr(firewall, "add", add_rules)
         monkeypatch.setattr(firewall, "remove_ours", remove_rules)
 
-        def hosts(action, address, backup_dir):
+        def hosts(action, address=None):
             self.calls.append(("hosts", action))
             if uac_ok:
                 self.hosts = []

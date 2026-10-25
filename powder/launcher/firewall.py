@@ -1,14 +1,19 @@
 """Windows Defender Firewall rules for playing with others on the local network.
 
-  host:      "Powder server": Powder's server program (its HTTPS, game server and Storm ports)
-  every PC:  "Powder: Steep peer-to-peer": the game itself (the players' games connect to each other)
+  host:      "Powder server": Powder's server program, TCP on its HTTPS and CRL ports, UDP on its game
+             server and Storm ports (one rule per protocol)
+  every PC:  "Powder: Steep peer-to-peer": the game itself, UDP (the players' games connect to each other
+             on ports they pick)
 
-Rules are per program, not per port: Windows asks about a program that starts listening unless a rule
-names that program, and port rules don't count. Both rules allow only the local network (RemoteAddress
-LocalSubnet; a VPN with its own subnet is not covered) and carry the group "Powder", so Restore system
-removes exactly these. Reading rules needs no admin rights; adding and removing them does (UAC): announce
-it first and only call add/remove after the user pressed a button for it (see session.py).
-Uses PowerShell's NetSecurity cmdlets, whose output is not translated (netsh's is).
+Rules are per program: Windows asks about a program that starts listening unless a rule names that program,
+and port rules don't count. All rules allow only the local network (RemoteAddress LocalSubnet; a VPN with its
+own subnet is not covered) on networks Windows treats as Private or Domain (not Public: on a public Wi-Fi the
+"local network" is everyone there), and carry the group "Powder", so Restore system removes exactly these.
+Reading rules needs no admin rights; adding and removing them does (UAC): announce it first and only call
+add/remove after the user pressed a button for it (see session.py).
+Uses PowerShell's NetSecurity cmdlets, whose output is not translated (netsh's is), by PowerShell's full path
+in System32 and without profiles; the elevated script loads modules only from PowerShell's own folder
+($PSHOME\Modules, admin-only), not from the user's module folders, which come first in PSModulePath.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import paths
 from . import elevate
 
 log = logging.getLogger("powder.launcher")
@@ -28,6 +34,8 @@ SERVER_RULE = "Powder server"
 GAME_RULE = "Powder: Steep peer-to-peer"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CATEGORY_PROFILE = {"Private": "Private", "Public": "Public", "DomainAuthenticated": "Domain"}
+PROFILES = "Domain, Private"            # where our rules apply (never Public)
+TRUSTED_CATEGORIES = {"Private", "DomainAuthenticated"}
 
 
 class FirewallError(Exception):
@@ -43,6 +51,7 @@ class Rule:
     group: str = ""
     profile: str = "Any"        # "Any" or e.g. "Private, Public"
     protocol: str = "Any"       # "Any", "TCP", "UDP", ...
+    ports: str = "Any"          # local ports: "Any" or e.g. "443 80" / "5000-5010"
 
 
 @dataclass(frozen=True)
@@ -51,6 +60,10 @@ class Program:
     exe: Path
     rule: str
     protocols: tuple[str, ...]  # what it needs (an Allow rule for "Any" covers everything)
+    ports: tuple[tuple[str, tuple[int, ...]], ...] = ()   # (protocol, local ports) it listens on; none: any port
+
+    def ports_for(self, protocol: str) -> tuple[int, ...]:
+        return next((p for proto, p in self.ports if proto == protocol), ())
 
 
 def norm(path: str | Path) -> str:
@@ -61,9 +74,13 @@ def _q(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def powershell() -> str:
+    return paths.system_exe(r"WindowsPowerShell\v1.0\powershell.exe")
+
+
 def _ps(script: str, timeout: float = 90) -> str:
     try:
-        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        r = subprocess.run([powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
                            capture_output=True, text=True, timeout=timeout, creationflags=CREATE_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as e:
         raise FirewallError(f"PowerShell could not read the firewall rules ({e})") from e
@@ -72,10 +89,11 @@ def _ps(script: str, timeout: float = 90) -> str:
     return r.stdout
 
 
-_RULE_FIELDS = ("[pscustomobject]@{ name = $r.DisplayName; action = [string]$r.Action; enabled = [string]$r.Enabled; "
+_RULE_FIELDS = ("$p = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; "
+                "[pscustomobject]@{ name = $r.DisplayName; action = [string]$r.Action; enabled = [string]$r.Enabled; "
                 "group = $r.Group; profile = [string]$r.Profile; "
                 "program = [Environment]::ExpandEnvironmentVariables([string]$a.Program).ToLowerInvariant(); "
-                "protocol = [string]($r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue).Protocol }")
+                "protocol = [string]$p.Protocol; ports = [string]$p.LocalPort }")
 
 
 def _parse(out: str) -> dict:
@@ -92,7 +110,7 @@ def _parse(out: str) -> dict:
     return {"categories": cats,
             "rules": [Rule(d.get("name") or "", d.get("action") or "", str(d.get("enabled")) == "True",
                            os.path.normcase(d.get("program") or ""), d.get("group") or "", d.get("profile") or "Any",
-                           d.get("protocol") or "Any") for d in rules]}
+                           d.get("protocol") or "Any", d.get("ports") or "Any") for d in rules]}
 
 
 def ours() -> list[Rule]:
@@ -131,14 +149,37 @@ def blocked(program: Program, rules: list[Rule], categories: list[str]) -> list[
             and _applies(r, categories)]
 
 
+def port_set(text: str) -> set[int] | None:
+    """Local ports of a rule ("443 80", "5000-5010"); None for any port (also for what can't be read)."""
+    found: set[int] = set()
+    for part in text.replace(",", " ").split():
+        lo, _, hi = part.partition("-")
+        if not lo.isdigit() or not (hi or lo).isdigit() or not int(lo) <= int(hi or lo) < 65536:
+            return None
+        found.update(range(int(lo), int(hi or lo) + 1))
+    return found or None
+
+
 def allowed(program: Program, rules: list[Rule], categories: list[str]) -> bool:
-    protocols = {r.protocol for r in rules if r.program == norm(program.exe).lower() and r.action == "Allow"
-                 and _applies(r, categories)}
-    return "Any" in protocols or set(program.protocols) <= protocols
+    """Do enabled Allow rules for this program cover every protocol (and port) it needs, here and now?"""
+    mine = [r for r in rules if r.program == norm(program.exe).lower() and r.action == "Allow"
+            and _applies(r, categories)]
+    for protocol in program.protocols:
+        covering = [r for r in mine if r.protocol in ("Any", protocol)]
+        if not covering:
+            return False
+        opened = [port_set(r.ports) if r.protocol != "Any" else None for r in covering]
+        if None in opened:
+            continue                                     # a rule for every port of it
+        needed = set(program.ports_for(protocol))
+        if not needed or not needed <= set().union(*opened):
+            return False
+    return True
 
 
 def add_script(programs: list[Program]) -> str:
-    common = (f"-Group {_q(GROUP)} -Direction Inbound -Action Allow -RemoteAddress LocalSubnet -Profile Any "
+    common = (f"-Group {_q(GROUP)} -Direction Inbound -Action Allow -RemoteAddress LocalSubnet "
+              f"-Profile {_q(PROFILES)} "
               f"-Description {_q('Added by the Powder launcher for playing on the local network')}")
     parts = []
     for p in programs:
@@ -147,13 +188,21 @@ def add_script(programs: list[Program]) -> str:
         parts.append(f"Get-NetFirewallRule -Group {_q(GROUP)} -ErrorAction SilentlyContinue | Where-Object {{ "
                      f"$_.DisplayName -eq {_q(p.rule)} -and ($_ | Get-NetFirewallApplicationFilter).Program -eq "
                      f"{_q(exe)} }} | Remove-NetFirewallRule")
-        parts.append(f"New-NetFirewallRule -DisplayName {_q(p.rule)} {common} -Program {_q(exe)} | Out-Null")
+        for protocol in p.protocols:
+            if protocol not in ("TCP", "UDP"):
+                raise ValueError(f"protocol {protocol!r}")
+            ports = sorted({int(n) for n in p.ports_for(protocol) if 0 < int(n) < 65536})
+            local = f" -LocalPort {','.join(map(str, ports))}" if ports else ""
+            parts.append(f"New-NetFirewallRule -DisplayName {_q(p.rule)} {common} -Program {_q(exe)} "
+                         f"-Protocol {protocol}{local} | Out-Null")
     return "; ".join(parts)
 
 
 def _elevated(script: str) -> int:
-    return elevate.run_elevated(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                                 f"$ErrorActionPreference = 'Stop'; {script}; exit 0"])
+    # modules only from $PSHOME (System32, admin-only): the user's module folders come first in PSModulePath
+    return elevate.run_elevated([powershell(), "-NoProfile", "-NonInteractive", "-Command",
+                                 "$ErrorActionPreference = 'Stop'; $env:PSModulePath = Join-Path $PSHOME 'Modules'; "
+                                 f"Import-Module NetSecurity; {script}; exit 0"])
 
 
 def add(programs: list[Program]) -> int:

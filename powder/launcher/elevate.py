@@ -1,10 +1,14 @@
-"""Run one command elevated (UAC) and wait for it. Used only for the hosts-file change.
+"""Run one command elevated (UAC) and wait for it: the hosts-file change (Powder's own program, see hostsfix.py)
+and the firewall rules (PowerShell by its full path, see firewall.py). Only fixed, validated arguments are
+passed (the hosts step gets an IPv4 address and nothing else).
 
 Rule: call this only after the user was told why admin rights are needed and pressed a button for it
-(see HOSTS_ADMIN_WHY in session.py); a UAC prompt must never appear out of nowhere."""
+(see HOSTS_ADMIN_WHY in session.py); a UAC prompt must never appear out of nowhere.
+Known limit (see paths.py): the installed powder-cli.exe sits in a user-writable folder."""
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import subprocess
 from ctypes import wintypes
 
@@ -40,5 +44,12 @@ def run_elevated(cmd: list[str]) -> int:
     return code.value
 
 
-def hosts(action: str, address: str, backup_dir: str) -> int:
-    return run_elevated(paths.self_command("hostsfix", action, "--address", address, "--backup-dir", backup_dir))
+def hosts(action: str, address: str | None = None) -> int:
+    """hostsfix add (for `address`, an IPv4 address) or remove, elevated."""
+    if action == "add":
+        try:
+            address = str(ipaddress.IPv4Address(address or ""))
+        except ValueError:
+            return 1
+        return run_elevated(paths.self_command("hostsfix", "add", "--address", address))
+    return run_elevated(paths.self_command("hostsfix", "remove"))
