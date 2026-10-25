@@ -10,7 +10,8 @@
 //!   of ubi.com and ubisoft.com ([`PERMITTED_DOMAINS`]); they are kept as they are (players trust them), and a
 //!   new CA is made only by deleting `data/tls/` (then trusted again on each PC).
 //! - **server certificate** (`server.pem` = key + certificate + CA): the Ubisoft hostnames we answer that its
-//!   CA permits (`cert_names()`; under a narrow CA without the `*.ubi.com`-style wildcards), with a CRL
+//!   CA permits (`cert_names()`; under a narrow CA without the `*.ubi.com`-style wildcards, and one carrying a
+//!   name its CA does not permit is re-issued: every client refuses it as a whole), with a CRL
 //!   distribution point on this machine.
 //! - The private keys (`ca-key.pem`, `server.pem`) are written readable by their owner only (0600 on Unix), and
 //!   an existing key file readable by others is made so when it is loaded.
@@ -241,8 +242,10 @@ fn load_ca(ca_pem: &Path, ca_key_pem: &Path) -> Result<(Vec<u8>, Certificate, Ke
     Ok((der.to_vec(), ca, key))
 }
 
-/// An existing server.pem is reused only if this CA signed it, it is not about to expire, and it has the
-/// current names and CRL point. (Earlier versions' certificates are replaced automatically.)
+/// An existing server.pem is reused only if this CA signed it, it is not about to expire, it has the names its CA
+/// permits (and no other: one would make clients refuse it, as a server.pem with wildcards under a narrow CA, which
+/// the Python server wrote before 2026-10-25) and the CRL point. (Earlier versions' certificates are replaced
+/// automatically.)
 fn server_ok(server_pem: &Path, ca_der: &[u8]) -> bool {
     let Ok(pem) = std::fs::read(server_pem) else { return false };
     let Some(Ok(der)) = rustls_pemfile::certs(&mut pem.as_slice()).next() else { return false };
@@ -255,7 +258,11 @@ fn server_ok(server_pem: &Path, ca_der: &[u8]) -> bool {
         && cert.verify_signature(Some(ca.public_key())).is_ok()
         && cert.subject().as_raw() != cert.issuer().as_raw()
         && cert.validity().not_after.timestamp() > renew_at.timestamp()
-        && dns_names(&cert).is_some_and(|names| server_names(ca_der).iter().all(|h| names.contains(h)))
+        && dns_names(&cert).is_some_and(|names| {
+            let permitted = permitted_dns(&ca);
+            server_names(ca_der).iter().all(|h| names.contains(h))
+                && permitted.is_none_or(|p| names.iter().all(|n| within(n, &p)))
+        })
         && crl_points(&cert).is_some_and(|points| points == [crl_url()])
 }
 
@@ -535,12 +542,42 @@ mod tests {
             handshake(&server, &pki.ca_der, host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
         }
         assert!(server_ok(&pki.server_pem, &pki.ca_der));
+        let kept = std::fs::read(&pki.server_pem).unwrap();
+        assert_eq!(std::fs::read(ensure_pki(dir.path()).unwrap().server_pem).unwrap(), kept, "kept, wildcards and all");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!((mode(&pki.ca_key_pem), mode(&pki.server_pem)), (0o600, 0o600));
         }
+    }
+
+    /// Under a narrow CA, a server.pem with every `cert_names()` entry (wildcards included, as the Python server
+    /// wrote before 2026-10-25; every client refuses it) is re-issued with exactly the names the CA permits; one
+    /// with those names is kept byte for byte.
+    #[tokio::test]
+    async fn a_narrow_ca_with_a_wildcard_server_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, ca_key) = make_ca(&ca_permitted()).unwrap();
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(dir.path().join("ca-key.pem"), ca_key.serialize_pem()).unwrap();
+        let (cert, key) = make_server(&ca, &ca_key, &cert_names()).unwrap();
+        let wildcard = chain(&cert, &key, ca.der());
+        std::fs::write(dir.path().join("server.pem"), &wildcard).unwrap();
+        let refused = handshake(&wildcard, ca.der(), redirect_hosts()[0]).await.unwrap_err();
+        assert!(refused.contains("NameConstraintViolation"), "{refused}");
+        assert!(!server_ok(&dir.path().join("server.pem"), ca.der()));
+        let pki = ensure_pki(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&pki.ca_pem).unwrap(), ca.pem().as_bytes());
+        let chain_der = certs(&pki.server_pem);
+        let (_, server) = parse_x509_certificate(&chain_der[0]).unwrap();
+        assert_eq!(dns_names(&server).unwrap(), redirect_hosts());
+        let server = std::fs::read_to_string(&pki.server_pem).unwrap();
+        for host in redirect_hosts() {
+            handshake(&server, &pki.ca_der, host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        let kept = std::fs::read(&pki.server_pem).unwrap();
+        assert_eq!(std::fs::read(ensure_pki(dir.path()).unwrap().server_pem).unwrap(), kept, "exactly those: kept");
     }
 
     /// Key files are written owner-only, and an existing one readable by others is made so on load.
