@@ -76,6 +76,76 @@ pub(super) fn owner(c: &Ctx) -> Option<String> {
     c.session.as_ref().map(|s| s.profile_id().to_string())
 }
 
+// ---- who may act ------------------------------------------------------------------------------------------
+// A server without accounts trusts everyone (one local player, the default one, or [players.bind]): routes act
+// for the session's player, else the default player, as before accounts existed. Once accounts are required (an
+// account exists, or [server] public), a route that acts for a player needs a session (401 otherwise, never the
+// default player as a stand-in), writes go only to the session's own player, entities and UGC (403 otherwise),
+// and reads of player data need a session too (any player: others' public data stays readable). Not affected:
+// the sign-in, the internet check, the rendezvous configuration, game-wide data (pack, built-in replies,
+// offers), the public /_powder/ routes and the links whose token is the credential (cloud-save slots, entity
+// file uploads); file downloads (entity files, photos) stay open like the S3 links they stand in for.
+
+/// The player a request acts for, and whether it may act only on its own data (accounts are required).
+pub(super) struct Actor {
+    pub pid: String,
+    pub guarded: bool,
+}
+
+static PROFILE_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap());
+
+/// A profile id from the URL, lower-cased, if it is shaped like one (a UUID): anything else never reaches the
+/// database or a file path.
+pub(super) fn url_profile_id(raw: &str) -> Option<String> {
+    let pid = raw.to_lowercase();
+    PROFILE_ID.is_match(&pid).then_some(pid)
+}
+
+pub(super) fn accounts_required(c: &Ctx) -> Result<bool, Reply> {
+    c.state.accounts.required().map_err(|e| Reply::internal_error(&e))
+}
+
+/// A request without a session where one is needed: 401, shaped like UbiServices' refused sign-in.
+pub(super) fn no_session(c: &Ctx) -> Reply {
+    log::warn!(target: "powder.https", "{} {} from {} refused: no session (accounts are required)", c.req.method,
+               c.req.path(), c.req.client_ip());
+    let mut r = auth_refused("Not signed in (no valid ticket)");
+    r.how = "no-session".into();
+    r
+}
+
+/// Writing what belongs to another player (accounts required).
+pub(super) fn forbidden(c: &Ctx, what: &str) -> Reply {
+    log::warn!(target: "powder.https", "{} {} by {} refused: {what}", c.req.method, c.req.path(),
+               owner(c).unwrap_or_else(|| "?".into()));
+    error(1, what, 403, "forbidden")
+}
+
+/// Who acts: the session's player; without a session the default player (no accounts) or a 401.
+pub(super) fn acting(c: &Ctx) -> Result<Actor, Reply> {
+    let guarded = accounts_required(c)?;
+    match (owner(c), guarded) {
+        (Some(pid), _) => Ok(Actor { pid, guarded }),
+        (None, false) => Ok(Actor { pid: default_player(c).map_err(|e| Reply::internal_error(&e))?, guarded }),
+        (None, true) => Err(no_session(c)),
+    }
+}
+
+/// Reads of player data: anyone on a server without accounts, else a signed-in player (-> its profile id).
+pub(super) fn reader(c: &Ctx) -> Result<Option<String>, Reply> {
+    match owner(c) {
+        Some(pid) => Ok(Some(pid)),
+        None if accounts_required(c)? => Err(no_session(c)),
+        None => Ok(None),
+    }
+}
+
+/// The reply, or the refusal (Err) that came first.
+pub(super) fn allowed(r: Result<Reply, Reply>) -> Reply {
+    r.unwrap_or_else(|refused| refused)
+}
+
 /// `items[offset:offset + limit]`, as Python slices (negative numbers count from the end).
 pub(super) fn py_slice<T>(items: Vec<T>, offset: i64, limit: i64) -> Vec<T> {
     let n = items.len() as i64;
@@ -199,6 +269,9 @@ fn rendezvous_configuration(c: &Ctx) -> Reply {
 
 // ---- inventory & store --------------------------------------------------------------------------------------
 fn get_inventory(c: &Ctx) -> Reply {
+    if let Err(refused) = reader(c) {
+        return refused;
+    }
     let pid = c.param("profile_id").to_lowercase();
     match c.state.repos.player(&pid) {
         // someone this server has no record of: owns nothing
@@ -216,8 +289,20 @@ fn get_inventory(c: &Ctx) -> Reply {
 fn post_inventory(c: &Ctx) -> Reply {
     let st = c.state;
     let pid = c.param("profile_id").to_lowercase();
-    if let Some(me) = owner(c).filter(|me| *me != pid) {
-        log::warn!(target: "powder.https", "inventory POST for {pid} by session of {me}");
+    let me = match acting(c) {
+        Ok(me) => me,
+        Err(refused) => return refused,
+    };
+    if me.pid != pid {
+        if me.guarded {
+            return forbidden(c, "not your inventory");
+        }
+        // no accounts: anyone may, as before, but a player record is made only for the one acting
+        match st.repos.player(&pid) {
+            Ok(Some(_)) => log::warn!(target: "powder.https", "inventory POST for {pid} by {}", me.pid),
+            Ok(None) => return error(1, &format!("profile {pid} not found"), 404, "unknown-player"),
+            Err(e) => return Reply::internal_error(&e),
+        }
     }
     let bad = |msg: &str| error(1, &format!("bad request: {msg}"), 400, "bad-request");
     let body = match json_object(c, bad) {
@@ -275,46 +360,91 @@ fn kind(q: &Query) -> Option<&str> {
     q.get("type").filter(|t| !t.is_empty())
 }
 
+/// Signs the upload links (putUrl / deleteUrl) of entity files; new on every start (the links last an hour).
+static LINK_KEY: LazyLock<Vec<u8>> = LazyLock::new(|| crate::util::random_bytes(32));
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.iter().map(|b| b ^ byte).collect::<Vec<u8>>();
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(message).finalize();
+    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
+}
+
+/// `<expiry>.<signature>`: lets the holder write one entity's file until the expiry (unix seconds), like an S3
+/// presigned link (the game may upload without its ticket).
+fn file_token(entity_id: &str, expires: i64) -> String {
+    let mac = hmac_sha256(&LINK_KEY, format!("entity-file:{entity_id}:{expires}").as_bytes());
+    format!("{expires}.{}", hex::encode(mac))
+}
+
+fn file_token_ok(entity_id: &str, token: &str) -> bool {
+    let Some(expires) = token.split_once('.').and_then(|(e, _)| e.parse::<i64>().ok()) else { return false };
+    let want = file_token(entity_id, expires);
+    expires >= chrono::Utc::now().timestamp() && want.len() == token.len()
+        && want.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 /// An entity with a file (extendedStorage, e.g. a saved replay or a challenge ghost) gets links to it on this
 /// server, as Ubisoft's gave links to S3: putUrl / deleteUrl after a write (the game uploads there), getUrl /
-/// headUrl on reads.
-fn storage(req: &Req, mut entity: Entity, write: bool) -> Entity {
+/// headUrl on reads. `signed`: the write links carry a token (accounts required; see entity_file).
+fn storage(req: &Req, mut entity: Entity, write: bool, signed: bool) -> Entity {
     let Some(Value::Object(ext)) = entity.get("extendedStorage") else { return entity };
     let id = entity.get("entityId").and_then(Value::as_str).unwrap_or_default();
-    let url = json!(format!("https://{}/_powder/entity-files/{id}", host(req)));
-    let expires = (chrono::Utc::now() + chrono::Duration::seconds(STORAGE_LINK_S)).format("%Y-%m-%dT%H:%M:%SZ");
+    let url = format!("https://{}/_powder/entity-files/{id}", host(req));
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(STORAGE_LINK_S);
     let mut ext = ext.clone();
     ext.insert("provider".into(), json!("s3"));
     if write {
-        ext.insert("putUrl".into(), url.clone());
-        ext.insert("deleteUrl".into(), url.clone());
+        let write_url = if signed { format!("{url}?t={}", file_token(id, expires.timestamp())) } else { url.clone() };
+        ext.insert("putUrl".into(), json!(write_url));
+        ext.insert("deleteUrl".into(), json!(write_url));
     }
-    ext.insert("headUrl".into(), url.clone());
-    ext.insert("getUrl".into(), url);
-    ext.insert("expirationTime".into(), json!(expires.to_string()));
+    ext.insert("headUrl".into(), json!(url));
+    ext.insert("getUrl".into(), json!(url));
+    ext.insert("expirationTime".into(), json!(expires.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
     entity.insert("extendedStorage".into(), Value::Object(ext));
     entity
 }
 
 fn entities_reply(req: &Req, items: Vec<Entity>) -> Reply {
     let how = format!("entities({})", items.len());
-    let items: Vec<Value> = items.into_iter().map(|e| Value::Object(storage(req, e, false))).collect();
+    let items: Vec<Value> = items.into_iter().map(|e| Value::Object(storage(req, e, false, false))).collect();
     Reply::json(&json!({"entities": items}), &how, 200)
 }
 
-/// The file behind an entity's links: PUT (upload), GET / HEAD (download), DELETE.
+/// The file behind an entity's links: PUT (upload), GET / HEAD (download), DELETE. With accounts required, a
+/// write needs the link's token or a session of the entity's owner (403 otherwise); downloads stay open.
 fn entity_file(c: &Ctx) -> Reply {
     let id = c.param("entity_id").to_lowercase();
     if !ENTITY_FILE.is_match(&id) {
         return empty(404, "?");
     }
-    match c.state.entities.get(&id) {
-        Ok(Some(_)) => {}
+    let entity = match c.state.entities.get(&id) {
+        Ok(Some(e)) => e,
         Ok(None) => return empty(404, "?"),
         Err(e) => return Reply::internal_error(&e),
+    };
+    let method = c.req.method.as_str();
+    if matches!(method, "PUT" | "POST" | "DELETE") {
+        let guarded = match accounts_required(c) {
+            Ok(g) => g,
+            Err(reply) => return reply,
+        };
+        let owners = owner(c).is_some_and(|me| entity.get("profileId").and_then(Value::as_str) == Some(me.as_str()));
+        if guarded && !owners && !query(c.req).get("t").is_some_and(|t| file_token_ok(&id, t)) {
+            log::warn!(target: "powder.https", "entity file {id}: {method} from {} refused (no valid link token, \
+                       not the owner's session)", c.req.client_ip());
+            return empty(403, "forbidden");
+        }
     }
     let path = c.state.config.data_dir().join("entity-files").join(&id);
-    match c.req.method.as_str() {
+    match method {
         "PUT" | "POST" => {
             let written = path.parent().map_or(Ok(()), std::fs::create_dir_all)
                 .and_then(|_| std::fs::write(&path, &c.req.body));
@@ -354,6 +484,9 @@ pub(super) fn remove_file(path: &std::path::Path) {
 
 /// GET /v2/profiles/{pid}/entities?type=&tags=&offset=&limit= (own player from the DB).
 fn get_profile_entities(c: &Ctx) -> Reply {
+    if let Err(refused) = reader(c) {
+        return refused;
+    }
     let q = query(c.req);
     match c.state.entities.for_profile(c.param("profile_id"), kind(&q), q.get("tags"), 0, usize::MAX) {
         Ok(items) => entities_reply(c.req, py_slice(items, int_param(&q, "offset", 0), int_param(&q, "limit", 100))),
@@ -364,6 +497,9 @@ fn get_profile_entities(c: &Ctx) -> Reply {
 /// GET /v2/profiles/entities?profileIds=a,b&type=PROFILE (rider cards of friends and self), also with tags (the
 /// friends' trails: type=FAVORITE_CHALLENGE&tags=TRAIL,WORLD_<id>,SANDBOX_A).
 fn get_entities_batch(c: &Ctx) -> Reply {
+    if let Err(refused) = reader(c) {
+        return refused;
+    }
     let q = query(c.req);
     let ids: Vec<String> = q.get("profileIds").unwrap_or("").split(',').filter(|p| !p.is_empty())
         .map(str::to_string).collect();
@@ -374,59 +510,93 @@ fn get_entities_batch(c: &Ctx) -> Reply {
 }
 
 fn get_entity(c: &Ctx) -> Reply {
+    if let Err(refused) = reader(c) {
+        return refused;
+    }
     match c.state.entities.get(c.param("entity_id")) {
-        Ok(Some(e)) => Reply::json(&Value::Object(storage(c.req, e, false)), "entity", 200),
+        Ok(Some(e)) => Reply::json(&Value::Object(storage(c.req, e, false, false)), "entity", 200),
         Ok(None) => error(1002, "entity not found", 404, "entity-missing"),
         Err(e) => Reply::internal_error(&e),
     }
 }
 
 /// An entity written (PUT, POST): its links to upload a file to.
-fn entity_written(c: &Ctx, written: anyhow::Result<Entity>, how: impl Fn(&Entity) -> String) -> Reply {
+fn entity_written(c: &Ctx, written: anyhow::Result<Entity>, signed: bool, how: impl Fn(&Entity) -> String)
+                  -> Reply {
     match written {
-        Ok(e) => Reply::json(&Value::Object(storage(c.req, e.clone(), true)), &how(&e), 200),
+        Ok(e) => Reply::json(&Value::Object(storage(c.req, e.clone(), true, signed)), &how(&e), 200),
         // EntityService::put's refusal (Python's ValueError); anything else failed
         Err(e) if e.to_string() == "entity without an owner" => error(1, &e.to_string(), 400, "bad-request"),
         Err(e) => Reply::internal_error(&e),
     }
 }
 
+fn text_field<'a>(m: &'a Entity, key: &str) -> Option<&'a str> {
+    m.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+/// With accounts required: the entity (if it exists) must be the actor's, and a body naming an owner must name
+/// the actor (EntityService::put would take it for a new entity).
+fn check_entity_owner(c: &Ctx, me: &Actor, existing: Option<&Entity>, body: Option<&Entity>) -> Result<(), Reply> {
+    if !me.guarded {
+        return Ok(());
+    }
+    let others = |owner: Option<&str>| owner.is_some_and(|o| o.to_lowercase() != me.pid);
+    if others(existing.and_then(|e| text_field(e, "profileId"))) {
+        return Err(forbidden(c, "not your entity"));
+    }
+    if existing.is_none() && others(body.and_then(|b| text_field(b, "profileId"))) {
+        return Err(forbidden(c, "not your profile"));
+    }
+    Ok(())
+}
+
+fn existing_entity(c: &Ctx, id: &str) -> Result<Option<Entity>, Reply> {
+    c.state.entities.get(id).map_err(|e| Reply::internal_error(&e))
+}
+
 fn put_entity(c: &Ctx) -> Reply {
-    let body = match json_object(c, |msg| error(1, msg, 400, "bad-request")) {
-        Ok(b) => b,
-        Err(reply) => return reply,
-    };
-    let me = owner(c);
-    let written = c.state.entities.put(c.param("entity_id"), &body, me.as_deref());
-    entity_written(c, written, |e| format!("entity-saved(rev {})", e.get("revision").unwrap_or(&Value::Null)))
+    allowed((|| {
+        let me = acting(c)?;
+        let body = json_object(c, |msg| error(1, msg, 400, "bad-request"))?;
+        // no accounts: the session's player (none: the body must name the owner), as before
+        let writer = if me.guarded { Some(me.pid.clone()) } else { owner(c) };
+        if me.guarded {
+            check_entity_owner(c, &me, existing_entity(c, c.param("entity_id"))?.as_ref(), Some(&body))?;
+        }
+        let written = c.state.entities.put(c.param("entity_id"), &body, writer.as_deref());
+        Ok(entity_written(c, written, me.guarded,
+                          |e| format!("entity-saved(rev {})", e.get("revision").unwrap_or(&Value::Null))))
+    })())
 }
 
 /// POST /v2/profiles/entities and /v2/profiles/{pid}/entities (e.g. a new player's rider card).
 fn post_entity(c: &Ctx) -> Reply {
-    let owner = match Some(c.param("profile_id")).filter(|p| !p.is_empty()).map(str::to_string).or_else(|| owner(c)) {
-        Some(o) => o,
-        None => match default_player(c) {
-            Ok(p) => p,
-            Err(e) => return Reply::internal_error(&e),
-        },
-    }.to_lowercase();
-    let body = match json_object(c, |msg| error(1, msg, 400, "bad-request")) {
-        Ok(b) => b,
-        Err(reply) => return reply,
-    };
-    entity_written(c, c.state.entities.create(&body, &owner), |_| "entity-created".into())
+    allowed((|| {
+        let me = acting(c)?;
+        let owner = match Some(c.param("profile_id")).filter(|p| !p.is_empty()) {
+            None => me.pid.clone(),
+            Some(p) if p.to_lowercase() == me.pid => me.pid.clone(),
+            Some(_) if me.guarded => return Err(forbidden(c, "not your profile")),
+            Some(p) => url_profile_id(p).ok_or_else(|| error(1, "bad profile id", 400, "bad-request"))?,
+        };
+        let body = json_object(c, |msg| error(1, msg, 400, "bad-request"))?;
+        check_entity_owner(c, &me, None, Some(&body))?;
+        Ok(entity_written(c, c.state.entities.create(&body, &owner), me.guarded, |_| "entity-created".into()))
+    })())
 }
 
 fn delete_entity(c: &Ctx) -> Reply {
-    let id = c.param("entity_id");
-    let deleted = match c.state.entities.delete(id) {
-        Ok(d) => d,
-        Err(e) => return Reply::internal_error(&e),
-    };
-    if ENTITY_FILE.is_match(&id.to_lowercase()) {
-        remove_file(&c.state.config.data_dir().join("entity-files").join(id.to_lowercase()));
-    }
-    Reply::json(&json!({}), if deleted { "entity-deleted" } else { "entity-absent" }, 200)
+    allowed((|| {
+        let id = c.param("entity_id");
+        let me = acting(c)?;
+        check_entity_owner(c, &me, existing_entity(c, id)?.as_ref(), None)?;
+        let deleted = c.state.entities.delete(id).map_err(|e| Reply::internal_error(&e))?;
+        if ENTITY_FILE.is_match(&id.to_lowercase()) {
+            remove_file(&c.state.config.data_dir().join("entity-files").join(id.to_lowercase()));
+        }
+        Ok(Reply::json(&json!({}), if deleted { "entity-deleted" } else { "entity-absent" }, 200))
+    })())
 }
 
 // ---- Ubisoft Connect ----------------------------------------------------------------------------------------
@@ -436,14 +606,19 @@ fn internet_check(_: &Ctx) -> Reply {
     Reply::new(200, "text/plain; charset=utf-8", b"I AM ALIVE!".to_vec(), "internet-check")
 }
 
-/// Whose cloud save: the signed-in player (Connect's ticket), else the profile in the path, else the default
-/// player (a server without accounts).
-fn cloud_owner(c: &Ctx) -> anyhow::Result<String> {
-    let pid = owner(c).or_else(|| Some(c.param("profile_id").to_string()).filter(|p| !p.is_empty()));
-    Ok(match pid {
-        Some(p) => p,
-        None => default_player(c)?,
-    }.to_lowercase())
+/// Whose cloud save: the signed-in player (Connect's ticket). Without a session: on a server without accounts the
+/// profile in the path (if shaped like one), else the default player; once accounts are required, a 401.
+fn cloud_owner(c: &Ctx) -> Result<String, Reply> {
+    if let Some(me) = owner(c) {
+        return Ok(me.to_lowercase());
+    }
+    if accounts_required(c)? {
+        return Err(no_session(c));
+    }
+    match url_profile_id(c.param("profile_id")) {
+        Some(pid) => Ok(pid),
+        None => default_player(c).map(|p| p.to_lowercase()).map_err(|e| Reply::internal_error(&e)),
+    }
 }
 
 /// GET /v1/profiles/{pid}/entities?name=upcCloudSaveUplayId_<product>: Ubisoft Connect's cloud-save entity
@@ -452,7 +627,7 @@ fn get_entities_v1(c: &Ctx) -> Reply {
     let product = query(c.req).get("name").and_then(cloudsaves::product_of);
     let owner = match cloud_owner(c) {
         Ok(o) => o,
-        Err(e) => return Reply::internal_error(&e),
+        Err(refused) => return refused,
     };
     let Some(product) = product.filter(|_| owner == c.param("profile_id").to_lowercase()) else {
         return Reply::json(&json!({"entities": []}), "entities-v1", 200);
@@ -493,7 +668,18 @@ fn write_cloud_entity(c: &Ctx) -> Reply {
 
 fn cloud_entity(c: &Ctx, body: &mut Entity, product: u64) -> anyhow::Result<Reply> {
     let st = c.state;
-    let owner = cloud_owner(c)?;
+    let owner = match cloud_owner(c) {
+        Ok(o) => o,
+        Err(refused) => return Ok(refused),
+    };
+    let path_pid = c.param("profile_id").to_lowercase();
+    let guarded = match accounts_required(c) {
+        Ok(g) => g,
+        Err(reply) => return Ok(reply),
+    };
+    if guarded && !path_pid.is_empty() && path_pid != owner {
+        return Ok(forbidden(c, "not your profile"));
+    }
     let slots = body.get("obj").and_then(|o| o.get("slots")).and_then(Value::as_array).into_iter().flatten()
         .filter_map(Value::as_object)
         .map(|s| format!("({}, {})", py_repr(s.get("filename")), py_repr(s.get("size"))))
@@ -612,6 +798,11 @@ mod tests {
 
     fn register(st: &HttpState, email: &str, name: &str) {
         st.accounts.register(email, PASSWORD, name).unwrap();
+    }
+
+    /// The Authorization header of a new session of this player.
+    fn auth_for(st: &HttpState, pid: &str) -> String {
+        format!("Ubi_v1 t={}", st.sessions.issue(st.accounts.player(pid).unwrap(), "127.0.0.1", "").ticket)
     }
 
     #[test]
@@ -1180,9 +1371,11 @@ mod tests {
     #[test]
     fn links_and_entities_belong_to_one_player() {
         let tmp = tempfile::tempdir().unwrap();
-        let (st, _) = files_state(tmp.path(), None);
+        let (st, host) = files_state(tmp.path(), None);
         register(&st, "host@example.com", "Host"); // takes over the default player
         let other = st.accounts.register("guest@example.com", PASSWORD, "Guest").unwrap().profile_id;
+        let auth = auth_for(&st, &host);
+        let auth = [("Authorization", auth.as_str())];
         let token = st.cloudsaves.link(&other, PRODUCT, "1", None, "PUT").unwrap();
         let r = send(&st, "PUT", &format!("/_powder/cloudsaves/{PRODUCT}/2?t={token}"), &[], b"x");
         assert_eq!((r.status, r.how.as_str(), r.body.len()), (403, "?", 0), "another slot");
@@ -1191,13 +1384,129 @@ mod tests {
         let mut b = entity_body(None, &[10, 20]);
         b["type"] = json!("cloudSave");
         st.entities.put("00000000-0000-4000-8000-0000000000aa", b.as_object().unwrap(), Some(&other)).unwrap();
-        let r = send_json(&st, "PUT", "/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", &[],
+        let r = send_json(&st, "PUT", "/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", &auth,
                           &entity_body(Some(1), &[10, 20]));
         assert_eq!((r.status, r.how.as_str()), (403, "forbidden"), "not the requester's");
-        let r = handle(&st, &req("GET", &format!("/v1/profiles/{other}/entities?name={}", cloud_name(PRODUCT)), &[]));
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{other}/entities?name={}", cloud_name(PRODUCT)), &auth));
         assert_eq!(body(&r), json!({"entities": []}));
-        let r = send_json(&st, "POST", &format!("/v1/profiles/{other}/entities"), &[], &json!({"name": "x"}));
+        let r = send_json(&st, "POST", &format!("/v1/profiles/{other}/entities"), &auth, &json!({"name": "x"}));
         assert_eq!((r.status, body(&r)["message"].as_str()), (400, Some("not a cloud save")));
+        // creating one in another player's name, or anything without a session (accounts exist)
+        let r = send_json(&st, "POST", &format!("/v1/profiles/{other}/entities"), &auth, &entity_body(None, &[1]));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (403, Some("not your profile")));
+        assert!(st.cloudsaves.entity(&other, PRODUCT).unwrap().unwrap()["profileId"] == other.as_str());
+        let r = send_json(&st, "PUT", "/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", &[],
+                          &entity_body(Some(1), &[10, 20]));
+        assert_eq!((r.status, r.how.as_str(), body(&r)["httpCode"].as_i64()), (401, "no-session", Some(401)));
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{other}/entities?name={}", cloud_name(PRODUCT)), &[]));
+        assert_eq!(r.status, 401);
+    }
+
+    /// Once accounts exist: no default player for requests without a session, and a player writes only its own
+    /// inventory and entities (reads of others' stay allowed).
+    #[test]
+    fn accounts_keep_players_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, victim) = files_state(tmp.path(), None);
+        register(&st, "host@example.com", "Host"); // the victim: the default player, taken over
+        let attacker = st.accounts.register("guest@example.com", PASSWORD, "Guest").unwrap().profile_id;
+        let (mine, theirs) = (auth_for(&st, &attacker), auth_for(&st, &victim));
+        let (mine, theirs) = ([("Authorization", mine.as_str())], [("Authorization", theirs.as_str())]);
+        let offer = json!({"spaceId": SPACE_ID, "offerId": SKI_A, "offerRevision": 6});
+        let inv = format!("/v1/profiles/{victim}/inventory");
+        // inventory: no ticket -> 401 (was: the default player); someone else's -> 403; unknown ids get no record
+        let r = send_json(&st, "POST", &inv, &[], &offer);
+        assert_eq!((r.status, r.how.as_str()), (401, "no-session"));
+        assert_eq!(body(&r)["errorContext"], "Profiles Client Facade Service");
+        let r = send_json(&st, "POST", &inv, &mine, &offer);
+        assert_eq!((r.status, body(&r)["message"].as_str()), (403, Some("not your inventory")));
+        let r = send_json(&st, "POST", &format!("/v1/profiles/{FRIEND}/inventory"), &mine, &offer);
+        assert_eq!(r.status, 403);
+        assert!(st.repos.player(FRIEND).unwrap().is_none(), "no player record for an unknown id");
+        assert_eq!(send_json(&st, "POST", &inv, &theirs, &offer).how, "economy", "one's own: fine");
+        assert_eq!(handle(&st, &req("GET", &inv, &mine)).how, "inventory", "reading another's: fine");
+        assert_eq!(handle(&st, &req("GET", &inv, &[])).status, 401);
+
+        // entities: the victim's card can be read, not changed, deleted or made in the victim's name
+        let card = body(&send_json(&st, "POST", &format!("/v2/profiles/{victim}/entities"), &theirs,
+                                   &json!({"type": "PROFILE", "obj": {"title": 1}})));
+        let card_id = card["entityId"].as_str().unwrap().to_string();
+        let path = format!("/v2/profiles/entities/{card_id}");
+        let r = send_json(&st, "PUT", &path, &mine, &json!({"obj": {"title": 666}}));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (403, Some("not your entity")));
+        assert_eq!(send_json(&st, "PUT", &path, &[], &json!({"obj": {}})).status, 401);
+        assert_eq!(handle(&st, &req("DELETE", &path, &mine)).status, 403);
+        assert_eq!(handle(&st, &req("DELETE", &path, &[])).status, 401);
+        assert_eq!(st.entities.get(&card_id).unwrap().unwrap()["obj"]["title"], 1, "untouched");
+        assert_eq!(body(&handle(&st, &req("GET", &path, &mine)))["obj"]["title"], 1);
+        let r = send_json(&st, "POST", &format!("/v2/profiles/{victim}/entities"), &mine, &json!({"type": "X"}));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (403, Some("not your profile")));
+        let r = send_json(&st, "POST", "/v2/profiles/entities", &mine, &json!({"type": "X", "profileId": victim}));
+        assert_eq!(r.status, 403, "the body naming another owner");
+        let r = send_json(&st, "PUT", "/v2/profiles/entities/00000000-0000-4000-8000-0000000000bb", &mine,
+                          &json!({"type": "X", "profileId": victim}));
+        assert_eq!(r.status, 403);
+        assert_eq!(send_json(&st, "POST", "/v2/profiles/entities", &[], &json!({"type": "X"})).status, 401);
+        // the cloud save entity through /v2 too
+        let save = st.entities.put("00000000-0000-4000-8000-0000000000cc",
+                                   entity_body(None, &[1]).as_object().unwrap(), Some(&victim)).unwrap();
+        let r = send_json(&st, "PUT", &format!("/v2/profiles/entities/{}", save["entityId"].as_str().unwrap()), &mine,
+                          &json!({"obj": {}}));
+        assert_eq!(r.status, 403);
+        // listings need a session
+        let batch = format!("/v2/profiles/entities?profileIds={victim}");
+        assert_eq!(handle(&st, &req("GET", &batch, &[])).status, 401);
+        assert_eq!(handle(&st, &req("GET", &batch, &mine)).how, "entities(2)");
+        assert_eq!(handle(&st, &req("GET", &format!("/v2/profiles/{victim}/entities"), &[])).status, 401);
+        assert_eq!(handle(&st, &req("GET", &path, &[])).status, 401);
+        // the own entity works as before
+        let r = send_json(&st, "POST", &format!("/v2/profiles/{attacker}/entities"), &mine, &json!({"type": "X"}));
+        assert_eq!((r.status, body(&r)["profileId"].as_str()), (200, Some(attacker.as_str())));
+    }
+
+    /// An entity's file: once accounts are required, writes need the putUrl's token (the game may upload without
+    /// its ticket, as to S3) or the owner's session; downloads stay open.
+    #[test]
+    fn entity_files_are_written_by_their_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, victim) = files_state(tmp.path(), None);
+        register(&st, "host@example.com", "Host");
+        let attacker = st.accounts.register("guest@example.com", PASSWORD, "Guest").unwrap().profile_id;
+        let (mine, theirs) = (auth_for(&st, &attacker), auth_for(&st, &victim));
+        let (mine, theirs) = ([("Authorization", mine.as_str())], [("Authorization", theirs.as_str())]);
+        let ghost = body(&send_json(&st, "POST", &format!("/v2/profiles/{victim}/entities"), &theirs, &json!({
+            "type": "BEST_GHOST_CHALLENGE_PUBLIC_ALLTIME", "extendedStorage": {"provider": "s3", "fileExtension": ""}})));
+        let storage = &ghost["extendedStorage"];
+        let put = path_of(storage["putUrl"].as_str().unwrap());
+        let (plain, token) = put.split_once("?t=").expect("a signed upload link");
+        assert_eq!(storage["deleteUrl"], storage["putUrl"]);
+        assert_eq!(path_of(storage["getUrl"].as_str().unwrap()), plain, "the read links are not signed");
+        assert_eq!(send(&st, "PUT", &put, &[], b"GHOST").status, 200, "the link's token");
+        assert_eq!(send(&st, "PUT", plain, &theirs, b"GHOST2").status, 200, "the owner's session");
+        for (path, auth) in [(plain.to_string(), &mine[..]), (plain.to_string(), &[][..]),
+                             (format!("{plain}?t=1.{}", &token[token.len() - 64..]), &[][..]),
+                             (format!("{plain}?t={}", &token[..token.len() - 1]), &mine[..])] {
+            assert_eq!(send(&st, "PUT", &path, auth, b"EVIL").status, 403, "{path}");
+            assert_eq!(handle(&st, &req("DELETE", &path, auth)).status, 403, "{path}");
+        }
+        // another entity's token does not fit
+        let other = body(&send_json(&st, "POST", "/v2/profiles/entities", &mine, &json!({
+            "type": "FAVORITE_REPLAY", "extendedStorage": {"provider": "s3"}})));
+        let other_put = path_of(other["extendedStorage"]["putUrl"].as_str().unwrap());
+        let other_token = other_put.split_once("?t=").unwrap().1;
+        assert_eq!(send(&st, "PUT", &format!("{plain}?t={other_token}"), &mine, b"EVIL").status, 403);
+        let r = handle(&st, &req("GET", plain, &[]));
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"GHOST2"[..]), "downloads: open");
+        assert!(super::file_token_ok(ghost["entityId"].as_str().unwrap(), token));
+        assert!(!super::file_token_ok(ghost["entityId"].as_str().unwrap(),
+                                      &super::file_token(ghost["entityId"].as_str().unwrap(), 1)), "expired");
+    }
+
+    /// RFC 4231 test case 2.
+    #[test]
+    fn hmac_sha256_vector() {
+        assert_eq!(hex::encode(super::hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+                   "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     /// Without a cloud save, Connect lists the old system's slots first: empty.

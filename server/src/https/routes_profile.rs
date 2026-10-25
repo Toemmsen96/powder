@@ -2,8 +2,11 @@
 //! server's routes_profile.py: the game's and Ubisoft Connect's profile, social, news and telemetry calls. Most
 //! only need a well-formed answer: empty lists for news and other people's content; neutral values for account
 //! details. Friends: every other player of the server (services/friends.rs). Connect's achievement pages
-//! (GraphQL) come from the database and the pack; its chat channels from services/channels.rs.
+//! (GraphQL) come from the database and the pack; its chat channels from services/channels.rs. "me" is the
+//! session's player; without a session the default player, until accounts are required (then a 401; routes_ubi.rs,
+//! "who may act").
 
+use super::routes_ubi::{acting, reader};
 use super::{Ctx, Reply, Route};
 use crate::builtin::http::Query;
 use crate::constants::{APP_ID, SPACE_ID};
@@ -102,15 +105,38 @@ fn ok(data: Value, how: &str) -> Reply {
 }
 
 fn done(r: Result<Reply>) -> Reply {
-    r.unwrap_or_else(|e| Reply::internal_error(&e))
+    r.unwrap_or_else(|e| match e.downcast::<Refused>() {
+        Ok(Refused(reply)) => reply,
+        Err(e) => Reply::internal_error(&e),
+    })
 }
 
-/// The requesting player's profile id (from the ticket, else the default player).
-fn me(c: &Ctx) -> Result<String> {
-    match &c.session {
-        Some(s) => Ok(s.profile_id().to_string()),
-        None => c.state.accounts.default_profile_id(),
+/// A request refused before it was answered (no session where accounts are required); `done` sends its reply.
+struct Refused(Reply);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused ({} {})", self.0.status, self.0.how)
     }
+}
+
+impl std::fmt::Debug for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The requesting player's profile id: the ticket's; without one the default player while accounts are not
+/// required, else refused (routes_ubi.rs' `acting`).
+fn me(c: &Ctx) -> Result<String> {
+    acting(c).map(|a| a.pid).map_err(|r| Refused(r).into())
+}
+
+/// Reads of player data: refused without a session once accounts are required (routes_ubi.rs' `reader`).
+fn signed_in(c: &Ctx) -> Result<()> {
+    reader(c).map(|_| ()).map_err(|r| Refused(r).into())
 }
 
 /// The {profile_id} in the path ("me" = the requester).
@@ -303,6 +329,7 @@ fn actions(c: &Ctx) -> Result<Reply> {
 
 /// GET /v3/profiles?profileIds=|userIds=|idOnPlatform=&platformType=: players this server knows.
 fn profiles_lookup(c: &Ctx) -> Result<Reply> {
+    signed_in(c)?;
     let q = query(c);
     let wanted: HashSet<String> = ["profileIds", "userIds", "idOnPlatform", "idsOnPlatform", "nameOnPlatform"].iter()
         .flat_map(|k| q.get(k).unwrap_or("").split(',').filter(|x| !x.is_empty()).map(str::to_lowercase)
@@ -383,6 +410,7 @@ fn online_profiles(c: &Ctx) -> Result<std::collections::BTreeSet<String>> {
 }
 
 fn online_statuses(c: &Ctx) -> Result<Reply> {
+    signed_in(c)?;
     let q = query(c);
     let raw = q.get("UserIds").or_else(|| q.get("userIds")).unwrap_or("");
     let now = online_profiles(c)?;
@@ -406,6 +434,7 @@ fn game_friends(c: &Ctx) -> Result<Reply> {
 
 /// Ubisoft Connect's friends list; the enriched one (harboursocial) also has each one's online status.
 fn connect_friends(c: &Ctx) -> Result<Reply> {
+    signed_in(c)?;
     let (since, enriched) = (iso_now(), c.req.path().ends_with("/enriched"));
     let online = if enriched { online_profiles(c)? } else { Default::default() };
     let mut out = vec![];
@@ -436,6 +465,7 @@ const IM_HOST: &str = "public-im-ubiservices.ubi.com";
 /// GET /v1/profiles/connections?profileIds=..&applications=<Steep>: which friends are in Steep now (the game asks
 /// every minute; only a friend with a connection is "online" in its social tab and can be invited).
 fn profile_connections(c: &Ctx) -> Result<Reply> {
+    signed_in(c)?;
     let q = query(c);
     let list = |k: &str| -> Vec<String> {
         q.get(k).unwrap_or("").split(',').filter(|x| !x.is_empty()).map(str::to_lowercase).collect()
@@ -617,6 +647,15 @@ mod tests {
         st.accounts.register(email, "correct horse", name).unwrap().profile_id
     }
 
+    /// The Authorization header of a new session of this player (the game's, from 127.0.0.1).
+    fn auth_of(st: &HttpState, pid: &str) -> String {
+        format!("Ubi_v1 t={}", st.sessions.issue(st.accounts.player(pid).unwrap(), "127.0.0.1", "").ticket)
+    }
+
+    fn get_as(st: &HttpState, auth: &str, path: &str) -> Reply {
+        handle(st, &req("GET", path, &[("Authorization", auth)]))
+    }
+
     /// Account details, friends and Club actions come from the player record: nothing of a recorded account
     /// (email, friends, action progress) is ever served.
     #[test]
@@ -682,25 +721,26 @@ mod tests {
         let (st, pid) = with_pack(Config::default());
         register(&st, "host@example.com", ""); // takes over the default player
         let guest = register(&st, "guest@example.com", "Guest");
-        let game = body(&get(&st, "/v2/profiles/me/friends"))["friends"].clone();
+        let auth = auth_of(&st, &pid);
+        let game = body(&get_as(&st, &auth, "/v2/profiles/me/friends"))["friends"].clone();
         assert_eq!(game.as_array().unwrap().len(), 1);
         assert_eq!((game[0]["pid"].as_str(), game[0]["nameOnPlatform"].as_str(), game[0]["state"].as_str()),
                    (Some(guest.as_str()), Some("Guest"), Some("Friends")));
         assert_eq!(keys(&game[0]), ["pid", "nameOnPlatform", "state", "lastModified"]);
-        let plain = body(&get(&st, &format!("/v3/profiles/{pid}/friends")));
+        let plain = body(&get_as(&st, &auth, &format!("/v3/profiles/{pid}/friends")));
         assert_eq!(keys(&plain), ["groupId", "friends"]);
         assert_eq!(plain["friends"][0]["pid"], guest.as_str());
         assert_eq!(keys(&plain["friends"][0]), ["isFavorite", "lastModified", "nickname", "pid", "state",
                                                 "friendshipDate"]);
         let url = format!("/v3/profiles/{pid}/global/harboursocial/friends/core/enriched");
-        assert_eq!(body(&get(&st, &url))["friends"][0]["onlineStatus"], "offline");
+        assert_eq!(body(&get_as(&st, &auth, &url))["friends"][0]["onlineStatus"], "offline");
         let connect = st.connect_clients.add("192.0.2.20:1000"); // Guest's Connect is on
         connect.update(|c| c.profile_id = Some(guest.clone()));
-        let enriched = body(&get(&st, &url));
+        let enriched = body(&get_as(&st, &auth, &url));
         assert_eq!(enriched["friends"][0]["onlineStatus"], "online");
         assert!(enriched["friends"][0].get("friendshipDate").is_none());
         let user = st.repos.player(&guest).unwrap().unwrap().user_id;
-        let statuses = body(&get(&st, &format!("/v1/users/onlineStatuses?UserIds={user},someone-else")));
+        let statuses = body(&get_as(&st, &auth, &format!("/v1/users/onlineStatuses?UserIds={user},someone-else")));
         assert_eq!(statuses, json!({"onlineStatuses": [
             {"connections": [], "onlineStatus": "online", "userId": user},
             {"connections": [], "onlineStatus": "offline", "userId": "someone-else"}]}));
@@ -717,13 +757,14 @@ mod tests {
     /// The game asks which friends are in Steep (and only offers to invite those).
     #[test]
     fn a_friend_in_steep_has_a_connection() {
-        let (st, _) = with_pack(Config::default());
+        let (st, pid) = with_pack(Config::default());
         let guest = register(&st, "guest@example.com", "Guest");
+        let auth = auth_of(&st, &pid);
         let url = format!("/v1/profiles/connections?limit=24&offset=0&profileIds={guest}&applications={APP_ID}");
-        assert_eq!(get(&st, &url).body, br#"{"connections": []}"#);
+        assert_eq!(get_as(&st, &auth, &url).body, br#"{"connections": []}"#);
         let session = st.sessions.issue(st.accounts.player(&guest).unwrap(), "192.0.2.20", "");
         session.channels.set_nex(Some(Arc::new(FakeNex))); // Guest's game is connected
-        let conns = body(&get(&st, &url))["connections"].clone();
+        let conns = body(&get_as(&st, &auth, &url))["connections"].clone();
         assert_eq!(conns.as_array().unwrap().len(), 1);
         let conn = &conns[0];
         assert_eq!((conn["profileId"].as_str(), conn["applicationId"].as_str()), (Some(guest.as_str()), Some(APP_ID)));
@@ -734,16 +775,17 @@ mod tests {
                                 "lastModifiedDate", "processId", "spaceIds", "stagingSpaceId", "ubiLocaleCode"]);
         assert_eq!(conn["messageTypes"].as_array().unwrap().len(), 13);
         let other_app = url.replace(APP_ID, "f68a4bb5-608a-4ff2-8123-be8ef797e0a6");
-        assert_eq!(body(&get(&st, &other_app)), json!({"connections": []}));
+        assert_eq!(body(&get_as(&st, &auth, &other_app)), json!({"connections": []}));
         session.channels.set_nex(None);
-        assert_eq!(body(&get(&st, &url)), json!({"connections": []}));
+        assert_eq!(body(&get_as(&st, &auth, &url)), json!({"connections": []}));
 
         let mut config = Config::default();
         config.multiplayer.pretend_online = vec!["guest".into()]; // testing alone
-        let (st, _) = with_pack(config);
+        let (st, pid) = with_pack(config);
         let guest = register(&st, "guest@example.com", "Guest");
+        let auth = auth_of(&st, &pid);
         let url = format!("/v1/profiles/connections?profileIds={guest}&applications={APP_ID}");
-        assert_eq!(body(&get(&st, &url))["connections"].as_array().unwrap().len(), 1);
+        assert_eq!(body(&get_as(&st, &auth, &url))["connections"].as_array().unwrap().len(), 1);
     }
 
     /// uuid5(NAMESPACE_URL, "powder-connection/<pid>") as Python's uuid module makes it.
@@ -758,9 +800,13 @@ mod tests {
     fn a_notification_reaches_the_other_players_game() {
         let (st, pid) = with_pack(Config::default());
         let guest = register(&st, "guest@example.com", "Guest");
+        let auth = auth_of(&st, &pid);
+        let post = |path: &str, body: &Value| {
+            handle(&st, &with_body("POST", path, &[("Authorization", &auth)], body))
+        };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         st.sessions.issue(st.accounts.player(&guest).unwrap(), "192.0.2.20", "").channels.add_websocket(tx);
-        let r = post(&st, &format!("/v2/profiles/{guest}/notifications"),
+        let r = post(&format!("/v2/profiles/{guest}/notifications"),
                      &json!({"notificationType": "STEEP_SPECTATOR", "content": {"ask": 1}, "spaceId": SPACE_ID}));
         assert_eq!((r.status, r.body.as_slice(), r.how.as_str()), (200, &b"{}"[..], "notification-sent"));
         let n = rx.try_recv().unwrap();
@@ -770,7 +816,7 @@ mod tests {
         assert_eq!(keys(&n), ["notificationType", "content", "datePosted", "source", "spaceId"]);
         assert!(rx.try_recv().is_err());
         // no "content": the whole body is
-        post(&st, &format!("/v2/profiles/{}/notifications", guest.to_uppercase()), &json!({"type": "X", "a": 1}));
+        post(&format!("/v2/profiles/{}/notifications", guest.to_uppercase()), &json!({"type": "X", "a": 1}));
         let n = rx.try_recv().unwrap();
         assert_eq!((n["notificationType"].as_str(), &n["content"]), (Some("X"), &json!({"type": "X", "a": 1})));
         assert_eq!(n["spaceId"], SPACE_ID);
@@ -782,7 +828,8 @@ mod tests {
         let (st, pid) = with_pack(Config::default());
         let guest = register(&st, "guest@example.com", "Guest");
         let space = "c0539e9c-90ab-4af8-a2d6-ef7b3883f430";
-        let host = [("Host", "channel-service.upc.ubi.com")];
+        let auth = auth_of(&st, &pid);
+        let host = [("Host", "channel-service.upc.ubi.com"), ("Authorization", auth.as_str())];
         let r = handle(&st, &with_body("POST", &format!("/v1/spaces/{space}/channels"), &host,
                                        &json!({"channel": {"type": "DM"}, "members": [guest]})));
         assert_eq!(r.how, "channel-created");
@@ -800,9 +847,9 @@ mod tests {
         let listed = body(&handle(&st, &req("GET", &messages, &host)));
         assert_eq!(keys(&listed), ["messages", "nextToken"]);
         assert_eq!(listed["messages"][0]["authorId"], pid.as_str());
-        let mine = body(&get(&st, &format!("/v1/profiles/me/channels?spaceId={space}")));
+        let mine = body(&get_as(&st, &auth, &format!("/v1/profiles/me/channels?spaceId={space}")));
         assert_eq!(mine["channels"][0]["id"], id);
-        assert_eq!(body(&get(&st, "/v1/profiles/me/channels?spaceId=other"))["channels"], json!([]));
+        assert_eq!(body(&get_as(&st, &auth, "/v1/profiles/me/channels?spaceId=other"))["channels"], json!([]));
         let r = handle(&st, &with_body("POST", &format!("/v1/spaces/{space}/channels/nope/messages"), &host, &json!({})));
         assert_eq!(r.status, 404);
     }
@@ -867,6 +914,55 @@ mod tests {
         let r = get(&st, &format!("/v2/spaces/{SPACE_ID}/entities?type=TITLE_MATCHMAKING_MAP&tags=WORLD_10af88fa9e4\
                                    &offset=0&limit=10"));
         assert_eq!((r.status, r.body.as_slice()), (200, &br#"{"entities": []}"#[..]));
+    }
+
+    /// Once accounts exist, a request without a session is nobody: no default player to read as, overwrite,
+    /// notify or chat as (401); with one, the session's player.
+    #[test]
+    fn without_a_session_nobody_acts_for_the_default_player() {
+        let (st, host) = with_pack(Config::default());
+        register(&st, "host@example.com", ""); // takes over the default player
+        let guest = register(&st, "guest@example.com", "Guest");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        st.sessions.issue(st.accounts.player(&guest).unwrap(), "192.0.2.20", "").channels.add_websocket(tx);
+        let refused = |r: Reply| {
+            assert_eq!((r.status, r.how.as_str()), (401, "no-session"), "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(keys(&body(&r)), ["message", "errorCode", "httpCode", "errorContext", "moreInfo",
+                                         "transactionTime", "transactionId"]);
+        };
+        refused(handle(&st, &with_body("PUT", "/v1/profiles/me/populations/data", &[], &json!({"populations": [9]}))));
+        assert_eq!(st.repos.kv_get(&host, "populations_data").unwrap(), None);
+        refused(post(&st, &format!("/v2/profiles/{guest}/notifications"), &json!({"type": "STEEP_SPECTATOR"})));
+        assert!(rx.try_recv().is_err(), "nothing delivered");
+        refused(post(&st, "/v1/spaces/s/channels", &json!({"members": [guest]})));
+        for path in ["/v3/profiles", "/v3/users/me", "/v2/profiles/me/friends", "/v1/profiles/me/channels",
+                     "/v1/profiles/me/populations", "/v1/profiles/me/actions",
+                     "/v1/profiles/me/global/ubiconnect/economy/api/units"] {
+            refused(get(&st, path));
+        }
+        refused(get(&st, &format!("/v3/profiles/{host}/friends")));
+        refused(post(&st, "/v1/profiles/me/uplay/graphql", &json!([{"operationName": "GetAchievements",
+                                                                     "variables": {"spaceId": SPACE_ID}}])));
+        // game-wide answers need nobody
+        assert_eq!(get(&st, "/v1/profiles/me/news").status, 200);
+        assert_eq!(get(&st, &format!("/v1/profiles/{guest}/global/ubiconnect/economy/api/units")).status, 200);
+        // with a session: that player
+        let auth = auth_of(&st, &guest);
+        let r = handle(&st, &with_body("PUT", "/v1/profiles/me/populations/data", &[("Authorization", &auth)],
+                                       &json!({"populations": [1]})));
+        assert_eq!(r.status, 200);
+        assert_eq!(st.repos.kv_get(&guest, "populations_data").unwrap(), Some(json!({"populations": [1]})));
+        assert_eq!(body(&get_as(&st, &auth, "/v3/users/me"))["nameOnPlatform"], "Guest");
+        assert_eq!(body(&get_as(&st, &auth, "/v3/profiles"))["profiles"].as_array().unwrap().len(), 2);
+    }
+
+    /// Without accounts, everything works without a ticket, as the default player.
+    #[test]
+    fn without_accounts_the_default_player_acts() {
+        let (st, pid) = with_pack(Config::default());
+        assert_eq!(body(&get(&st, "/v3/users/me"))["userId"], pid.as_str());
+        assert_eq!(get(&st, "/v3/profiles").status, 200);
+        assert_eq!(handle(&st, &with_body("PUT", "/v1/profiles/me/populations/data", &[], &json!({}))).status, 200);
     }
 
     /// The game's populations data is kept and echoed (tests/test_progression.py).

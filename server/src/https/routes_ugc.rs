@@ -14,7 +14,8 @@
 //! are kept as the item's files (Data, Thumbnail), not in the item. The JPEGs themselves carry no metadata.
 //! Deleting is DELETE {id} followed by PUT {id}/hide. {id}/url comes from the game's code.
 
-use super::routes_ubi::{empty, file_reply, host, owner, query, remove_file};
+use super::routes_ubi::{accounts_required, acting, empty, file_reply, forbidden, host, no_session, owner, query,
+                        remove_file, Actor};
 use super::{Ctx, Reply, Route};
 use crate::repos::UgcItem;
 use anyhow::{Context as _, Result};
@@ -40,12 +41,10 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
-/// Who is asking: the session's player, else the default player.
-fn me(c: &Ctx) -> Result<String> {
-    match owner(c) {
-        Some(p) => Ok(p),
-        None => c.state.accounts.default_profile_id(),
-    }
+/// Who is asking: the session's player; without one the default player while accounts are not required, else
+/// refused (Err: the 401; routes_ubi.rs' "who may act").
+fn me(c: &Ctx) -> std::result::Result<Actor, Reply> {
+    acting(c)
 }
 
 fn files(c: &Ctx) -> PathBuf {
@@ -92,10 +91,12 @@ fn ugc_list(c: &Ctx) -> Reply {
     let q = query(c.req);
     let param = |name: &str| py_int(q.get(name).map(|v| json!(v)).as_ref());
     let profiles: Vec<String> = q.0.iter().filter(|(k, _)| k == "profile_id").map(|(_, v)| v.clone()).collect();
-    let listed = me(c).and_then(|me| {
-        let items = c.state.repos.ugc_find(param("type_id"), param("world_id"), &profiles)?;
-        Ok(items.iter().map(|i| out(c, i, &me)).collect::<Vec<_>>())
-    });
+    let me = match me(c) {
+        Ok(me) => me.pid,
+        Err(refused) => return refused,
+    };
+    let listed = c.state.repos.ugc_find(param("type_id"), param("world_id"), &profiles)
+        .map(|items| items.iter().map(|i| out(c, i, &me)).collect::<Vec<_>>());
     match listed {
         Ok(items) => {
             let how = format!("ugc({})", items.len());
@@ -125,20 +126,23 @@ fn save_inline(dir: &Path, name: &str, value: Option<&Value>) -> Result<()> {
 }
 
 fn ugc_create(c: &Ctx) -> Reply {
-    match create(c) {
+    let me = match me(c) {
+        Ok(me) => me.pid,
+        Err(refused) => return refused,
+    };
+    match create(c, &me) {
         Ok(reply) => reply,
         Err(e) => Reply::internal_error(&e),
     }
 }
 
-fn create(c: &Ctx) -> Result<Reply> {
+fn create(c: &Ctx, me: &str) -> Result<Reply> {
     let raw = &c.req.body;
     let mut body = match serde_json::from_slice::<Value>(raw) {
         Ok(Value::Object(m)) => m,
         _ => Map::new(),
     };
     let pictures: Vec<(&str, Option<Value>)> = FILE_FIELDS.iter().map(|(f, s)| (*s, body.shift_remove(*f))).collect();
-    let me = me(c)?;
     let text = crate::util::dumps(&Value::Object(body.clone())); // ASCII: any cut is a char boundary
     log::info!(target: "powder.https", "ugc create from {me} ({} B): {}", raw.len(), &text[..text.len().min(1500)]);
     let metadata = body.get("metadata").filter(|m| m.is_object()).cloned().unwrap_or_else(|| json!({}));
@@ -151,21 +155,24 @@ fn create(c: &Ctx) -> Result<Reply> {
     let extra: Map<String, Value> = body.iter().filter(|(k, _)| !KNOWN.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone())).collect();
     let id = uuid::Uuid::new_v4().to_string();
-    let item = c.state.repos.ugc_create(&id, type_id, world_id, &me, &metadata, &tags, &extra)?;
+    let item = c.state.repos.ugc_create(&id, type_id, world_id, me, &metadata, &tags, &extra)?;
     for (suffix, picture) in &pictures {
         save_inline(&files(c), &format!("{id}{suffix}"), picture.as_ref())?;
     }
     log::info!(target: "powder.https", "ugc {id} created (type {type_id}, world {}) by {me}",
                world_id.map(|w| w.to_string()).unwrap_or_else(|| "None".into()));
-    Ok(Reply::json(&out(c, &item, &me), "ugc-created", 200))
+    Ok(Reply::json(&out(c, &item, me), "ugc-created", 200))
 }
 
 fn ugc_item(c: &Ctx) -> Reply {
     let id = c.param("ugc_id");
-    let found = me(c).and_then(|me| Ok((c.state.repos.ugc_get(id)?, me)));
-    let (item, me) = match found {
-        Ok((Some(item), me)) => (item, me),
-        Ok((None, _)) => return Reply::json(&json!({"error": "not found"}), "?", 404),
+    let me = match me(c) {
+        Ok(me) => me.pid,
+        Err(refused) => return refused,
+    };
+    let item = match c.state.repos.ugc_get(id) {
+        Ok(Some(item)) => item,
+        Ok(None) => return Reply::json(&json!({"error": "not found"}), "?", 404),
         Err(e) => return Reply::internal_error(&e),
     };
     if c.req.method != "DELETE" {
@@ -187,7 +194,11 @@ fn ugc_action(c: &Ctx) -> Reply {
     let (id, action) = (c.param("ugc_id"), c.param("action"));
     let how = format!("ugc-{action}");
     let repos = &c.state.repos;
-    let done = me(c).and_then(|me| {
+    let me = match me(c) {
+        Ok(me) => me.pid,
+        Err(refused) => return refused,
+    };
+    let done = (|| -> Result<Option<Reply>> {
         let Some(item) = repos.ugc_get(id)? else { return Ok(None) }; // e.g. the hide the game sends after deleting
         match action {
             "like" => repos.ugc_like(id, &me, c.req.method != "DELETE")?,
@@ -198,7 +209,7 @@ fn ugc_action(c: &Ctx) -> Reply {
             _ => log::info!(target: "powder.https", "ugc {} {id}/{action}: not known, acknowledged", c.req.method),
         }
         Ok(None)
-    });
+    })();
     match done {
         Ok(Some(reply)) => reply,
         Ok(None) => empty(204, &how),
@@ -206,7 +217,9 @@ fn ugc_action(c: &Ctx) -> Reply {
     }
 }
 
-/// The files behind an item's links: the game uploads (PUT/POST) and downloads (GET) them here.
+/// The files behind an item's links: the game uploads (PUT/POST) and downloads (GET) them here. Downloads are
+/// open (the links are in every listing); once accounts are required, only the item's owner (its session)
+/// uploads.
 fn ugc_file(c: &Ctx) -> Reply {
     match file(c) {
         Ok(reply) => reply,
@@ -219,6 +232,18 @@ fn file(c: &Ctx) -> Result<Reply> {
     let id = name.split('_').next().unwrap_or_default();
     let item = if FILE_NAME.is_match(name) { c.state.repos.ugc_get(id)? } else { None };
     let Some(item) = item else { return Ok(empty(404, "?")) };
+    let method = c.req.method.as_str();
+    if matches!(method, "PUT" | "POST") {
+        match accounts_required(c) {
+            Ok(false) => {}
+            Ok(true) => match owner(c) {
+                None => return Ok(no_session(c)),
+                Some(me) if me != item.profile_id => return Ok(forbidden(c, "not your item")),
+                Some(_) => {}
+            },
+            Err(reply) => return Ok(reply),
+        }
+    }
     let dir = files(c);
     let mut path = dir.join(name);
     for (field, suffix) in FILE_FIELDS {
@@ -227,7 +252,6 @@ fn file(c: &Ctx) -> Result<Reply> {
             save_inline(&dir, &format!("{}{suffix}", item.ugc_id), item.extra.get(field))?;
         }
     }
-    let method = c.req.method.as_str();
     if method == "GET" && name.ends_with("_thumbnail") && !path.exists() {
         path = dir.join(id); // a photo is its own thumbnail
     }
@@ -273,6 +297,20 @@ mod tests {
 
     fn get(st: &HttpState, path: &str) -> Reply {
         send(st, "GET", path, b"")
+    }
+
+    /// As this player (a new session of theirs); `None`: without a ticket.
+    fn send_as(st: &HttpState, pid: Option<&str>, method: &str, path: &str, data: &[u8]) -> Reply {
+        let auth = pid.map(|p| {
+            format!("Ubi_v1 t={}", st.sessions.issue(st.accounts.player(p).unwrap(), "127.0.0.1", "").ticket)
+        });
+        let mut headers = vec![OLYMPUS];
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a));
+        }
+        let mut r = req(method, path, &headers);
+        r.body = Bytes::copy_from_slice(data);
+        handle(st, &r)
     }
 
     fn path_of(url: &Value) -> String {
@@ -373,12 +411,37 @@ mod tests {
     fn only_the_owner_hides_or_deletes() {
         let tmp = tempfile::tempdir().unwrap();
         let st = files_state(tmp.path());
-        st.accounts.register("host@example.com", "correct horse", "").unwrap(); // takes over the requester
+        let host = st.accounts.register("host@example.com", "correct horse", "").unwrap().profile_id;
         let other = st.accounts.register("guest@example.com", "correct horse", "Guest").unwrap().profile_id;
         let id = "00000000-0000-4000-8000-000000000001";
         st.repos.ugc_create(id, 2, Some(WORLD), &other, &json!({}), &json!([]), &Default::default()).unwrap();
-        assert_eq!(send(&st, "PUT", &format!("/ugc/v1/{id}/hide"), b"").status, 204);
-        assert_eq!(send(&st, "DELETE", &format!("/ugc/v1/{id}"), b"").status, 204);
+        assert_eq!(send_as(&st, Some(&host), "PUT", &format!("/ugc/v1/{id}/hide"), b"").status, 204);
+        assert_eq!(send_as(&st, Some(&host), "DELETE", &format!("/ugc/v1/{id}"), b"").status, 204);
         assert!(!st.repos.ugc_get(id).unwrap().unwrap().hidden, "not ours: untouched");
+    }
+
+    /// Once accounts exist: no default player without a ticket, and only the owner uploads an item's files
+    /// (everyone downloads them).
+    #[test]
+    fn only_the_owner_writes_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = files_state(tmp.path());
+        let host = st.accounts.register("host@example.com", "correct horse", "").unwrap().profile_id;
+        let other = st.accounts.register("guest@example.com", "correct horse", "Guest").unwrap().profile_id;
+        let created = json!({"typeId": 2, "worldId": WORLD, "datas": b64(b"MINE")});
+        let item = body(&send_as(&st, Some(&other), "POST", "/ugc/v1/", created.to_string().as_bytes()));
+        assert_eq!(item["profileId"], other.as_str());
+        let data = path_of(&item["links"]["urls"]["Data"]);
+        let r = send_as(&st, Some(&host), "PUT", &data, b"EVIL");
+        assert_eq!((r.status, body(&r)["message"].as_str()), (403, Some("not your item")));
+        assert_eq!(send_as(&st, None, "PUT", &data, b"EVIL").status, 401);
+        assert_eq!(get(&st, &data).body, b"MINE", "downloads: open");
+        assert_eq!(send_as(&st, Some(&other), "PUT", &data, b"NEWER").status, 200);
+        assert_eq!(get(&st, &data).body, b"NEWER");
+        // no ticket: no stand-in player for creating, listing or liking
+        assert_eq!(send(&st, "POST", "/ugc/v1/", created.to_string().as_bytes()).status, 401);
+        assert_eq!(get(&st, "/ugc/v1/?type_id=2").status, 401);
+        assert_eq!(send(&st, "PUT", &format!("/ugc/v1/{}/like", item["id"].as_str().unwrap()), b"").status, 401);
+        assert_eq!(body(&send_as(&st, Some(&host), "GET", "/ugc/v1/?type_id=2", b""))[0]["id"], item["id"]);
     }
 }
