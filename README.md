@@ -380,10 +380,10 @@ powder-server gamedata verify                      # also build / zip / install
 
 | Ported | Not yet |
 | ------ | ------- |
-| HTTPS (TLS + local CA, CORS, game-data pack, built-in replies), sign-in (`/v3/profiles/sessions`), the CA's revocation list | profile, friends, store, UGC, cloud-save routes; the websocket; `/_powder/` status and account API |
+| HTTPS (TLS + local CA, CORS, game-data pack, built-in replies), sign-in (`/v3/profiles/sessions`), the CA's revocation list, Ubisoft Connect's demux | profile, friends, store, UGC, cloud-save routes; the websocket; `/_powder/` status and account API |
 | NEX transport, login, game storage, profile/leaderboard handlers | stats and matchmaking handlers |
-| Storm (peer-to-peer helpers), accounts and sessions, economy, entities, stats, leaderboards | matchmaking, channels, cloud saves, import |
-| server mods (Lua) and client mods | Ubisoft Connect's demux |
+| Storm (peer-to-peer helpers), accounts and sessions, economy, entities, stats, leaderboards, friends, cloud saves (service) | matchmaking, channels, import |
+| server mods (Lua) and client mods | |
 
 It reads the same `config.toml`, `data/` (database, keys, local CA) and game-data pack as the Python
 server, so you can switch between them. `admin trust` also works on Linux: Ubisoft Connect under Wine

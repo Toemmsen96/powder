@@ -258,7 +258,7 @@ async fn run(config: Config) -> Result<()> {
     let accounts = Arc::new(AccountService::new(config.clone(), repos.clone(), sessions.clone()));
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
     log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX stats and \
-                                  matchmaking, the demux (use the Python server to play)");
+                                  matchmaking (use the Python server to play)");
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))
@@ -291,8 +291,15 @@ async fn run(config: Config) -> Result<()> {
         }
     });
     log::info!(target: "powder", "HTTPS on {}:{} (local CA {})", s.bind, s.https_port, pki.ca_thumbprint()?);
+    // Connect's demux hands out cloud-save links the HTTPS routes redeem: one CloudSaveService for both
+    let cloudsaves = Arc::new(powder_server::services::cloudsaves::CloudSaveService::new(repos.clone(), config.data_dir()));
+    let demux = Arc::new(powder_server::demux::DemuxDeps {
+        config: config.clone(), assets: assets.clone(), accounts: accounts.clone(), cloudsaves,
+        clients: Arc::new(powder_server::demux::ConnectClients::new()), mods: Some(mods.clone()),
+    });
     let state = Arc::new(HttpState { config: config.clone(), assets, mods: Some(mods), accounts,
-                                     login_failures: Arc::new(FailureLimiter::default()), nex_public_key });
+                                     login_failures: Arc::new(FailureLimiter::default()), nex_public_key,
+                                     demux: Some(demux) });
     https::serve(addr(s.https_port)?, pki.server_config()?, state).await
 }
 

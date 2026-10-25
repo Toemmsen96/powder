@@ -69,6 +69,8 @@ pub struct HttpState {
     pub login_failures: Arc<FailureLimiter>,
     /// The key that signs the NEX handshake, as the rendezvous configuration publishes it.
     pub nex_public_key: String,
+    /// Ubisoft Connect's demux, on the same TLS port (None: its connections are closed).
+    pub demux: Option<Arc<crate::demux::DemuxDeps>>,
 }
 
 impl HttpState {
@@ -422,7 +424,14 @@ pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<
                 log::info!(target: "powder.tls", "tls ok {peer} for {sni}");
             }
             if sni == DEMUX_HOST {
-                log::warn!(target: "powder.tls", "demux connection from {peer} closed: not ported to Rust yet");
+                match state.demux.clone() {
+                    Some(deps) => {
+                        if let Err(e) = crate::demux::run(stream, peer, deps).await {
+                            log::warn!(target: "powder.demux", "demux connection {peer} failed: {e:#}");
+                        }
+                    }
+                    None => log::warn!(target: "powder.tls", "demux connection from {peer} closed: no demux"),
+                }
                 return;
             }
             let service = service_fn(move |req| serve_request(state.clone(), sni.clone(), peer, req));
@@ -482,7 +491,7 @@ pub(crate) mod testing {
         let accounts = AccountService::new(config.clone(), Arc::new(Repos::new(db)), Arc::new(SessionRegistry::new()));
         HttpState { config, assets: Arc::new(assets), mods: mods.map(|m| Arc::new(Mutex::new(m))),
                     accounts: Arc::new(accounts), login_failures: Arc::new(FailureLimiter::default()),
-                    nex_public_key: "TESTKEY".into() }
+                    nex_public_key: "TESTKEY".into(), demux: None }
     }
 
     pub fn state(fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {

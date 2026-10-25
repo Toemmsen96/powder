@@ -31,7 +31,8 @@ Crate layout (`server/src/`, library `lib.rs` + binary `main.rs`):
 | NEX transport + handlers | `nex/{connection,server,dispatch}.rs`, `nex/handlers/` | `transport/nex/` (login, gamestorage, profile) |
 | Storm (UDP P2P helpers) | `storm.rs` | `transport/storm.py` |
 | accounts, sessions | `core/`, `services/accounts.rs`, `services/seed.rs` | `core/`, `services/accounts.py` |
-| services | `services/{economy,entities,stats,leaderboards}.rs` | `services/*.py` |
+| services | `services/{economy,entities,stats,leaderboards,cloudsaves,friends}.rs` | `services/*.py` |
+| Ubisoft Connect's demux | `demux/` (shares `CloudSaveService` and `ConnectClients` via `DemuxDeps`) | `transport/demux/` |
 | mods | `mods.rs` (Lua), `client_mods.rs` | `plugins/` (new design) |
 
 CLI: `run` (default), `mods`, `admin trust|players|accounts|account-*`, `gamedata build|verify|zip|install`.
@@ -42,9 +43,10 @@ CLI: `run` (default), `mods`, `admin trust|players|accounts|account-*`, `gamedat
   `routes_powder.py` (status, account API, ca.pem), `websocket.py`, and the rest of `routes_ubi.py` (inventory
   + store → `services/economy.rs` is ready, entities v2 → `services/entities.rs` is ready, Connect cloud saves).
 - NEX handlers: `stats.py` (→ `services/stats.rs` is ready), `matchmaking.py` (needs `services/matchmaking.py`).
-- Services: `matchmaking.py`, `channels.py`, `cloudsaves.py`, `importer.py`.
+- Services: `matchmaking.py`, `channels.py`, `importer.py`. The cloud-save HTTPS routes must use the same
+  `CloudSaveService` as the demux (built in `run`); `/_powder/status` lists `ConnectClients::snapshot()`.
 - Admin: inventory, grant, stats, ledger, events, cloud-saves, scores, achievements, entities, import, reset, offers.
-- Ubisoft Connect's demux (`transport/demux/`) and launcher client mods: see the latest commits / open worktrees.
+- Launcher client mods (Python side): see the latest commits / open worktrees.
 - `run` logs a warning listing what is missing; keep it accurate.
 
 ## Conventions
