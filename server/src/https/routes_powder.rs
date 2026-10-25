@@ -1,7 +1,7 @@
 //! /_powder/: the server's own endpoints (not Ubisoft's), from routes_powder.py, plus the client mods. Used by the
-//! launcher. The status needs no sign-in and shows player names and the address of every connected game, which
-//! is fine for a server meant for a local network of friends; don't expose it to the internet. The account
-//! calls carry the account's email and password.
+//! launcher. The status needs no sign-in; it shows the addresses of connected games and Connect clients only to
+//! the server's own PC (loopback) and to each caller for its own address (others: names only; on a public
+//! server not at all). The account calls carry the account's email and password.
 //!
 //!   GET /_powder/status          who is connected: Ubisoft Connect (demux) clients and game (NEX) sessions, and
 //!                                the caller's address as the server sees it ("you": a launcher finds its own PC)
@@ -19,6 +19,7 @@ use crate::repos::AccountRow;
 use crate::services::accounts::{AccountService, Error as AccountError, Result as AccountResult};
 use crate::util::unquote_path;
 use serde_json::{json, Map, Value};
+use std::net::{IpAddr, SocketAddr};
 
 /// Registrations count like failed sign-ins (hashing is slow), under this key instead of an email.
 const REGISTER_KEY: &str = "#register";
@@ -46,16 +47,43 @@ fn status(c: &Ctx) -> Reply {
     }
 }
 
+/// The address part of a peer ("10.0.0.5:4001", "[::1]:4001" or a bare address).
+fn peer_ip(peer: &str) -> Option<IpAddr> {
+    peer.parse::<SocketAddr>().map(|a| a.ip()).or_else(|_| peer.parse::<IpAddr>()).ok()
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            ip => ip,
+        })
+}
+
+/// Who sees which entries of the status: the server's own PC (loopback) everything; anyone else its own
+/// entries (same address) as they are, the others' without their address, and on a public server not at all.
+/// The launcher uses its own entries ("connect", "game" with the peer it is seen from) and the names in "game".
+fn shown(c: &Ctx, peer: &str, mut entry: Value) -> Option<Value> {
+    let you = peer_ip(&c.req.client_ip());
+    if you.is_some_and(|ip| ip.is_loopback()) || (you.is_some() && peer_ip(peer) == you) {
+        return Some(entry);
+    }
+    if c.state.config.server.public {
+        return None;
+    }
+    entry.as_object_mut()?.shift_remove("peer");
+    Some(entry)
+}
+
 fn status_body(c: &Ctx) -> anyhow::Result<Value> {
     let st = c.state;
     let connect: Vec<Value> = st.connect_clients.snapshot().into_iter().filter(|cl| cl.profile_id.is_some())
-        .map(|cl| json!({"player": cl.player_name, "peer": cl.peer, "services": cl.services})).collect();
+        .filter_map(|cl| shown(c, &cl.peer, json!({"player": cl.player_name, "peer": cl.peer,
+                                                    "services": cl.services})))
+        .collect();
     // Python lists its sessions by player in first-login order; ours come from a map, so oldest session first.
     // The NEX connection does not know its address here: the session's (the PC it signed in from) stands in.
     let mut sessions: Vec<_> = st.sessions.players().into_iter().filter(|s| s.channels.nex().is_some()).collect();
     sessions.sort_by(|a, b| a.created.total_cmp(&b.created));
     let game: Vec<Value> = sessions.iter()
-        .map(|s| json!({"player": s.player.name, "nex": true, "peer": s.client_ip})).collect();
+        .filter_map(|s| shown(c, &s.client_ip, json!({"player": s.player.name, "nex": true, "peer": s.client_ip})))
+        .collect();
     Ok(json!({"server": "powder", "version": crate::constants::version(), "you": c.req.client_ip(),
               "public_host": st.config.server.public_host, "accounts": st.accounts.required()?,
               "players": st.repos.players()?.len(), "gamedata": !st.assets.is_empty(),
@@ -324,6 +352,52 @@ mod tests {
         assert_eq!(b["game"], json!([{"player": name, "nex": true, "peer": "10.0.0.5"}]));
         drop((anonymous, signed_in));
         assert_eq!(body(&handle(&st, &req("GET", "/_powder/status", &[])))["connect"], json!([]));
+    }
+
+    /// Other players' addresses only for the server's own PC; a caller sees its own entries as the launcher
+    /// needs them (peer = its address), the others by name (on a public server: not at all).
+    #[test]
+    fn status_hides_other_players_addresses() {
+        struct Nex;
+        impl crate::core::sessions::NexChannel for Nex {
+            fn send_request(&self, _: &str, _: &str, _: &[u8], _: Option<u32>) -> u32 {
+                0
+            }
+        }
+        for public in [false, true] {
+            let mut config = Config::default();
+            config.server.public = public;
+            let st = state_with(config, vec![], None);
+            let (ann, bob) = (st.accounts.player("00000000-0000-4000-8000-00000000000a").unwrap(),
+                              st.accounts.player("00000000-0000-4000-8000-00000000000b").unwrap());
+            let mut clients = vec![];
+            for (player, ip) in [(&ann, "10.0.0.5"), (&bob, "10.0.0.9")] {
+                st.sessions.issue(player.clone(), ip, "").channels.set_nex(Some(Arc::new(Nex)));
+                let c = st.connect_clients.add(&format!("{ip}:4000"));
+                c.update(|c| {
+                    c.profile_id = Some(player.profile_id.clone());
+                    c.player_name = Some(player.name.clone());
+                });
+                clients.push(c);
+                std::thread::sleep(std::time::Duration::from_millis(2)); // session order
+            }
+            let b = body(&handle(&st, &req_from("10.0.0.9", "GET", "/_powder/status", &[])));
+            let mut want_game = vec![json!({"player": bob.name, "nex": true, "peer": "10.0.0.9"})];
+            let mut want_connect = vec![json!({"player": bob.name, "peer": "10.0.0.9:4000", "services": []})];
+            if !public {
+                want_game.insert(0, json!({"player": ann.name, "nex": true}));
+                want_connect.insert(0, json!({"player": ann.name, "services": []}));
+            }
+            assert_eq!((&b["game"], &b["connect"]), (&json!(want_game), &json!(want_connect)), "public {public}");
+            assert_eq!(b["you"], "10.0.0.9");
+            // the server's PC sees everything
+            for local in ["127.0.0.1", "[::1]"] {
+                let all = body(&handle(&st, &req_from(local, "GET", "/_powder/status", &[])));
+                assert_eq!(all["game"][0]["peer"], "10.0.0.5", "{local}");
+                assert_eq!(all["connect"].as_array().unwrap().len(), 2);
+            }
+        }
+        assert_eq!(peer_ip("[::ffff:10.0.0.1]:5"), Some("10.0.0.1".parse().unwrap()));
     }
 
     #[test]
