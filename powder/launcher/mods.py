@@ -1,16 +1,19 @@
 """Client mods: DLLs a server offers to load into the game, next to the TLS helper.
 
 The server lists them at GET /_powder/mods and serves each file at GET /_powder/mods/<name>/<path>, over
-its HTTPS port, checked against its CA (like the account calls). Trust model: a server must never be able
-to put code on a player's PC unasked, so
+its HTTPS port, checked against its CA as pinned for that server (like the account calls; no redirects
+followed). Trust model: a server must never be able to put code on a player's PC unasked, so
   - client mods are off unless launcher.toml says `[client_mods] enabled = true`,
-  - only the mods named in `allow` are used (exact names, no wildcard),
-  - the first time an allowed mod is used from a server, its files (path + sha256) and inject list are
-    pinned (settings.json, per server); afterwards any change is refused until the player approves the
-    new version (a button in the Client mods step),
+  - only the mods named in `allow` are considered (exact names, no wildcard),
+  - each one is used only once the player approved it for this server, shown with its files, sizes and
+    SHA-256 (refusing is the first choice): the approval pins the files (path + sha256) and the inject list
+    (settings.json client_mod_approvals, under the server's pinned CA fingerprint, so another server, or
+    another CA at the same address, asks again); afterwards any change asks again,
   - every file is checked for size and sha256 after download and again right before it is injected,
   - files land only in <data_dir>/client-mods/<server>/<mod>/: paths from the server that are absolute,
-    contain "..", a drive letter, a backslash, a colon or a Windows device name are rejected.
+    contain "..", a drive letter, a backslash, a colon or a Windows device name are rejected; the list is
+    bounded (MAX_MODS mods, MAX_FILES files and MAX_MOD_BYTES per mod), and its texts are cleaned of
+    control characters and cut before they are shown.
 Game files are never touched.
 """
 from __future__ import annotations
@@ -23,22 +26,27 @@ import shutil
 import ssl
 import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+from . import server
 
 API = 1
 MAX_INDEX = 1 << 20                      # bytes of /_powder/mods we read at most
 MAX_FILE = 256 << 20                     # a single mod file at most
+MAX_MOD_BYTES = 512 << 20                # all files of one mod at most
+MAX_FILES = 256                          # files per mod
+MAX_MODS = 64                            # mods in the list
+MAX_NAME, MAX_VERSION, MAX_DESCRIPTION, MAX_PATH = 64, 40, 200, 240
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RESERVED = {"con", "prn", "aux", "nul", "conin$", "conout$"} | {f"{d}{i}" for d in ("com", "lpt") for i in range(10)}
 
 # what the launcher does with an offered mod
 OFF = "off"                 # client mods are off in launcher.toml
 NOT_ALLOWED = "not allowed" # not in client_mods.allow
-NEW = "new"                 # allowed, first use from this server: pinned now and used
-ACTIVE = "active"           # allowed, files as pinned
-CHANGED = "changed"         # allowed, but its files differ from the pin: not used until approved again
+NEW = "new"                 # allowed, not approved for this server yet: asks
+ACTIVE = "active"           # allowed and approved, files as pinned
+CHANGED = "changed"         # allowed, but its files differ from the approval: asks again
 
 
 class ModError(Exception):
@@ -66,6 +74,13 @@ class ClientMod:
                 "inject": list(self.inject)}
 
 
+def clean(text, limit: int) -> str:
+    """A server-given text as it may be shown: printable characters only (no control or bidi characters),
+    whitespace collapsed, at most `limit` characters."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 # ---- path safety ------------------------------------------------------------------------------------------
 def safe_segment(seg: str) -> str:
     """One path component that means the same on Windows and POSIX and stays where it is put."""
@@ -84,6 +99,8 @@ def safe_rel_path(path: str) -> PurePosixPath:
     """A server-given relative path ("bin/x.dll"), or ModError if it could leave the mod's folder."""
     if not isinstance(path, str) or not path:
         raise ModError("empty path")
+    if len(path) > MAX_PATH:
+        raise ModError(f"path {clean(path, 60)!r} is longer than {MAX_PATH} characters")
     if path.startswith(("/", "\\")) or "\\" in path or ":" in path:
         raise ModError(f"path {path!r} is absolute or uses a drive, backslash or colon")
     parts = path.split("/")
@@ -108,9 +125,14 @@ def parse_mod(raw) -> ClientMod:
     name = raw.get("name")
     if not isinstance(name, str):
         raise ModError("mod without a name")
+    if len(name) > MAX_NAME:
+        raise ModError(f"mod name {clean(name, 40)!r} is longer than {MAX_NAME} characters")
     safe_segment(name)
     files, seen = [], set()
-    for f in raw.get("files") or []:
+    listed = raw.get("files") or []
+    if not isinstance(listed, list) or len(listed) > MAX_FILES:
+        raise ModError(f"{name}: more than {MAX_FILES} files, or not a list")
+    for f in listed:
         if not isinstance(f, dict):
             raise ModError(f"{name}: file entry is not an object")
         path = str(safe_rel_path(f.get("path")))
@@ -125,6 +147,8 @@ def parse_mod(raw) -> ClientMod:
         files.append(ModFile(path, size, sha))
     if not files:
         raise ModError(f"{name}: no files")
+    if sum(f.size for f in files) > MAX_MOD_BYTES:
+        raise ModError(f"{name}: more than {MAX_MOD_BYTES >> 20} MiB in all")
     inject = raw.get("inject") or []
     if not isinstance(inject, list):
         raise ModError(f"{name}: inject is not a list")
@@ -134,8 +158,8 @@ def parse_mod(raw) -> ClientMod:
             raise ModError(f"{name}: inject {p!r} is not one of its files")
         if not p.lower().endswith(".dll"):
             raise ModError(f"{name}: inject {p!r} is not a .dll")
-    return ClientMod(name, str(raw.get("version", "")), str(raw.get("description", "")), tuple(files),
-                     tuple(str(safe_rel_path(p)) for p in inject))
+    return ClientMod(name, clean(raw.get("version", ""), MAX_VERSION), clean(raw.get("description", ""),
+                     MAX_DESCRIPTION), tuple(files), tuple(str(safe_rel_path(p)) for p in inject))
 
 
 def parse_index(data) -> tuple[list[ClientMod], list[str]]:
@@ -143,7 +167,9 @@ def parse_index(data) -> tuple[list[ClientMod], list[str]]:
     if not isinstance(data, dict) or data.get("api") != API or not isinstance(data.get("mods"), list):
         raise ModError(f"the server's mod list is not in a format this launcher knows (api {API})")
     mods, problems, names = [], [], set()
-    for raw in data["mods"]:
+    if len(data["mods"]) > MAX_MODS:
+        problems.append(f"{len(data['mods']) - MAX_MODS} mods beyond the first {MAX_MODS} ignored")
+    for raw in data["mods"][:MAX_MODS]:
         try:
             mod = parse_mod(raw)
         except ModError as e:
@@ -160,7 +186,7 @@ def parse_index(data) -> tuple[list[ClientMod], list[str]]:
 # ---- consent ------------------------------------------------------------------------------------------------
 def decide(mods: list[ClientMod], enabled: bool, allow, pins: dict) -> dict[str, str]:
     """What happens to each offered mod (OFF / NOT_ALLOWED / NEW / ACTIVE / CHANGED), from launcher.toml's
-    switch and allow list and this server's pins."""
+    switch and allow list and the approvals for this server's CA (`pins`: name -> approved pin)."""
     allow = set(allow)
     out = {}
     for m in mods:
@@ -188,7 +214,13 @@ def changes(old: dict, mod: ClientMod) -> str:
     parts += [f"{p} removed" for p in before if p not in after]
     if old.get("inject") != list(mod.inject):
         parts.append("load order " + " -> ".join(mod.inject or ["nothing"]))
-    return ", ".join(parts) or "nothing"
+    return clean(", ".join(parts), 400) or "nothing"
+
+
+def listing(mod: ClientMod) -> str:
+    """For the player to check (and copy): each file's SHA-256, size and path, and what gets loaded."""
+    lines = [f"{f.sha256}  {f.size:>10}  {f.path}" for f in mod.files]
+    return "\n".join(lines + [f"loads, in order: {', '.join(mod.inject) or 'nothing'}"])
 
 
 # ---- download -----------------------------------------------------------------------------------------------
@@ -263,7 +295,8 @@ def remove_unused(server_dir: Path, keep: set[str]) -> None:
 
 # ---- HTTP ---------------------------------------------------------------------------------------------------
 class Http:
-    """GETs on the server's HTTPS port, checked against its CA (reached by address: no name check)."""
+    """GETs on the server's HTTPS port, checked against its pinned CA (reached by address: no name check),
+    no redirects."""
     def __init__(self, address: str, port: int, ca: Path, timeout: float = 30):
         self.base = f"https://{address}:{port}"
         self.timeout = timeout
@@ -273,7 +306,7 @@ class Http:
     def get(self, path: str, max_bytes: int) -> bytes:
         """The body; ModError on HTTP errors, unreachable server or a body over `max_bytes`."""
         try:
-            with urllib.request.urlopen(self.base + path, timeout=self.timeout, context=self.ctx) as r:
+            with server.open_url(self.base + path, self.ctx, self.timeout) as r:
                 data = r.read(max_bytes + 1)
         except urllib.error.HTTPError as e:
             raise ModError(f"{path}: HTTP {e.code}") from e

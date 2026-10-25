@@ -639,27 +639,34 @@ class Session:
             self.set("account", OK, f"{acc.name} ({acc.email})")
             return True
 
-    # ---- client mods (opt-in, pinned per server; see mods.py) -------------------------------------------
+    # ---- client mods (opt-in, approved per server CA and content; see mods.py) -------------------------
     def mods_dir(self) -> Path:
         """Where this server's client mods are downloaded to (one folder per mod)."""
         return self.data_dir / "client-mods" / self._account_key().replace(":", "_")
 
     def mod_pins(self) -> dict:
-        """The approved files of each client mod of this server (settings.json)."""
-        return dict((self._prefs().get("client_mod_pins") or {}).get(self._account_key()) or {})
+        """The client mods approved for this server: name -> approved files (settings.json client_mod_approvals,
+        under the server's pinned CA fingerprint, not its address)."""
+        ca = self.pinned_ca()
+        return dict((self._prefs().get("client_mod_approvals") or {}).get(ca) or {}) if ca else {}
 
     def _save_mod_pins(self, pins: dict) -> None:
-        every = dict(self._prefs().get("client_mod_pins") or {})
-        every[self._account_key()] = pins
-        self._save_prefs(client_mod_pins=every)
+        every = dict(self._prefs().get("client_mod_approvals") or {})
+        every[self.pinned_ca()] = pins
+        self._save_prefs(client_mod_approvals=every)
 
     def check_mods(self) -> bool:
         """Which client mods the server offers and which are used: only with client_mods.enabled, only the
-        ones in client_mods.allow, and only as pinned on first use (a change asks first). Never stops Play."""
+        ones in client_mods.allow, and only once the player approved exactly those files for this server (new
+        or changed: asks). Never stops Play."""
         self.mod_plan = []
         self.set("mods", RUNNING, "asking the server which client mods it offers")
+        ca = self.trusted_ca()
+        if ca is None:                                  # the Certificate step pins it; nothing without it
+            self.set("mods", OK, "the server's certificate is not pinned; playing without client mods")
+            return True
         try:
-            http = mods.Http(self.cfg.server_address, self.cfg.server_https_port, self.ca_path)
+            http = mods.Http(self.cfg.server_address, self.cfg.server_https_port, ca)
             index = mods.fetch_index(http.get)
         except (mods.ModError, OSError, ssl.SSLError) as e:
             log.warning("client mods: no list from the server: %s", e)
@@ -678,21 +685,34 @@ class Session:
         shown: list[str] = []
         for m in offered:
             state = verdict[m.name]
-            if state == mods.CHANGED:
-                choice = self.ask("mods", f"The client mod \"{m.name}\" ({m.version}) is not what you approved on "
-                                  f"this server: {mods.changes(pins[m.name], m)}. A client mod is code that runs "
-                                  "inside the game with your rights: approve the new version only if you trust "
-                                  "the server's host with that.", ["Approve new version", "Play without it"])
-                if choice != "Approve new version":
-                    log.warning("client mod %s: changed since approved, not used", m.name)
-                    shown.append(f"{m.name}: changed since you approved it, not used")
+            if state in (mods.NEW, mods.CHANGED):
+                size = sum(f.size for f in m.files) / (1 << 20)
+                files = f"{len(m.files)} file(s), {size:.1f} MiB, loads {', '.join(m.inject) or 'nothing'}"
+                if state == mods.NEW:
+                    what = (f"The server at {self._account_key()} offers the client mod \"{m.name}\" "
+                            f"{m.version or '(no version)'}" + (f" ({m.description})" if m.description else "") +
+                            f", not approved for this server yet: {files}.")
+                    approve = "Approve and load"
+                else:
+                    what = (f"The client mod \"{m.name}\" {m.version or '(no version)'} of the server at "
+                            f"{self._account_key()} is not what you approved: {mods.changes(pins[m.name], m)}; "
+                            f"now {files}.")
+                    approve = "Approve new version"
+                choice = self.ask("mods", what + " A client mod is code that runs inside the game with your rights: "
+                                  "approve it only if you trust the server's host with that. Its files and their "
+                                  "SHA-256 are below.", ["Play without it", approve], details=mods.listing(m))
+                if choice != approve:
+                    log.warning("client mod %s: %s, not approved, not used", m.name,
+                                "new" if state == mods.NEW else "changed since approved")
+                    shown.append(f"{m.name}: " + ("not approved" if state == mods.NEW else
+                                                  "changed since you approved it") + ", not used")
                     continue
-                state = mods.NEW
-            if state == mods.NEW:
                 pins[m.name] = m.pin()
                 self._save_mod_pins(pins)
-                log.info("client mod %s %s approved for this server: %s", m.name, m.version, m.pin())
-            if state in (mods.NEW, mods.ACTIVE):
+                log.info("client mod %s %s approved for the server CA %s: %s", m.name, m.version, self.pinned_ca(),
+                         m.pin())
+                state = mods.ACTIVE
+            if state == mods.ACTIVE:
                 self.set("mods", RUNNING, f"downloading {m.name}")
                 try:
                     got = mods.sync(m, self.mods_dir() / m.name, http.get)

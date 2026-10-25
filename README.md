@@ -271,17 +271,24 @@ allow = ["fov", "hud"]         # exact mod names; no wildcard
 
 - With client mods off, the **Client mods** step still shows what the server offers (and the log lists
   it), but downloads nothing.
-- The first time an allowed mod is used from a server, the launcher **pins** it: each file's path and
-  SHA-256 and the DLLs it loads, in order, remembered per server in `data/launcher/settings.json`
-  (`client_mod_pins`). Only the version text may change later.
-- If the host changes a pinned mod, Play stops at the step and says what changed: **Approve new version**
-  pins the new files, **Play without it** plays this time without that mod (and asks again next time).
-  To withdraw an approval, take the mod out of `allow` (its files are deleted at the next Play); to
-  forget a pin, delete its entry under `client_mod_pins`.
+- An allowed mod is used only once you approved it for that server: the first time, Play stops at the step
+  and shows the server, the mod's name, version and description, its files with size and SHA-256 and the
+  DLLs it loads, in order. **Play without it** (the first button) plays without it and asks again next
+  time; **Approve and load** pins exactly those files and that load order, remembered in
+  `data/launcher/settings.json` (`client_mod_approvals`) under the server's pinned CA fingerprint (see
+  Certificate above), not its address: another server, or another CA at the same address, asks again even
+  for a mod of the same name. Only the version text may change later. (Approvals of older launchers,
+  `client_mod_pins`, are not used: each mod is asked about once more.)
+- If the host changes an approved mod, Play stops at the step and says what changed: **Approve new
+  version** pins the new files, **Play without it** plays this time without that mod (and asks again next
+  time). To withdraw an approval, take the mod out of `allow` (its files are deleted at the next Play); to
+  forget one, delete its entry under `client_mod_approvals`.
 - Files go only to `data/launcher/client-mods/<server>_<port>/<mod>/`. Paths that are absolute, contain
   `..`, a drive letter, a backslash, a colon or a Windows device name are refused, as is any file whose
   size or SHA-256 differs from the server's list (checked after the download and again right before
-  loading). Files no longer listed are deleted; game files are never touched.
+  loading). Files no longer listed are deleted; game files are never touched. The list is bounded (64
+  mods, 256 files and 512 MiB per mod, 256 MiB per file), its texts are cleaned of control characters and
+  cut before they are shown, and downloads follow no redirects.
 - The DLLs are loaded after the TLS helper is attached and its armer started, mod by mod in the server's
   order. A mod that fails to load is logged and skipped; the game goes on, and the Steep step says which
   mods loaded.

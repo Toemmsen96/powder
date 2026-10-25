@@ -17,8 +17,8 @@ remove_hosts_on_exit = false     # take the hosts entries the launcher added out
 remove_ca_on_exit = false        # same for the server's CA it added to Windows' trusted roots (asks first)
 
 # Client mods: DLLs a server offers to load into the game (see README, "Client mods"). They run on this PC
-# with your rights, so they are off by default and only the mods named here are used. Each is pinned to
-# its file hashes per server on first use; if the host changes it, Play asks before using the new version.
+# with your rights, so they are off by default and only the mods named here are considered. Play asks before
+# using one the first time on a server (showing its files and hashes) and again whenever the host changes it.
 [client_mods]
 enabled = false
 allow = []                       # e.g. ["fov", "hud"]: exact mod names, no wildcard
