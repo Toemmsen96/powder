@@ -363,7 +363,7 @@ async fn run(config: Config) -> Result<()> {
     let config = Arc::new(config);
     log::info!(target: "powder", "Powder {} ({}): config {}", version(), config.server.name,
                config.path.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "(defaults)".into()));
-    let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
+    let db = Arc::new(Db::open(&Services::move_legacy_db(config.data_dir())?)?);
     db.migrate()?;
     log::info!(target: "powder", "data: {} (schema v{})", config.data_dir().display(), db.version()?);
     let assets = Arc::new(if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() });
