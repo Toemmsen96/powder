@@ -44,8 +44,9 @@ fi
 # 3. trust the CA in the Wine prefix (same registry layout powder-wrap/trust.rs use)
 HERE=$(cd "$(dirname "$0")" && pwd)
 REG=$(mktemp --suffix=.reg)
-KEY=$(python3 "$HERE/mkcareg.py" "$MITM_CA" "$REG")
-say "trusting mitmproxy CA in $WINEPREFIX"
+THUMB=$(python3 "$HERE/mkcareg.py" "$MITM_CA" "$REG")
+ROOT='Software\Microsoft\SystemCertificates\Root\Certificates'
+say "trusting mitmproxy CA (HKLM + HKCU) in $WINEPREFIX"
 WINEPREFIX="$WINEPREFIX" "$WINE" regedit "$REG" >/dev/null 2>&1 || true
 
 # 4. point the prefix at the proxy (WinINet / Ubisoft Connect reads this)
@@ -57,7 +58,8 @@ cleanup() {
     say "cleanup: removing proxy + CA from the prefix"
     WINEPREFIX="$WINEPREFIX" "$WINE" reg add "$PROXY_KEY" /v ProxyEnable /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
     WINEPREFIX="$WINEPREFIX" "$WINE" reg delete "$PROXY_KEY" /v ProxyServer /f >/dev/null 2>&1 || true
-    WINEPREFIX="$WINEPREFIX" "$WINE" reg delete "$KEY" /f >/dev/null 2>&1 || true
+    WINEPREFIX="$WINEPREFIX" "$WINE" reg delete "HKEY_LOCAL_MACHINE\\$ROOT\\$THUMB" /f >/dev/null 2>&1 || true
+    WINEPREFIX="$WINEPREFIX" "$WINE" reg delete "HKEY_CURRENT_USER\\$ROOT\\$THUMB" /f >/dev/null 2>&1 || true
     rm -f "$REG"
     say "flows saved to $OUT.flows  -> parse with: python3 tools/capture/ubiparse.py $OUT.flows"
 }
