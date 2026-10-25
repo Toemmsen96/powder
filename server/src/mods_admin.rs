@@ -91,13 +91,13 @@ pub fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool) -> mlua::Res
     t.set("sign_in", lua.create_function(move |lua, (email, password, address): (String, String, String)| {
         let s = services(&sl)?;
         let email = email.trim().to_lowercase();
-        if s.login_failures.blocked(&address, &email) {
+        // counted before the password is hashed (a success takes it back): concurrent guesses can't slip past
+        if !s.login_failures.attempt(&address, &email) {
             return refused("too many failed sign-ins, try again in a few minutes".into());
         }
         let account = match s.accounts.authenticate(&email, &password) {
             Ok(a) => a,
             Err(_) => {
-                s.login_failures.failed(&address, &email);
                 log::warn!(target: "powder.mods", "admin sign-in from {address} refused: invalid credentials");
                 return refused("invalid email or password".into());
             }

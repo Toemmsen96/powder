@@ -224,7 +224,7 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
         keep_upload(state, req);
     }
     let origin = req.header("Origin").map(str::to_string);
-    if let Some(foreign) = origin.as_deref().filter(|o| !connect_origin(o)) {
+    if let Some(foreign) = origin.as_deref().filter(|o| !connect_origin(o) && !same_origin(req, o)) {
         if !matches!(req.method.as_str(), "GET" | "HEAD") {
             // a web page elsewhere (the hosts file sends the player's browser here too): no preflight, no writes
             log::warn!(target: "powder.https", "{} {} from {} refused: origin {foreign:?} is not Ubisoft Connect's",
@@ -275,6 +275,13 @@ fn connect_origin(origin: &str) -> bool {
         .map_or(rest, |(h, _)| h).to_ascii_lowercase();
     let valid = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
     valid && ["ubisoft.com", "ubi.com"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// A page this server served itself (e.g. a mod's, such as the admin page) calling it back: the browser sets
+/// Origin to the page's own scheme + host, which no other site can claim. Not cross-origin: no CORS headers
+/// needed, and not refused.
+fn same_origin(req: &Req, origin: &str) -> bool {
+    req.header("host").is_some_and(|host| !host.is_empty() && origin.eq_ignore_ascii_case(&format!("https://{host}")))
 }
 
 /// One line per request (the size is "-" for a websocket, as aiohttp's content_length is None).
@@ -657,6 +664,18 @@ mod tests {
 
     /// Only Ubisoft Connect's origins get CORS (with credentials): a web page elsewhere, which the hosts file
     /// also sends here, can neither read replies nor send anything but GET / HEAD.
+    #[test]
+    fn a_servers_own_page_may_call_it() {
+        let st = state(vec![], None);
+        let own = [("Host", "127.0.0.1:18443"), ("Origin", "https://127.0.0.1:18443")];
+        let r = handle(&st, &req("POST", "/v1/nothing", &own));
+        assert_eq!((r.status, r.how.as_str(), header(&r, "access-control-allow-origin")), (200, "UNMATCHED", None));
+        let other = [("Host", "127.0.0.1:18443"), ("Origin", "https://127.0.0.1:9999")];
+        assert_eq!(handle(&st, &req("POST", "/v1/nothing", &other)).status, 403);
+        assert_eq!(handle(&st, &req("POST", "/v1/nothing", &[("Origin", "https://127.0.0.1:18443")])).status, 403,
+                   "no Host: nothing to compare with");
+    }
+
     #[test]
     fn cors_only_for_connects_origins() {
         for ok in ["https://connect.cdn.ubisoft.com", "https://uat-connect.cdn.ubisoft.com", "https://ubisoft.com",

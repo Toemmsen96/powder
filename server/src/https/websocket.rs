@@ -162,7 +162,7 @@ mod tests {
         let st = state(vec![], None);
         let ok = [("Upgrade", "websocket"), ("Connection", "keep-alive, Upgrade"), ("Sec-WebSocket-Version", "13"),
                   ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="), ("Sec-WebSocket-Protocol", "a, b"),
-                  ("Origin", "https://x")];
+                  ("Origin", "https://connect.cdn.ubisoft.com")];
         for path in ["/v2/websocket?NotificationTypes=X", "/v2/websocket/server?SpaceIds=x&NotificationTypes=X"] {
             let r = handle(&st, &req("GET", path, &ok));
             assert_eq!((r.status, r.how.as_str(), r.body.len()), (101, HOW, 0));
@@ -180,7 +180,7 @@ mod tests {
             h.push((name, value));
             handle(&st, &req("GET", "/v2/websocket", &h))
         };
-        let plain = handle(&st, &req("GET", "/v2/websocket", &[("Origin", "https://x")]));
+        let plain = handle(&st, &req("GET", "/v2/websocket", &[("Origin", "https://connect.cdn.ubisoft.com")]));
         for r in [plain, with("Sec-WebSocket-Version", "12"), with("Sec-WebSocket-Key", "c2hvcnQ="),
                   with("Connection", "keep-alive"), with("Upgrade", "h2c")] {
             let got = (r.status, r.how.as_str(), r.body.len(), r.headers.len());
