@@ -193,8 +193,10 @@ static void job_players(pw::HttpClient &c, AppState &st) {
             x.created_at = p.value("created_at", "");
             x.admin = p.value("admin", false);
             x.online = p.value("connect", false) || p.value("game", false);
-            x.credits = p.value("credits", (long long)0);
-            if (p.contains("level") && !p["level"].is_null()) x.level = std::to_string(p["level"].get<long long>());
+            if (p.contains("credits") && p["credits"].is_number()) x.credits = p["credits"].get<long long>();
+            // the server sends level as a string (or null) - not a number
+            if (p.contains("level") && p["level"].is_string()) x.level = p["level"].get<std::string>();
+            else if (p.contains("level") && p["level"].is_number()) x.level = std::to_string(p["level"].get<long long>());
             else x.level = "-";
             ps.push_back(std::move(x));
         }
@@ -219,7 +221,7 @@ static void job_detail(pw::HttpClient &c, AppState &st, std::string id) {
         }
         for (auto &s : j["stats"]) {
             Stat x; x.key = s.value("key", ""); x.is_double = s.value("double", false);
-            if (s.contains("value") && !s["value"].is_null()) x.value = s["value"].get<double>();
+            if (s.contains("value") && s["value"].is_number()) x.value = s["value"].get<double>();
             d.stats.push_back(std::move(x));
         }
         d.loaded = true;
