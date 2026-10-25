@@ -1,5 +1,9 @@
 //! The game-data pack on disk: MANIFEST.json (format, build info, sha256 of every file) plus the files listed
 //! in assets.rs. It travels as one .zip (`gamedata zip` / `gamedata install`).
+//!
+//! A pack may come from someone else: [`check`] (install, zip) and the server's loading apply the builder's
+//! allow-lists again and refuse a pack that fails (validate.rs). A zip is unpacked only within MAX_PACK_MEMBERS
+//! files and MAX_PACK_BYTES uncompressed; a folder with symbolic links is refused.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -8,6 +12,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const PACK_FORMAT: i64 = 1;
+/// A pack has 7 files (plus folders).
+pub const MAX_PACK_MEMBERS: usize = 64;
+/// Uncompressed (real packs: some MB, mostly the achievement icons).
+pub const MAX_PACK_BYTES: u64 = 512 << 20;
 pub const FILES: &[&str] = &["http.json", "offers.json", "actions.json", "rmc.json", "connect/http.json",
                              "connect/demux.json"];
 
@@ -55,7 +63,8 @@ pub fn verify_files(root: &Path, manifest: &Map<String, Value>) -> Vec<String> {
     }).map(|(name, _)| name.clone()).collect()
 }
 
-/// The manifest of a complete, unchanged pack at `root`; an error says what is wrong otherwise.
+/// The manifest of a complete, unchanged pack at `root` whose contents pass validate.rs; an error says what is
+/// wrong otherwise.
 pub fn check(root: &Path) -> Result<Map<String, Value>> {
     let manifest = read_manifest(root)?;
     let files = manifest.get("files").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -64,12 +73,19 @@ pub fn check(root: &Path) -> Result<Map<String, Value>> {
     if !wrong.is_empty() {
         bail!("the game-data pack at {} is incomplete or changed: {}", root.display(), wrong.join(", "));
     }
+    super::validate::validated(root)?;
     Ok(manifest)
 }
 
-/// Pack a checked pack into one .zip (to bring it to another PC).
+/// Pack a checked pack into one .zip (to bring it to another PC), after the privacy check that needs no
+/// recordings (privacy::self_check: nothing that looks like an account's data).
 pub fn zip_pack(root: &Path, out: &Path) -> Result<Map<String, Value>> {
     let manifest = check(root)?;
+    let findings = super::privacy::self_check(root);
+    if !findings.is_empty() {
+        bail!("the game-data pack at {} looks like it holds personal data, not zipped: {}", root.display(),
+              findings.iter().take(10).cloned().collect::<Vec<_>>().join("; "));
+    }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -84,17 +100,78 @@ pub fn zip_pack(root: &Path, out: &Path) -> Result<Map<String, Value>> {
     Ok(manifest)
 }
 
-/// The folder holding MANIFEST.json: `folder` itself or its single subfolder (a zipped folder).
+/// The folder holding MANIFEST.json: `folder` itself or its single subfolder (a zipped folder). One with
+/// symbolic links is refused (copying would follow them).
 fn pack_root(folder: &Path) -> Result<PathBuf> {
-    if folder.join("MANIFEST.json").exists() {
-        return Ok(folder.to_path_buf());
+    let root = if folder.join("MANIFEST.json").exists() {
+        folder.to_path_buf()
+    } else {
+        let subs: Vec<PathBuf> = std::fs::read_dir(folder)?.filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.is_dir()).collect();
+        if subs.len() != 1 || !subs[0].join("MANIFEST.json").exists() {
+            bail!("this is not a game-data pack (no MANIFEST.json inside)");
+        }
+        subs[0].clone()
+    };
+    if has_links(&root)? {
+        bail!("this game-data pack contains symbolic links; not installed");
     }
-    let subs: Vec<PathBuf> = std::fs::read_dir(folder)?.filter_map(|e| e.ok()).map(|e| e.path())
-        .filter(|p| p.is_dir()).collect();
-    if subs.len() == 1 && subs[0].join("MANIFEST.json").exists() {
-        return Ok(subs[0].clone());
+    Ok(root)
+}
+
+/// Whether `path` or anything below it is a symbolic link (links are not followed).
+fn has_links(path: &Path) -> Result<bool> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(true);
     }
-    bail!("this is not a game-data pack (no MANIFEST.json inside)")
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            if has_links(&entry?.path())? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Unpack a pack's .zip into `staging`: no path leaving it, at most `max_members` entries and `max_bytes`
+/// unpacked (the sizes the zip declares; no member is inflated beyond its own).
+pub(crate) fn unzip_capped(source: &Path, staging: &Path, max_members: usize, max_bytes: u64) -> Result<()> {
+    let file = std::fs::File::open(source)?;
+    let source_name = source.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let mut z = zip::ZipArchive::new(file).map_err(|_| anyhow!("{source_name} is not a .zip file"))?;
+    let mut total = 0u64;
+    for i in 0..z.len() {
+        let entry = z.by_index_raw(i)?;
+        if entry.enclosed_name().is_none() {
+            bail!("unsafe path in the zip: {}", entry.name()); // refuse paths that leave the folder
+        }
+        total = total.saturating_add(entry.size());
+    }
+    if z.len() > max_members || total > max_bytes {
+        bail!("{source_name} is not a game-data pack: {} files, {total} bytes unpacked (at most {max_members} files, \
+               {max_bytes} bytes)", z.len());
+    }
+    for i in 0..z.len() {
+        let mut entry = z.by_index(i)?;
+        let rel = entry.enclosed_name().ok_or_else(|| anyhow!("unsafe path in the zip: {}", entry.name()))?;
+        let dest = staging.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let (size, mut data) = (entry.size(), vec![]);
+        (&mut entry).take(size + 1).read_to_end(&mut data)?;
+        if data.len() as u64 != size {
+            bail!("{source_name}: {} is not the size the zip says", entry.name());
+        }
+        std::fs::write(dest, data)?;
+    }
+    Ok(())
 }
 
 fn sibling(target: &Path, suffix: &str) -> PathBuf {
@@ -128,25 +205,7 @@ pub fn install(source: &Path, target: &Path) -> Result<Map<String, Value>> {
         if source.is_dir() {
             copy_dir(&pack_root(source)?, &staging)?;
         } else {
-            let file = std::fs::File::open(source)?;
-            let mut z = zip::ZipArchive::new(file)
-                .map_err(|_| anyhow!("{} is not a .zip file", source.file_name().unwrap_or_default().to_string_lossy()))?;
-            for i in 0..z.len() {
-                let mut entry = z.by_index(i)?;
-                // refuse paths that leave the folder
-                let rel = entry.enclosed_name().ok_or_else(|| anyhow!("unsafe path in the zip: {}", entry.name()))?;
-                let dest = staging.join(rel);
-                if entry.is_dir() {
-                    std::fs::create_dir_all(&dest)?;
-                    continue;
-                }
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut data = vec![];
-                entry.read_to_end(&mut data)?;
-                std::fs::write(dest, data)?;
-            }
+            unzip_capped(source, &staging, MAX_PACK_MEMBERS, MAX_PACK_BYTES)?;
             let root = pack_root(&staging)?;
             if root != staging {
                 // zipped folder: lift its content up
@@ -193,7 +252,7 @@ mod tests {
         let pack = dir.path().join("pack");
         std::fs::create_dir_all(pack.join("connect")).unwrap();
         for name in FILES {
-            std::fs::write(pack.join(name), "{}").unwrap();
+            std::fs::write(pack.join(name), if name.ends_with("http.json") { "[]" } else { "{}" }).unwrap();
         }
         write_manifest(&pack, Map::new()).unwrap();
         let z = dir.path().join("p.zip");

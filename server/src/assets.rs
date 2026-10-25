@@ -6,16 +6,17 @@
 //!   offers.json                    the store catalogue {"offers": [...]}
 //!   actions.json                   Ubisoft Club action definitions (no player state)
 //!   connect/demux.json             Steep's owned-games entries for Ubisoft Connect, and its patch info
+//!
+//! What is used of a pack is what gamedata/validate.rs lets through (a pack that fails is not used at all).
 
-use crate::gamedata::pack;
+use crate::gamedata::{pack, validate};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 static GUID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").unwrap()
@@ -273,7 +274,9 @@ impl OfferCatalog {
     }
 }
 
-/// Steep's entries in Ubisoft Connect's owned-games reply.
+/// Steep's entries in Ubisoft Connect's owned-games reply: the server's own entries (builtin/products.rs) for the
+/// products the pack lists, with cloud saves on (demux/ownership.rs switches them off unless configured). Nothing
+/// of the pack's product entries but their ids reaches Connect.
 #[derive(Default)]
 pub struct ConnectProducts {
     pub patch_info: Option<Vec<u8>>,
@@ -282,17 +285,12 @@ pub struct ConnectProducts {
 }
 
 impl ConnectProducts {
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+    pub fn from_ids(patch_info: Option<Vec<u8>>, ids: &[u64], achievements_file: Option<&str>) -> Self {
+        if ids.is_empty() {
+            return Self { patch_info, products: vec![] };
         }
-        let raw: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        Ok(Self {
-            patch_info: raw.get("patch_info").and_then(Value::as_str).and_then(crate::util::unb64),
-            products: raw.get("products").and_then(Value::as_array).map(|p| {
-                p.iter().filter_map(|x| x.as_str().and_then(crate::util::unb64)).collect()
-            }).unwrap_or_default(),
-        })
+        let only: BTreeSet<u64> = ids.iter().copied().collect();
+        Self { patch_info, products: crate::builtin::products::entries_of(true, achievements_file, Some(&only)) }
     }
 }
 
@@ -305,6 +303,8 @@ pub struct Assets {
     pub connect_http: HttpFixtures,
     pub products: ConnectProducts,
     pub manifest: Option<Map<String, Value>>,
+    /// The achievement definitions zip's files, read once (not on every icon or GraphQL request).
+    pub(crate) achievements: OnceLock<HashMap<String, Vec<u8>>>,
 }
 
 impl Assets {
@@ -330,22 +330,25 @@ impl Assets {
         if !changed.is_empty() {
             log::warn!(target: "powder", "game-data pack files changed since it was built: {}", changed.join(", "));
         }
-        let actions_path = root.join("actions.json");
-        let actions = if actions_path.exists() {
-            let raw: Value = serde_json::from_slice(&std::fs::read(&actions_path)?)?;
-            raw.get("actions").and_then(Value::as_array).cloned().unwrap_or_default()
-        } else {
-            vec![]
+        let valid = match validate::validated(root) {
+            Ok(valid) => valid,
+            Err(e) => {
+                log::warn!(target: "powder", "{e:#}; running on built-in replies");
+                return Ok(Assets::default());
+            }
         };
-        Ok(Assets {
-            http: HttpFixtures::load(&root.join("http.json"))?,
-            rmc: RmcFixtures::load(&root.join("rmc.json"))?,
-            catalog: OfferCatalog::load(&root.join("offers.json"))?,
-            actions,
-            connect_http: HttpFixtures::load(&root.join("connect").join("http.json"))?,
-            products: ConnectProducts::load(&root.join("connect").join("demux.json"))?,
+        let mut assets = Assets {
+            http: HttpFixtures::new(valid.http),
+            rmc: RmcFixtures::parse(&valid.rmc),
+            catalog: OfferCatalog::new(valid.offers),
+            actions: valid.actions,
+            connect_http: HttpFixtures::new(valid.connect_http),
             manifest: Some(manifest),
-        })
+            ..Assets::default()
+        };
+        assets.products = ConnectProducts::from_ids(valid.patch_info, &valid.product_ids,
+                                                    assets.achievements_file().as_deref());
+        Ok(assets)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -369,20 +372,19 @@ impl Assets {
     }
 
     /// A file from the achievement definitions (a zip of '<lang>_loc.txt' files of 'id<TAB>name<TAB>
-    /// description' lines and '<id>.png' icons).
+    /// description' lines and '<id>.png' icons). The zip is read once (size-capped, validate::read_zip).
     fn achievement_file(&self, name: &str) -> Option<Vec<u8>> {
-        for e in self.connect_http.entries.iter().filter(|e| {
-            let path = e.path.split('?').next().unwrap_or("");
-            path.ends_with(".zip") && path.contains("/assets/")
-        }) {
-            let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(&e.body)) else { continue };
-            let Ok(mut f) = z.by_name(name) else { continue };
-            let mut out = vec![];
-            if f.read_to_end(&mut out).is_ok() {
-                return Some(out);
+        let files = self.achievements.get_or_init(|| {
+            for e in self.connect_http.entries.iter()
+                .filter(|e| e.path.split('?').next().unwrap_or("").ends_with(".zip") && e.path.contains("/assets/")) {
+                match validate::read_zip(&e.body) {
+                    Ok(files) => return files,
+                    Err(err) => log::warn!(target: "powder", "game-data pack: {err:#}"),
+                }
             }
-        }
-        None
+            HashMap::new()
+        });
+        files.get(name).cloned()
     }
 
     /// {achievement id: (name, description)} of Steep's achievements, in file order.

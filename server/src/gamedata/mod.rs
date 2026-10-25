@@ -3,3 +3,4 @@
 pub mod build;
 pub mod pack;
 pub mod privacy;
+pub mod validate;

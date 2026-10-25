@@ -25,7 +25,7 @@ fn id() -> String {
 }
 
 /// (method, path regex without query): game-wide configuration only, nothing under a profile or user.
-static GAME_ALLOW: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+pub(crate) static GAME_ALLOW: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     [
         format!("/v2/applications/{GUID}/configuration"),
         format!("/v1/spaces/{GUID}/configs/primarystore"),
@@ -35,7 +35,7 @@ static GAME_ALLOW: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     ].into_iter().map(|p| ("GET", Regex::new(&format!("^(?:{p})$")).unwrap())).collect()
 });
 
-static CONNECT_ALLOW: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+pub(crate) static CONNECT_ALLOW: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     let id = id();
     [
         format!("/v1/applications/{id}/configuration"),
@@ -61,7 +61,7 @@ pub const RMC_ALLOW: &[&str] = &["GameStorageProtocol::GetGameParamaters_V1", "S
 const STEEP_PRODUCTS: &[u64] = &[3279, 3280]; // Steam entry + Ubisoft product; their add-ons follow
 static OFFERS_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("/v1/spaces/{GUID}/offers$")).unwrap());
 static ACTIONS_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("/v1/profiles/{GUID}/actions$")).unwrap());
-const ACTION_PLAYER_FIELDS: &[&str] = &["profileId", "value"]; // per-player state in an action
+pub(crate) const ACTION_PLAYER_FIELDS: &[&str] = &["profileId", "value"]; // per-player state in an action
 static ANY_GUID: LazyLock<Regex> = LazyLock::new(|| Regex::new(GUID).unwrap());
 
 #[derive(Default, Debug)]
@@ -80,6 +80,12 @@ fn method(e: &Value) -> &str {
 
 fn allowed(rules: &[(&str, Regex)], e: &Value) -> bool {
     rules.iter().any(|(m, rx)| *m == method(e) && rx.is_match(base(e)))
+}
+
+/// Whether a reply (`path` with or without its query) is one of `rules` (validate.rs applies them to packs).
+pub(crate) fn allowed_path(rules: &[(&str, Regex)], method: &str, path: &str) -> bool {
+    let base = path.split('?').next().unwrap_or("");
+    rules.iter().any(|(m, rx)| *m == method && rx.is_match(base))
 }
 
 fn body(e: &Value) -> Value {
@@ -161,7 +167,24 @@ fn products(demux: &Value) -> Result<Vec<Vec<u8>>> {
             }));
         }
     }
-    Ok(wanted.iter().filter_map(|p| decoded.get(p).cloned()).collect())
+    wanted.iter().filter_map(|p| decoded.get(p)).map(|e| known_hash(e)).collect()
+}
+
+/// A product entry with its field 21 (40 hex digits) as Steep's known one (builtin/product_table.rs), or without
+/// it: another value could be per account (privacy::product_hash_findings).
+fn known_hash(entry: &[u8]) -> Result<Vec<u8>> {
+    let fields = pb::decode(entry)?;
+    let Some(value) = pb::bytes(&fields, privacy::PRODUCT_HASH).filter(|v| privacy::HEX40.is_match(v)) else {
+        return Ok(entry.to_vec());
+    };
+    let known = privacy::known_product_hash(pb::int(&fields, 1));
+    if matches!(&known, Some(pb::V::Bytes(k)) if *k == value.to_ascii_uppercase()) {
+        return Ok(entry.to_vec());
+    }
+    Ok(pb::encode(&match known {
+        Some(k) => pb::replace(&fields, privacy::PRODUCT_HASH, k),
+        None => fields.into_iter().filter(|f| f.0 != privacy::PRODUCT_HASH).collect(),
+    }))
 }
 
 pub fn build(recordings: &Path, out: &Path) -> Result<Report> {
@@ -232,4 +255,121 @@ pub fn build(recordings: &Path, out: &Path) -> Result<Report> {
     }
     std::fs::rename(&tmp, out)?;
     Ok(report)
+}
+
+/// A small, entirely made-up recordings set (tests/synthetic.py on main: the parts the builder reads), and the
+/// pack the real builder makes of it.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use super::*;
+    use crate::demux::pb::F;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    pub const PLAYER: &str = "00000000-0000-4000-8000-000000000001";
+    pub const PLAYER_NAME: &str = "TestPlayer";
+    pub const FRIEND: &str = "00000000-0000-4000-8000-000000000002";
+    pub const FRIEND_NAME: &str = "SecretFriendName"; // personal: must never reach a pack
+    pub const PLAYER_EMAIL: &str = "player@example.invalid"; // personal
+    pub const UBI: &str = "public-ubiservices.ubi.com";
+    pub const STEEP_STEAM: u64 = 3279;
+    pub const STEEP: u64 = 3280;
+    pub const ADDON: u64 = 4001;
+    pub const OTHER_GAME: u64 = 1234;
+    pub const ICON: &[u8] = b"\x89PNG\r\n\x1a\nmade-up";
+    pub const ACHIEVEMENT_NAMES: [(i64, &str, &str); 4] = [(1, "First steps", "Do the first thing"),
+        (4, "Four", "Do a fourth thing"), (15, "Fifteen", "Do it fifteen times"), (30, "Thirty", "Not earned yet")];
+
+    pub fn entry(host: &str, path: &str, body: &[u8], content_type: &str) -> Value {
+        json!({"method": "GET", "host": host, "path": path, "status": 200, "content_type": content_type,
+               "body_b64": crate::util::b64(body)})
+    }
+
+    fn http(method: &str, path: &str, body: Value) -> Value {
+        json!({"method": method, "host": UBI, "path": path, "status": 200, "content_type": "application/json",
+               "body_b64": crate::util::b64(crate::util::dumps(&body).as_bytes())})
+    }
+
+    pub fn achievement_zip() -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
+        let opts = zip::write::SimpleFileOptions::default();
+        z.start_file("en-US_loc.txt", opts).unwrap();
+        let text: String = ACHIEVEMENT_NAMES.iter().map(|(i, n, d)| format!("{i}\t{n}\t{d}\n")).collect();
+        z.write_all(format!("\u{feff}{text}").as_bytes()).unwrap();
+        for (i, _, _) in ACHIEVEMENT_NAMES {
+            z.start_file(format!("{i}.png"), opts).unwrap();
+            z.write_all(ICON).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    pub fn product(pid: u64, addons: &[u64], extra: Vec<F>) -> Vec<u8> {
+        let mut fields = vec![F::int(1, pid)];
+        fields.extend(addons.iter().map(|a| F::int(16, *a)));
+        fields.push(F::str(17, "version: 2.0\r\nroot:\r\n  name: l1\r\n  cloud_saves: yes\r\n"));
+        fields.extend(extra);
+        pb::encode(&fields)
+    }
+
+    pub fn owned_games_reply(products: &[Vec<u8>]) -> Vec<u8> {
+        pb::encode(&[F::msg(1, vec![F::int(1, 1), F::msg(2, vec![F::int(1, 1),
+            F::msg(2, products.iter().map(|p| F::bytes(1, p)).collect()), F::int(5, 0), F::int(6, 0)])])])
+    }
+
+    /// Steep's Steam entry (with its add-on), Steep, the add-on, and another game (the rest of the library).
+    pub fn products(extra: impl Fn() -> Vec<F>) -> Vec<Vec<u8>> {
+        vec![product(STEEP_STEAM, &[ADDON], extra()), product(STEEP, &[], extra()), product(ADDON, &[], extra()),
+             product(OTHER_GAME, &[], extra())]
+    }
+
+    fn friends_reply() -> Vec<u8> {
+        let entry = vec![F::int(1, 0), F::msg(2, vec![F::str(1, FRIEND), F::str(2, FRIEND_NAME), F::bytes(3, b""),
+                                                      F::int(4, 0)]), F::int(3, 3)];
+        pb::encode(&[F::msg(1, vec![F::int(1, 2), F::msg(22, vec![F::int(1, 1), F::msg(2, entry)])])])
+    }
+
+    pub fn recordings(folder: &Path, products: &[Vec<u8>]) -> PathBuf {
+        std::fs::create_dir_all(folder).unwrap();
+        let offer = |id: &str, kind: &str| json!({"offerId": id, "spaceId": SPACE_ID, "type": kind, "tags": ["STEEP"],
+                                                   "revision": 6, "items": []});
+        let login = json!({"platformType": "uplay", "ticket": "recorded-ticket", "profileId": PLAYER, "userId": PLAYER,
+                           "nameOnPlatform": PLAYER_NAME, "environment": "Prod", "spaceId": SPACE_ID});
+        let action = json!({"spaceId": SPACE_ID, "profileId": PLAYER, "id": "1000", "value": 3,
+                            "name": "The legend starts here", "xp": 20, "description": "Play", "isBadge": false});
+        let fixtures = json!([
+            http("POST", "/v3/profiles/sessions", login),
+            http("GET", &format!("/v1/spaces/{SPACE_ID}/offers?tags=SKI&offset=0&limit=100"),
+                 json!({"offers": [offer("0000000b-0000-4000-8000-0000000000a1", "shop")]})),
+            http("GET", &format!("/v2/applications/{APP_ID}/configuration"), json!({"recorded": true})),
+            http("GET", &format!("/v1/profiles/{PLAYER}/actions?spaceId={SPACE_ID}"), json!({"actions": [action]})),
+            http("GET", "/v2/profiles/me/friends", json!({"friends": [
+                {"pid": FRIEND, "nameOnPlatform": FRIEND_NAME, "state": "Friends", "lastModified": "x"}]})),
+        ]);
+        std::fs::write(folder.join("fixtures.json"), crate::util::dumps(&fixtures)).unwrap();
+        let connect = json!([
+            http("GET", "/v3/users/me", json!({"userId": PLAYER, "nameOnPlatform": PLAYER_NAME, "email": PLAYER_EMAIL})),
+            http("GET", &format!("/v1/spaces/{SPACE_ID}/parameters?parameterGroups=x"), json!({"parameters": {"a": 1}})),
+            entry("static3.cdn.ubi.com", "/orbit/uplay_launcher_3_0/assets/0123abcd.zip", &achievement_zip(),
+                  "application/zip"),
+        ]);
+        std::fs::write(folder.join("connect-fixtures.json"), crate::util::dumps(&connect)).unwrap();
+        let demux = json!({"client_version": 13368,
+            "patch_info": crate::util::b64(&pb::encode(&[F::int(1, 1), F::int(5, 13368)])),
+            "services": {"ownership_service": {"2": [crate::util::b64(&owned_games_reply(products))]},
+                         "friends_service": {"22": [crate::util::b64(&friends_reply())]}}});
+        std::fs::write(folder.join("demux.json"), crate::util::dumps(&demux)).unwrap();
+        let rmc = json!({
+            "GameStorageProtocol::GetGameParamaters_V1": [{"params_sha1": "00", "params_len": 0, "body": "0100"}],
+            "MatchmakingProtocol::LeaveSession_V1": [{"params_sha1": "01", "params_len": 4, "body": ""}]});
+        std::fs::write(folder.join("fixtures-rmc.json"), crate::util::dumps(&rmc)).unwrap();
+        folder.to_path_buf()
+    }
+
+    /// A pack built from the made-up recordings with the real builder, in `dir/gamedata`.
+    pub fn pack(dir: &Path) -> PathBuf {
+        let out = dir.join("gamedata");
+        let report = build(&recordings(&dir.join("recordings"), &products(Vec::new)), &out).unwrap();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        out
+    }
 }

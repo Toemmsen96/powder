@@ -1,4 +1,5 @@
-//! Steep's owned-games entries for Ubisoft Connect, without a game-data pack.
+//! Steep's owned-games entries for Ubisoft Connect, without a game-data pack and with one: a pack only says which
+//! of these products to list (gamedata/validate.rs), so what Connect is told to run is always this.
 //!
 //! Connect only starts a game it finds in the player's owned games. The entries' ids and numbers come from
 //! product_table.rs; their product configuration (YAML, field 17) is written here, with only what Connect
@@ -9,6 +10,7 @@
 use super::product_table::{P, KINDS, PRODUCTS};
 use crate::constants::{APP_ID, SPACE_ID};
 use crate::demux::pb::{self, F, V};
+use std::collections::BTreeSet;
 
 pub const PRODUCT_CONFIG: u32 = 17;
 pub const STEAM_APP_ID: u32 = 460920;
@@ -62,7 +64,7 @@ fn yaml(product_id: u64, fields: &[F], cloud_saves: bool, achievements_file: Opt
     text.replace('\n', "\r\n").into_bytes()
 }
 
-fn to_fields(table: &[(u32, P)]) -> Vec<F> {
+pub(crate) fn to_fields(table: &[(u32, P)]) -> Vec<F> {
     table
         .iter()
         .map(|(n, v)| match v {
@@ -75,10 +77,16 @@ fn to_fields(table: &[(u32, P)]) -> Vec<F> {
 
 /// The encoded product messages of Steep, its Steam entry and its add-ons.
 pub fn entries(cloud_saves: bool, achievements_file: Option<&str>) -> Vec<Vec<u8>> {
+    entries_of(cloud_saves, achievements_file, None)
+}
+
+/// [`entries`], `only` those of these product ids (a game-data pack's list), in this table's order.
+pub fn entries_of(cloud_saves: bool, achievements_file: Option<&str>, only: Option<&BTreeSet<u64>>) -> Vec<Vec<u8>> {
     PRODUCTS
         .iter()
-        .map(|table| {
-            let fields = to_fields(table);
+        .map(|table| to_fields(table))
+        .filter(|fields| only.is_none_or(|only| pb::int(fields, 1).is_some_and(|pid| only.contains(&pid))))
+        .map(|fields| {
             let pid = pb::int(&fields, 1).unwrap_or(0);
             let config = yaml(pid, &fields, cloud_saves, achievements_file);
             let fields: Vec<F> = fields
