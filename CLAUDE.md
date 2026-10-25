@@ -88,6 +88,34 @@ The Python codecs on `main` (e.g. `transport/nex/prudp.py`) are handy cross-chec
 
 Never run `admin trust install/remove` yourself: it changes the system trust store; leave it to the user.
 
+## Security (reviewed and hardened 2026-10-25)
+
+Both servers, the launcher and powder-wrap were reviewed; the fixes are in both servers alike (each Rust
+commit's message is the spec the Python one followed, and the other way round). In short: with accounts,
+players act only on their own data (401 without a session, 403 for others'); `[server] public` makes tickets
+strict; CORS only for Ubisoft's https origins (and the server's own pages); sign-in limits count first, 4
+hashes at once; body/connection/time limits on HTTPS, websocket, demux, NEX, Storm; NEX handshake in order,
+rate-limited, `nex_check_signatures` (log by default until a live session confirms how the game signs);
+Storm peers need their key; new CAs name-constrained to the 8 redirected hosts, keys 0600; remember-me
+tickets stored hashed (90 days); game-data packs checked before they are trusted (Connect's product YAML is
+always Powder's own: a pack's names/images are not shown); Lua mods sandboxed (no io/os/require, 128 MiB,
+100 ms per hook; server work a mod asks for, like api.admin's hashing, is off the clock). Launcher: a
+server's CA is checked (one self-signed, name-constrained CA within ubi.com/ubisoft.com) and pinned per server
+(TOFU, `host#<fingerprint>` in the Join address), client-mod approvals per server CA + content, System32
+programs only in elevated steps, hosts file kept byte for byte, narrower firewall rules.
+
+Open (decide with the user before doing):
+- native/: the TLS helper makes the game accept ANY certificate for every host; pinning it to the server's CA
+  needs the game's OpenSSL layout per build (see the launcher review notes in the 2026-10-25 commits).
+- The launcher installs per user, so its elevated hosts step runs a user-writable powder-cli.exe; a
+  per-machine install (`PrivilegesRequired=admin`) would close that (needs a Windows test).
+- New CAs could carry EKU serverAuth (today's are trusted by Windows for any purpose within their names),
+  and the launcher could then require it.
+- The game's login finds its player through "Connect signed in from the same address": players behind one NAT
+  on a lenient server can be mixed up (tie the game's ticket to the Connect session if the demux allows it).
+- With a pack, Connect's library shows less (Powder's own product YAML); names/images could be taken from the
+  pack while the launch details stay Powder's.
+
 ## Starting on a new device
 
 ```
