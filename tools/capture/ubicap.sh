@@ -64,7 +64,10 @@ cleanup() {
 trap cleanup EXIT
 
 # 5. capture every ubi.com flow
-say "proxy running on 127.0.0.1:8080. NOW launch Steep in Lutris (no powder-wrap)."
-say "sign in, open the world map / travel to a DLC world (Alaska, Japan), open the in-game shop."
-say "press Ctrl-C here when done."
-"$MITMDUMP" --listen-host 127.0.0.1 -p 8080 -w "$OUT.flows" "~d ubi\\.com"
+say "proxy on 127.0.0.1:8080. In Lutris (Steep > System options > Environment variables) set:"
+say "    HTTP_PROXY=http://127.0.0.1:8080   HTTPS_PROXY=http://127.0.0.1:8080"
+say "    http_proxy=http://127.0.0.1:8080   https_proxy=http://127.0.0.1:8080"
+say "then launch Steep (no powder-wrap), sign in, open the map / a DLC world / the shop."
+say "watch below: each captured request prints a line. press Ctrl-C when done."
+# capture everything (so we can confirm routing works); ubiparse.py filters to the DLC-relevant endpoints
+"$MITMDUMP" --listen-host 127.0.0.1 -p 8080 -w "$OUT.flows" --set flow_detail=1
