@@ -600,6 +600,31 @@ mod tests {
         assert!(acc.login(&basic("10.0.0.8", "ann@example.org", "battery staple", CONNECT_APP_ID)).is_ok());
     }
 
+    /// Remember-me tickets are kept as `sha256:<hex>` (the Python server's format; one database for both): the
+    /// database holds no usable ticket, a plaintext row from before is taken once and rewritten, old ones expire.
+    #[test]
+    fn remember_me_tickets_are_stored_hashed() {
+        let acc = service(Config::default());
+        let a = acc.register("ann@example.org", "correct horse", "Ann").unwrap();
+        let c = acc.login(&basic("10.0.0.5", "ann@example.org", "correct horse", CONNECT_APP_ID)).unwrap();
+        acc.remember(&c, "rm-ticket").unwrap();
+        let stored: Vec<String> = acc.repos.db.query("SELECT ticket FROM remember_tickets", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, [format!("sha256:{}", hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"rm-ticket")))]);
+        assert_eq!(acc.repos.remember_ticket_account("rm-ticket").unwrap().as_deref(), Some(a.account_id.as_str()));
+        assert!(acc.repos.remember_ticket_account(&stored[0]).unwrap().is_none(), "the stored form is no ticket");
+        // a row an older server wrote: accepted once, then stored hashed
+        acc.repos.db.execute("INSERT INTO remember_tickets(ticket, account_id, created_at) VALUES (?,?,?)",
+                             rusqlite::params!["old-plain", a.account_id, crate::util::iso_now()]).unwrap();
+        assert!(acc.login(&LoginRequest::new("10.0.0.8", "rm_v1", "old-plain")).is_ok());
+        let left: i64 = acc.repos.db.query_one("SELECT COUNT(*) FROM remember_tickets WHERE ticket = 'old-plain'", [],
+                                               |r| r.get(0)).unwrap().unwrap();
+        assert_eq!(left, 0);
+        assert!(acc.login(&LoginRequest::new("10.0.0.8", "rm_v1", "old-plain")).is_ok(), "and works hashed");
+        // 90 days on: gone
+        acc.repos.db.execute("UPDATE remember_tickets SET created_at = ?", [crate::util::iso_in(-91 * 86400)]).unwrap();
+        assert!(acc.repos.remember_ticket_account("rm-ticket").unwrap().is_none());
+    }
+
     #[test]
     fn strict_tickets() {
         let mut config = Config::default();

@@ -417,12 +417,23 @@ impl Repos {
     // ---- remember-me tickets ------------------------------------------------------------------------
     /// Per account the newest ones are kept (one per Connect sign-in).
     pub const KEEP_TICKETS: i64 = 20;
+    /// A ticket is valid this long after it was handed out (Connect gets a new one at every sign-in).
+    pub const TICKET_TTL_DAYS: i64 = 90;
+    const TICKET_PREFIX: &'static str = "sha256:";
+
+    /// How a remember-me ticket is stored: `sha256:<hex of SHA-256(ticket)>`, so whoever reads the database
+    /// cannot sign in with it (the tickets are long random strings: no salt or key needed). The Python
+    /// server's format too.
+    pub fn stored_ticket(ticket: &str) -> String {
+        use sha2::Digest;
+        format!("{}{}", Self::TICKET_PREFIX, hex::encode(sha2::Sha256::digest(ticket.as_bytes())))
+    }
 
     pub fn add_remember_ticket(&self, ticket: &str, account_id: &str) -> Result<()> {
         let aid = lc(account_id);
         self.db.tx(|| {
             self.db.execute("INSERT OR REPLACE INTO remember_tickets(ticket, account_id, created_at) VALUES (?,?,?)",
-                            params![ticket, aid, iso_now()])?;
+                            params![Self::stored_ticket(ticket), aid, iso_now()])?;
             self.db.execute("DELETE FROM remember_tickets WHERE account_id = ? AND rowid NOT IN (SELECT rowid \
                              FROM remember_tickets WHERE account_id = ? ORDER BY rowid DESC LIMIT ?)",
                             params![aid, aid, Self::KEEP_TICKETS])?;
@@ -430,8 +441,23 @@ impl Repos {
         })
     }
 
+    /// The account a live ticket belongs to; expired tickets are deleted first. A row from before tickets were
+    /// stored hashed is accepted once more and then stored hashed.
     pub fn remember_ticket_account(&self, ticket: &str) -> Result<Option<String>> {
-        self.db.query_one("SELECT account_id FROM remember_tickets WHERE ticket = ?", [ticket], |r| r.get(0))
+        self.db.execute("DELETE FROM remember_tickets WHERE created_at < ?",
+                        [crate::util::iso_in(-Self::TICKET_TTL_DAYS * 86400)])?;
+        let hashed = Self::stored_ticket(ticket);
+        let found = |t: &str| self.db.query_one("SELECT account_id FROM remember_tickets WHERE ticket = ?", [t],
+                                                |r| r.get::<_, String>(0));
+        if let Some(aid) = found(&hashed)? {
+            return Ok(Some(aid));
+        }
+        if ticket.starts_with(Self::TICKET_PREFIX) {
+            return Ok(None); // the stored form itself is no ticket
+        }
+        let Some(aid) = found(ticket)? else { return Ok(None) };
+        self.db.execute("UPDATE OR REPLACE remember_tickets SET ticket = ? WHERE ticket = ?", params![hashed, ticket])?;
+        Ok(Some(aid))
     }
 
     pub fn revoke_remember_tickets(&self, account_id: &str) -> Result<usize> {
