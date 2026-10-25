@@ -13,7 +13,11 @@
 //! memberships [{profileId, membershipType ACTIVE / PENDING, addedBy}], lastMessage, lastMessageTime,
 //! unreadCount; a message id, channelId, authorId, type, createTime (plus what Connect sent).
 //!
-//! In memory: channels last until the server stops (invites are only useful while both are playing).
+//! In memory: channels last until the server stops (invites are only useful while both are playing). Bounded, so
+//! nobody can fill the server's memory with them: a channel has at most [`MAX_MEMBERS`] members (more are left
+//! out), keeps its newest [`MAX_MESSAGES`] messages up to [`MAX_MESSAGE_BYTES`] in all, a player has at most
+//! [`MAX_CHANNELS_PER_CREATOR`] channels they created and the server [`MAX_CHANNELS`]: creating one more forgets
+//! the oldest (logged). What one request may carry is limited by the HTTPS body limit for these paths (16 KiB).
 
 use crate::util::iso_now;
 use parking_lot::Mutex;
@@ -23,6 +27,14 @@ use std::sync::Arc;
 
 pub const DM: &str = "DM";
 pub const GROUP: &str = "GROUP";
+/// Members of one channel, its creator included (a DM has 2; Connect's group chats are small).
+pub const MAX_MEMBERS: usize = 100;
+/// Messages a channel keeps (newest first), and their JSON size in all; older ones are dropped.
+pub const MAX_MESSAGES: usize = 100;
+pub const MAX_MESSAGE_BYTES: usize = 64 << 10;
+/// Channels one player created, and channels in all; creating one more forgets the oldest of them.
+pub const MAX_CHANNELS_PER_CREATOR: usize = 32;
+pub const MAX_CHANNELS: usize = 512;
 
 /// (profile id, notification type, content): a notification over the player's websocket(s).
 pub type Push = Arc<dyn Fn(&str, &str, Value) + Send + Sync>;
@@ -30,10 +42,30 @@ pub type Push = Arc<dyn Fn(&str, &str, Value) + Send + Sync>;
 struct Channel {
     /// The channel object as Connect gets it.
     data: Map<String, Value>,
+    /// Newest first.
     messages: Vec<Value>,
+    /// The messages' JSON size in all.
+    message_bytes: usize,
+    creator: String,
+}
+
+fn json_size(v: &Value) -> usize {
+    serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0)
 }
 
 impl Channel {
+    /// Add a message (newest first), dropping the oldest beyond MAX_MESSAGES / MAX_MESSAGE_BYTES (the new one stays).
+    fn add_message(&mut self, message: Value) {
+        self.message_bytes += json_size(&message);
+        self.messages.insert(0, message);
+        let over = |c: &Self| c.messages.len() > MAX_MESSAGES || c.message_bytes > MAX_MESSAGE_BYTES;
+        while self.messages.len() > 1 && over(self) {
+            if let Some(old) = self.messages.pop() {
+                self.message_bytes = self.message_bytes.saturating_sub(json_size(&old));
+            }
+        }
+    }
+
     fn id(&self) -> &str {
         self.data.get("id").and_then(Value::as_str).unwrap_or("")
     }
@@ -85,6 +117,13 @@ impl ChannelService {
         let mut wanted: BTreeSet<String> = body.get("members").and_then(Value::as_array).into_iter().flatten()
             .filter_map(Value::as_str).map(str::to_lowercase).collect();
         wanted.insert(me.clone());
+        if wanted.len() > MAX_MEMBERS {
+            log::warn!(target: "powder.channels", "channel from {me} for {} members: only {MAX_MEMBERS} kept",
+                       wanted.len());
+            let kept: BTreeSet<String> = wanted.iter().filter(|p| **p != me).take(MAX_MEMBERS - 1).cloned().collect();
+            wanted = kept;
+            wanted.insert(me.clone());
+        }
         let requested = body.get("channel").and_then(Value::as_object).cloned().unwrap_or_default();
         let ctype = truthy(requested.get("type")).cloned()
             .unwrap_or_else(|| json!(if wanted.len() == 2 { DM } else { GROUP }));
@@ -109,7 +148,19 @@ impl ChannelService {
                            ("lastMessageTime", json!(now)), ("unreadCount", json!(0))] {
                 data.insert(k.into(), v);
             }
-            channels.push(Channel { data: data.clone(), messages: vec![] });
+            let mine: Vec<usize> =
+                channels.iter().enumerate().filter(|(_, c)| c.creator == me).map(|(i, _)| i).collect();
+            let oldest = if mine.len() >= MAX_CHANNELS_PER_CREATOR {
+                mine.first().copied()
+            } else {
+                (channels.len() >= MAX_CHANNELS).then_some(0)
+            };
+            if let Some(i) = oldest {
+                let gone = channels.remove(i);
+                log::info!(target: "powder.channels", "channel {} forgotten (the oldest of {}): {me} created another",
+                           gone.id(), if mine.len() >= MAX_CHANNELS_PER_CREATOR { "theirs" } else { "all" });
+            }
+            channels.push(Channel { data: data.clone(), messages: vec![], message_bytes: 0, creator: me.clone() });
             data
         };
         let id = data["id"].as_str().unwrap_or("").to_string();
@@ -140,7 +191,7 @@ impl ChannelService {
                 message.insert(k.into(), v);
             }
             let message = Value::Object(message);
-            channel.messages.insert(0, message.clone());
+            channel.add_message(message.clone());
             channel.data.insert("lastMessage".into(), message.clone());
             channel.data.insert("lastMessageTime".into(), json!(now));
             (message, members)
@@ -212,6 +263,52 @@ mod tests {
         let other = "33333333-3333-3333-3333-333333333333";
         assert!(channels.of(other, None).is_empty() && channels.messages(other, id).is_none());
         assert!(channels.post(other, id, &json!({"type": "TEXT_MESSAGE"})).is_none());
+    }
+
+    #[test]
+    fn bounded_members_messages_and_channels() {
+        let (channels, _) = make();
+        let many: Vec<String> = (0..MAX_MEMBERS + 20).map(|i| format!("p{i:04}")).collect();
+        let group = channels.create(A, SPACE, &json!({"members": many}));
+        assert_eq!(group["memberships"].as_array().unwrap().len(), MAX_MEMBERS);
+        assert_eq!(group["memberships"][0]["profileId"], A, "the creator is always in");
+        // messages: the newest MAX_MESSAGES, and no more than MAX_MESSAGE_BYTES of them
+        let dm = channels.create(A, SPACE, &json!({"channel": {"type": "DM"}, "members": [B]}));
+        let id = dm["id"].as_str().unwrap();
+        for i in 0..MAX_MESSAGES + 5 {
+            channels.post(A, id, &json!({"type": "TEXT_MESSAGE", "n": i})).unwrap();
+        }
+        let kept = channels.messages(B, id).unwrap();
+        assert_eq!((kept.len(), &kept[0]["n"], &kept[MAX_MESSAGES - 1]["n"]), (MAX_MESSAGES, &json!(MAX_MESSAGES + 4),
+                                                                              &json!(5)));
+        let text = "x".repeat(10 << 10);
+        for _ in 0..10 {
+            channels.post(B, id, &json!({"type": "TEXT_MESSAGE", "text": text})).unwrap();
+        }
+        let kept = channels.messages(A, id).unwrap();
+        assert!(kept.len() < 10 && kept.iter().map(json_size).sum::<usize>() <= MAX_MESSAGE_BYTES, "{}", kept.len());
+        let huge = "y".repeat(MAX_MESSAGE_BYTES);
+        channels.post(B, id, &json!({"text": huge})).unwrap();
+        assert_eq!(channels.messages(A, id).unwrap().len(), 1, "a single message over the size stays alone");
+        // channels: a player's oldest of theirs goes when they create one too many
+        let first = channels.create(B, SPACE, &json!({"members": ["c0", "c1"]}));
+        for i in 1..MAX_CHANNELS_PER_CREATOR {
+            channels.create(B, SPACE, &json!({"members": [format!("c{i}"), "x"]}));
+        }
+        assert!(channels.of(B, None).iter().any(|c| c["id"] == first["id"]));
+        channels.create(B, SPACE, &json!({"members": ["new", "x"]}));
+        let of_b = channels.of(B, None);
+        assert!(!of_b.iter().any(|c| c["id"] == first["id"]), "B's oldest forgotten");
+        assert!(of_b.iter().any(|c| c["id"] == dm["id"]), "A's DM with B stays");
+        // and the server's oldest when all are taken
+        let others = MAX_CHANNELS - channels.channels.lock().len();
+        for i in 0..others {
+            channels.create(&format!("{i:08}-0000-0000-0000-000000000000"), SPACE, &json!({"members": [A]}));
+        }
+        assert_eq!(channels.channels.lock().len(), MAX_CHANNELS);
+        channels.create(A, SPACE, &json!({"members": ["one", "more"]}));
+        assert_eq!(channels.channels.lock().len(), MAX_CHANNELS);
+        assert!(channels.messages(A, id).is_some() && channels.messages(A, group["id"].as_str().unwrap()).is_none());
     }
 
     #[test]
