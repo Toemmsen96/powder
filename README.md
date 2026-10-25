@@ -363,6 +363,55 @@ uv run powder-server admin trust status           # the local CA in Windows (als
 - **Matchmaking** policy (who meets whom) is in `services/matchmaking.py`; the game's calls and the
   notifications it expects are described there.
 
+## Rust server (work in progress)
+
+The server is being ported to Rust on the `rework/rust-server` branch (`server/`), reply for reply: the
+game and Ubisoft Connect must not notice the difference. Until it is complete, **play with the Python
+server**; the Rust one is for testing and for writing mods.
+
+```
+cargo build --release                              # target/release/powder-server
+powder-server run                                  # same config.toml and data/ as the Python server
+powder-server mods                                 # load the mods and show what they hook
+powder-server admin trust status                   # also install / remove
+powder-server admin accounts                       # accounts, account-create, account-password, ...
+powder-server gamedata verify                      # also build / zip / install
+```
+
+| Ported | Not yet |
+| ------ | ------- |
+| HTTPS (TLS + local CA, CORS, game-data pack, built-in replies), sign-in (`/v3/profiles/sessions`), the CA's revocation list | profile, friends, store, UGC, cloud-save routes; the websocket; `/_powder/` status and account API |
+| NEX transport, login, game storage, profile/leaderboard handlers | stats and matchmaking handlers |
+| Storm (peer-to-peer helpers), accounts and sessions, economy, entities, stats, leaderboards | matchmaking, channels, cloud saves, import |
+| server mods (Lua) and client mods | Ubisoft Connect's demux |
+
+It reads the same `config.toml`, `data/` (database, keys, local CA) and game-data pack as the Python
+server, so you can switch between them. `admin trust` also works on Linux: Ubisoft Connect under Wine
+(Lutris, Proton) trusts the system's CA store, so the local CA goes there (`trust anchor`, as root).
+
+## Mods
+
+The Rust server replaces the Python plugins with **mods**, in the `mods/` folder next to `config.toml`
+(`[mods]` in the config picks which; names starting with `_` are skipped, see `mods/_example/`). A mod
+has a server part, a client part, or both:
+
+- **Server part** (Lua 5.4): `mods/<name>.lua` or `mods/<name>/mod.lua`, returning `function(api) ... end`.
+  `api.on(event, fn)` for `login`, `nex_connected`, `purchase`, ...; `api.before_http(method, path_glob, fn)`
+  and `api.before_rmc(method, fn)` answer requests themselves (return nil to let the server answer);
+  `api.save` / `api.load` keep data in the server's database; `api.log`, `api.config`. Errors in a mod
+  are logged and never reach the game.
+- **Client part**: files in `mods/<name>/client/` and a `mod.toml` (`version`, `description`,
+  `[client] inject = ["x.dll"]`). The server lists them at `/_powder/mods`; the launcher downloads them
+  and loads the DLLs into the game. **A player's launcher only loads client mods that player approved**,
+  pinned to their file hashes: a server cannot push code to its players.
+
+```lua
+-- mods/welcome.lua
+return function(api)
+    api.on("login", function(s) api.log.info(s.name .. " signed in") end)
+end
+```
+
 ## Licence
 
 Powder is free software under the [GNU Affero General Public License v3.0 or later](LICENSE): you may
