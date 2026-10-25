@@ -43,7 +43,7 @@ build_overlay() {
     fetch_deps
     local img="$tp/imgui"
     local obj="$bin/obj"; rm -rf "$obj"; mkdir -p "$obj"
-    local inc=(-I"$img" -I"$img/backends" -I"$tp/minhook/include" -I"$tp/json" -I"$here/overlay")
+    local inc=(-I"$img" -I"$img/backends" -I"$tp/minhook/include" -I"$tp/minhook/src/hde" -I"$tp/json" -I"$here/overlay")
 
     # MinHook (C)
     for s in buffer hook trampoline; do
@@ -55,7 +55,7 @@ build_overlay() {
     local cxxflags=(-O2 -std=c++17 -Wall "${inc[@]}")
     local srcs=("$img/imgui" "$img/imgui_draw" "$img/imgui_tables" "$img/imgui_widgets"
                 "$img/backends/imgui_impl_dx11" "$img/backends/imgui_impl_win32"
-                "$here/overlay/overlay" "$here/overlay/http" "$here/overlay/memscan")
+                "$here/overlay/overlay" "$here/overlay/http" "$here/overlay/memscan" "$here/overlay/access")
     for s in "${srcs[@]}"; do
         cxx "${cxxflags[@]}" -c "$s.cpp" -o "$obj/$(basename "$s").o"
     done

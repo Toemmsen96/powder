@@ -39,6 +39,7 @@
 #include "json.hpp"
 #include "http.h"
 #include "memscan.h"
+#include "access.h"
 
 using json = nlohmann::json;
 
@@ -322,12 +323,14 @@ static void trainer_apply() {
     if (!g_fly || !axes_ok) return;
     auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     double mv[3] = {0, 0, 0};
-    if (held(VK_NUMPAD6)) mv[0] += 1;
-    if (held(VK_NUMPAD4)) mv[0] -= 1;
-    if (held(VK_NUMPAD9)) mv[1] += 1;
-    if (held(VK_NUMPAD3)) mv[1] -= 1;
-    if (held(VK_NUMPAD8)) mv[2] += 1;
-    if (held(VK_NUMPAD2)) mv[2] -= 1;
+    // WASD = horizontal (X = A/D, Z = W/S), Shift/Ctrl = up/down (Y). World-axis for now; which key maps to
+    // which world axis depends on how X/Y/Z are tagged - camera-relative needs the view matrix (later).
+    if (held('D')) mv[0] += 1;
+    if (held('A')) mv[0] -= 1;
+    if (held(VK_SHIFT)) mv[1] += 1;
+    if (held(VK_CONTROL)) mv[1] -= 1;
+    if (held('W')) mv[2] += 1;
+    if (held('S')) mv[2] -= 1;
     for (int k = 0; k < 3; ++k) {
         Slot &s = g_slots[g_axis[k]];
         pw::Value cur;
@@ -820,7 +823,7 @@ static void draw_trainer_tab() {
     ImGui::SeparatorText("Fly / noclip-lite");
     bool axes_ok = g_axis[0] >= 0 && g_axis[1] >= 0 && g_axis[2] >= 0;
     ImGui::BeginDisabled(!axes_ok);
-    ImGui::Checkbox("Fly (hold position; move with numpad 8/2 4/6 9/3)", &g_fly);
+    ImGui::Checkbox("Fly (hold position; move with W/A/S/D, Shift = up, Ctrl = down)", &g_fly);
     ImGui::EndDisabled();
     if (!axes_ok) ImGui::TextDisabled("assign X, Y and Z first (the buttons in each row)");
     ImGui::SetNextItemWidth(120); ImGui::InputFloat("speed (units/frame)", &g_fly_speed);
@@ -838,6 +841,59 @@ static void draw_trainer_tab() {
         for (int k = 0; k < 3; ++k) pw::poke(g_slots[g_axis[k]].addr, g_spot[k]);
     ImGui::EndDisabled();
     ImGui::EndDisabled();
+
+    // ---- access-finder: what code writes a slot (the bridge to real hooks / a stable pointer) ----
+    ImGui::SeparatorText("Find what writes an address (RE)");
+    static char afaddr[32] = "";
+    ImGui::SetNextItemWidth(160);
+    ImGui::InputText("addr (hex)##af", afaddr, sizeof(afaddr));
+    ImGui::SameLine();
+    if (!pw::g_access.armed()) {
+        if (ImGui::Button("Watch")) {
+            uint64_t a = (uint64_t)strtoull(afaddr, nullptr, 16);
+            if (!a && !g_slots.empty() && g_axis[0] >= 0) a = g_slots[g_axis[0]].addr;   // default: the X slot
+            if (a) pw::g_access.arm(a, 4);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(blank = the X slot) then move/act in-game");
+    } else {
+        if (ImGui::Button("Stop")) pw::g_access.disarm();
+        ImGui::SameLine(); ImGui::Text("watching 0x%llx", (unsigned long long)pw::g_access.target());
+    }
+    ImGui::TextDisabled("%s", pw::g_access.status());
+
+    auto hits = pw::g_access.hits();
+    if (!hits.empty()) {
+        ImGui::Text("%zu instruction(s) touch it:", hits.size());
+        if (ImGui::BeginTable("afhits", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, 150))) {
+            ImGui::TableSetupColumn("Code"); ImGui::TableSetupColumn("RW"); ImGui::TableSetupColumn("Operand");
+            ImGui::TableSetupColumn("Struct base + off"); ImGui::TableSetupColumn("");
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < hits.size(); ++i) {
+                const pw::AccessHit &h = hits[i];
+                ImGui::PushID((int)i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%s+0x%llx", h.module.c_str(), (unsigned long long)h.module_off);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(h.write ? "W" : "r");
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%s x%llu", h.text.c_str(), (unsigned long long)h.count);
+                ImGui::TableSetColumnIndex(3);
+                if (h.base_reg >= 0) ImGui::Text("0x%llx + 0x%lx", (unsigned long long)h.base_val, h.disp);
+                else ImGui::TextDisabled("rip-rel");
+                ImGui::TableSetColumnIndex(4);
+                if (h.write) {
+                    if (h.nopped) ImGui::TextDisabled("NOP'd");
+                    else if (ImGui::SmallButton("NOP")) pw::g_access.nop(h.rip);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::SmallButton("clear hits")) pw::g_access.clear();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("restore NOPs")) pw::g_access.restore_all();
+        ImGui::SameLine();
+        ImGui::TextDisabled("NOP a writer to freeze/override that field");
+    }
 }
 
 static void draw_ui() {

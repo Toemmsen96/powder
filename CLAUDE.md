@@ -197,12 +197,20 @@ don't run commands against the user's real prefix or data: test on scratch copie
    action in mods/admin/mod.lua), FPS, HTTP log, and a generic in-process memory scanner. Build with
    `native/build.sh overlay`; `native/bin/nettest.exe` checks the networking without the game. Verified
    headless: DLL loads, Present hooked, ImGui init, auto-login + players fetched. Trainer tab (2026-10-25):
-   a generic chassis for trainer features - the memory scanner (incl. unknown-value first scan over writable
-   memory) feeds found addresses into slots with freeze, set, X/Y/Z assignment, Fly (hold position, move with
-   the numpad) and Teleport (save/go-to spot). It needs no Steep RE itself; finding the player position is an
-   interactive in-game hunt (scan float, move -> changed, stand -> unchanged) the user does. Deferred:
-   per-feature Steep RE for real noclip (collision off) and camera-relative fly; live POWDER_* delivery to
-   non-admin players'
+   a generic chassis for trainer features - address slots with freeze, set, X/Y/Z assignment, Fly (hold
+   position, move with W/A/S/D + Shift/Ctrl) and Teleport (save/go-to spot).
+   WORKING 2026-10-25: character fly/teleport confirmed in-game. The player world position was found by
+   external memory analysis (tools/trainer/: findpos -> correlate (movement-delta) -> findauth2 (bisect with
+   held-out observers, gentle single writes); /proc/<pid>/mem read+write works under Proton, no ptrace). Writing
+   the authoritative X/Y/Z moves the real character. Addresses are per-launch.
+   Access-finder (2026-10-25, native/overlay/access.{h,cpp}): the overlay's Trainer tab can PAGE_GUARD a watched
+   address + VEH to capture the instruction(s) that read/write it, decode the operand with HDE64 (MinHook's
+   hde64) to recover the struct base register + value + field offset, show them (module+offset), and NOP a
+   writer to freeze/override that field. VMProtect guards its own code pages, not this data page, so the guard
+   works in-process. This is the bridge to a stable pointer path (so the position needn't be re-hunted each
+   launch) and to the hook manager / client-mod hook API (next). Deferred: derive the stable pointer path from
+   the captured base; MinHook-based function hooking with arg logging + a hook API for client mods; real noclip
+   (collision off) and camera-relative fly (needs the view matrix); live POWDER_* delivery to non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
    `native/build.ps1` overlay target for Windows builds.
