@@ -461,7 +461,10 @@ has a server part, a client part, or both:
   `api.on(event, fn)` for `login`, `nex_connected`, `purchase`, ...; `api.before_http(method, path_glob, fn)`
   and `api.before_rmc(method, fn)` answer requests themselves (return nil to let the server answer);
   `api.save` / `api.load` keep data in the server's database; `api.log`, `api.config`. Errors in a mod
-  are logged and never reach the game.
+  are logged and never reach the game. Server mods run with the host's trust; as a safety net against bugs
+  they get a reduced Lua library (`string`, `table`, `math`, `utf8`, `coroutine`, `os.time`/`clock`/`date`;
+  no `io`, `os.execute`, `require`, `dofile`, `debug`), share at most 128 MB, and a hook that runs longer
+  than 100 ms is aborted (logged).
 - **Client part**: files in `mods/<name>/client/` and a `mod.toml` (`version`, `description`,
   `[client] inject = ["x.dll"]`). The server lists them at `/_powder/mods`; the launcher downloads them
   and loads the DLLs into the game. **A player's launcher only loads client mods that player approved**,
