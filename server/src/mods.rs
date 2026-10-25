@@ -278,7 +278,8 @@ impl ModHost {
         api.set("config", self.lua.to_value(&self.config)?)?;
         api.set("log", self.build_log(name)?)?;
         api.set("json", crate::mods_admin::json_table(&self.lua)?)?;
-        api.set("admin", crate::mods_admin::admin_table(&self.lua, self.services.clone(), self.admins_configured)?)?;
+        api.set("admin", crate::mods_admin::admin_table(&self.lua, self.services.clone(), self.admins_configured,
+                                                        self.deadline.clone())?)?;
 
         let reg = self.reg.clone();
         let who = name.to_string();
@@ -457,17 +458,29 @@ const ABORTED: &str = "aborted: the mod ran past its time limit";
 /// When the running call into Lua must have returned (None: none running), and whether the main thread's hook
 /// was switched to every instruction (an overrun) and must be put back.
 #[derive(Default)]
-struct Deadline {
+pub(crate) struct Deadline {
     until: Option<Instant>,
     tight: bool,
 }
 
-type SharedDeadline = Arc<Mutex<Deadline>>;
+pub(crate) type SharedDeadline = Arc<Mutex<Deadline>>;
 
 impl Deadline {
     fn over(&self) -> bool {
         self.until.is_some_and(|until| Instant::now() > until)
     }
+}
+
+/// Run server work a mod asked for (e.g. hashing a password in `api.admin.sign_in`) without counting it
+/// against the mod's time limit: the limit is for the mod's own Lua code.
+pub(crate) fn uncounted<R>(deadline: &SharedDeadline, work: impl FnOnce() -> R) -> R {
+    let started = Instant::now();
+    let out = work();
+    let spent = started.elapsed();
+    if let Some(until) = deadline.lock().until.as_mut() {
+        *until += spent;
+    }
+    out
 }
 
 /// The main thread's time check every `every` instructions; once over time, on every instruction (so a mod's
@@ -621,6 +634,16 @@ mod tests {
         config.mods.dir = mods_dir;
         let host = ModHost::load(&config, repos);
         (dir, host)
+    }
+
+    #[test]
+    fn server_work_does_not_count_against_a_mods_time() {
+        let deadline = SharedDeadline::default();
+        deadline.lock().until = Some(Instant::now() + Duration::from_millis(50));
+        uncounted(&deadline, || std::thread::sleep(Duration::from_millis(80)));
+        assert!(!deadline.lock().over(), "the 80 ms of server work extended the deadline");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(deadline.lock().over());
     }
 
     #[test]

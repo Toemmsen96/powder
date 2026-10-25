@@ -23,6 +23,7 @@
 
 use crate::constants::{CONNECT_SPACE_ID, CREDITS_ITEM};
 use crate::services::stats::{stat_value, Stat, LEVEL_KEY, PROFILE_GROUP, STAT_DOUBLE};
+use crate::mods::SharedDeadline;
 use crate::services::Services;
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde_json::{json, Value as Json};
@@ -70,7 +71,7 @@ fn ok(lua: &Lua, v: &Json) -> mlua::Result<Refusal> {
     Ok((lua.to_value(v)?, None))
 }
 
-pub fn json_table(lua: &Lua) -> mlua::Result<Table> {
+pub(crate) fn json_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("decode", lua.create_function(|lua, text: mlua::String| {
         match serde_json::from_slice::<Json>(&text.as_bytes()) {
@@ -82,7 +83,7 @@ pub fn json_table(lua: &Lua) -> mlua::Result<Table> {
     Ok(t)
 }
 
-pub fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool) -> mlua::Result<Table> {
+pub(crate) fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool, deadline: SharedDeadline) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("configured", configured)?;
     t.set("token", lua.create_function(|_, ()| Ok(crate::util::token_urlsafe(32)))?)?;
@@ -95,7 +96,8 @@ pub fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool) -> mlua::Res
         if !s.login_failures.attempt(&address, &email) {
             return refused("too many failed sign-ins, try again in a few minutes".into());
         }
-        let account = match s.accounts.authenticate(&email, &password) {
+        // seconds of scrypt (more while other sign-ins hash) are the server's time, not the mod's
+        let account = match crate::mods::uncounted(&deadline, || s.accounts.authenticate(&email, &password)) {
             Ok(a) => a,
             Err(_) => {
                 log::warn!(target: "powder.mods", "admin sign-in from {address} refused: invalid credentials");
