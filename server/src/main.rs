@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use powder_server::assets::Assets;
 use powder_server::config::Config;
-use powder_server::core::sessions::SessionRegistry;
 use powder_server::db::Db;
 use powder_server::https::{self, HttpState};
 use powder_server::logging;
@@ -85,6 +84,69 @@ enum AdminCommand {
     },
     /// List players.
     Players,
+    /// Show a player's inventory.
+    Inventory {
+        player: Option<String>,
+        /// An item id or a prefix of it.
+        #[arg(long)]
+        item: Option<String>,
+    },
+    /// Add (or with a negative number remove) items or credits.
+    #[command(override_usage = "powder-server admin grant [OPTIONS] [PLAYER] ITEM QUANTITY")]
+    Grant {
+        /// [PLAYER] ITEM QUANTITY; ITEM is an item id or 'credits'.
+        #[arg(required = true, num_args = 2..=3, allow_negative_numbers = true, value_name = "ARG")]
+        args: Vec<String>,
+    },
+    /// Show or change statistics (level etc.).
+    Stats {
+        player: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, value_name = "KEY=VALUE")]
+        set: Option<String>,
+    },
+    /// Recent inventory changes.
+    Ledger {
+        player: Option<String>,
+        #[arg(short = 'n', default_value_t = 20, allow_negative_numbers = true)]
+        n: i64,
+    },
+    /// Recent stat uploads from the game (XP, medals, unlocks).
+    Events {
+        player: Option<String>,
+        #[arg(short = 'n', default_value_t = 20, allow_negative_numbers = true)]
+        n: i64,
+    },
+    /// Personal best per challenge.
+    Scores { player: Option<String> },
+    /// Profile entities (rider card, favorites).
+    Entities { player: Option<String> },
+    /// Ubisoft Connect cloud saves (the game's own save files).
+    CloudSaves {
+        player: Option<String>,
+        /// Remove the player's cloud saves (Connect then keeps each PC's local files).
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Earned achievements (as Ubisoft Connect reported them).
+    Achievements {
+        player: Option<String>,
+        /// Also list the ones not earned yet.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Import your own recorded progress into the database (once).
+    Import {
+        recordings: PathBuf,
+        /// Overwrite that player if it exists.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Wipe a player: they start again as a new player.
+    Reset { player: Option<String> },
+    /// Search the store catalogue by name.
+    Offers { text: String },
     /// List accounts (email -> player).
     Accounts,
     /// Create an account (asks for its password); for servers with closed registration.
@@ -134,14 +196,57 @@ fn main() -> Result<()> {
     }
 }
 
-/// The player and account commands (the host's way out when someone forgets a password).
+/// The player and account commands (the host's way out when someone forgets a password). PLAYER defaults to the
+/// configured default player.
 fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
-    use powder_server::constants::CREDITS_ITEM;
-    let config = Arc::new(config);
-    let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
-    db.migrate()?;
-    let repos = Arc::new(Repos::new(db));
-    let accounts = AccountService::new(config.clone(), repos.clone(), Arc::new(SessionRegistry::new()));
+    use powder_server::admin as a;
+    let s = a::open(config)?;
+    let (repos, accounts) = (&s.repos, &s.accounts);
+    let out = &mut std::io::stdout();
+    let pid = |player: Option<&str>| a::player_id(&s, player);
+    let ok = match cmd {
+        AdminCommand::Players => {
+            pid(None)?;
+            a::players(&s, out).map(|_| true)
+        }
+        AdminCommand::Inventory { player, item } => a::inventory(&s, &pid(player.as_deref())?, item.as_deref(), out)
+            .map(|_| true),
+        AdminCommand::Grant { args } => {
+            let (player, item, quantity) = a::grant_args(&args)?;
+            a::grant(&s, &pid(player.as_deref())?, &item, quantity, out)
+        }
+        AdminCommand::Stats { player, key, set } => {
+            a::stats(&s, &pid(player.as_deref())?, key.as_deref(), set.as_deref(), out).map(|_| true)
+        }
+        AdminCommand::Ledger { player, n } => a::ledger(&s, &pid(player.as_deref())?, n, out).map(|_| true),
+        AdminCommand::Events { player, n } => a::events(&s, &pid(player.as_deref())?, n, out).map(|_| true),
+        AdminCommand::Scores { player } => a::scores(&s, &pid(player.as_deref())?, out).map(|_| true),
+        AdminCommand::Entities { player } => a::entities(&s, &pid(player.as_deref())?, out).map(|_| true),
+        AdminCommand::CloudSaves { player, delete } => {
+            a::cloud_saves(&s, &pid(player.as_deref())?, player.as_deref(), delete, out).map(|_| true)
+        }
+        AdminCommand::Achievements { player, all } => {
+            a::achievements(&s, &pid(player.as_deref())?, all, out).map(|_| true)
+        }
+        AdminCommand::Import { recordings, replace } => {
+            pid(None)?;
+            a::import(&s, &recordings, replace, out)
+        }
+        AdminCommand::Reset { player } => a::reset(&s, &pid(player.as_deref())?, out).map(|_| true),
+        AdminCommand::Offers { text } => {
+            pid(None)?;
+            a::offers(&s, &text, out).map(|_| true)
+        }
+        cmd => return accounts_admin(cmd, repos, accounts),
+    }?;
+    if !ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The account commands.
+fn accounts_admin(cmd: AdminCommand, repos: &Repos, accounts: &AccountService) -> Result<()> {
     let account = |email: &str| -> Result<_> {
         repos.account_by_email(email)?.ok_or_else(|| anyhow::anyhow!("no account with the email {email}"))
     };
@@ -153,14 +258,6 @@ fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
         Ok(password)
     };
     match cmd {
-        AdminCommand::Trust { .. } => unreachable!("handled by trust()"),
-        AdminCommand::Players => {
-            for p in repos.players()? {
-                println!("{}  {:24} credits {}  since {}", p.profile_id, p.name,
-                         repos.quantity(&p.profile_id, CREDITS_ITEM)?, p.created_at);
-            }
-            return Ok(());
-        }
         AdminCommand::Accounts => {
             for acc in repos.accounts()? {
                 let name = repos.player(&acc.profile_id)?.map(|p| p.name).unwrap_or_else(|| "?".into());
@@ -186,6 +283,7 @@ fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
         AdminCommand::AccountRename { email, name } => accounts.rename(&account(&email)?, &name)?,
         AdminCommand::AccountLink { email, player } => accounts.link(&account(&email)?, &player)?,
         AdminCommand::AccountDelete { email } => accounts.delete(&account(&email)?)?,
+        _ => unreachable!("handled by admin() and trust()"),
     }
     println!("done");
     Ok(())

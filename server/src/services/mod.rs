@@ -11,6 +11,7 @@ pub mod cloudsaves;
 pub mod economy;
 pub mod entities;
 pub mod friends;
+pub mod importer;
 pub mod leaderboards;
 pub mod matchmaking;
 pub mod seed;
@@ -101,5 +102,48 @@ impl Services {
         let db = Arc::new(crate::db::Db::memory().unwrap());
         db.migrate().unwrap();
         Services::new(Arc::new(config), Arc::new(Assets::default()), Arc::new(Repos::new(db)), None)
+    }
+}
+
+// ---- admin: reset, the database file ------------------------------------------------------------------------------
+impl Services {
+    pub const DB_NAME: &'static str = "powder.db";
+    /// The database's name before the rename to Powder.
+    pub const LEGACY_DB_NAME: &'static str = "steep.db";
+
+    /// data/powder.db; if only a database from before the rename exists, move it (and its WAL files) there.
+    pub fn move_legacy_db(data_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        use anyhow::Context;
+        let (db, old) = (data_dir.join(Self::DB_NAME), data_dir.join(Self::LEGACY_DB_NAME));
+        if !db.exists() && old.exists() {
+            for suffix in ["", "-wal", "-shm"] {
+                let src = data_dir.join(format!("{}{suffix}", Self::LEGACY_DB_NAME));
+                let dst = data_dir.join(format!("{}{suffix}", Self::DB_NAME));
+                if src.exists() {
+                    std::fs::rename(&src, &dst)
+                        .with_context(|| format!("moving {} to {}", src.display(), dst.display()))?;
+                }
+            }
+            log::info!(target: "powder", "moved the database {} to {}", old.display(), db.display());
+        }
+        Ok(db)
+    }
+
+    /// Wipe a player; they start again as a new player on their next login. An account that owns the player keeps
+    /// it (same profile id and name; deleting the row would delete the account too).
+    pub fn reset(&self, profile_id: &str) -> anyhow::Result<()> {
+        let repos = &self.repos;
+        repos.db.tx(|| {
+            let account = repos.account_by_profile(profile_id)?;
+            let player = repos.player(profile_id)?;
+            repos.delete_player(profile_id)?;
+            repos.clear_entities(profile_id)?;
+            repos.clear_achievements(profile_id)?;
+            if let (Some(account), Some(player)) = (account, player) {
+                seed::create_player(&self.config, repos, profile_id, Some(&player.name), None)?;
+                repos.create_account(&account.account_id, &account.email, &account.password_hash, profile_id)?;
+            }
+            Ok(())
+        })
     }
 }

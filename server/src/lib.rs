@@ -3,6 +3,7 @@
 //! The binary (main.rs) wires these together; keeping them in a library lets the tests and the modding
 //! host reach them without going through the binary.
 
+pub mod admin;
 pub mod assets;
 pub mod builtin;
 pub mod client_mods;
