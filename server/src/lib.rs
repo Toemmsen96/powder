@@ -4,6 +4,7 @@
 //! host reach them without going through the binary.
 
 pub mod assets;
+pub mod builtin;
 pub mod config;
 pub mod constants;
 pub mod core;

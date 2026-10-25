@@ -6,12 +6,14 @@
 //!   access log      one line per request; uploaded remotelog/events bodies are kept (they explain client errors)
 //!   CORS            Ubisoft Connect's web UI calls UbiServices from its embedded browser: preflights, Allow-Origin
 //!   mods            `api.before_http` hooks may answer a request themselves
-//!   fallback        the game-data pack's recorded reply, or `{}` + an UNMATCHED warning
+//!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
+//!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
 //! The UbiServices routes themselves (sessions, profiles, UGC, /_powder/, the websocket) are not ported yet;
 //! until they are, everything they would answer falls through to the pack.
 
 use crate::assets::Assets;
+use crate::builtin::http as builtin_http;
 use crate::config::Config;
 use crate::constants::{APP_ID, DEMUX_HOST};
 use crate::mods::ModHost;
@@ -169,7 +171,7 @@ fn from_mods(state: &HttpState, req: &Req) -> Option<Reply> {
 }
 
 /// Game-wide data from the game-data pack for anything without a route. Requests from Ubisoft Connect (an app
-/// id other than the game's) try Connect's part of the pack first.
+/// id other than the game's) try Connect's part of the pack first. Without a pack reply: the built-in replies.
 fn fallback(state: &HttpState, req: &Req) -> Reply {
     let assets = &state.assets;
     let app_id = req.header("Ubi-AppId").unwrap_or("").to_lowercase();
@@ -179,13 +181,22 @@ fn fallback(state: &HttpState, req: &Req) -> Reply {
         [&assets.http, &assets.connect_http]
     };
     let hit = order.iter().find_map(|f| f.lookup(&req.method, &req.host, &req.path_qs));
-    match hit {
-        Some((fixture, tier)) => {
-            let body = storm_config(state, req.path(), &fixture.body);
-            Reply::new(fixture.status, &fixture.content_type, body, &format!("gamedata:{tier}"))
-        }
-        None => Reply::new(200, JSON, b"{}".to_vec(), "UNMATCHED"),
+    if let Some((fixture, tier)) = hit {
+        let body = storm_config(state, req.path(), &fixture.body);
+        return Reply::new(fixture.status, &fixture.content_type, body, &format!("gamedata:{tier}"));
     }
+    let cached_ui = builtin_http::keep_cached(req.path()); // Connect's UI settings: never overwrite its cache
+    let has = |name| req.header(name).is_some_and(|v| !v.is_empty());
+    if cached_ui && (has("If-None-Match") || has("If-Modified-Since")) {
+        return Reply { status: 304, headers: vec![], body: vec![], how: "not-modified".into() };
+    }
+    let query = builtin_http::Query::parse(req.path_qs.split_once('?').map(|(_, q)| q).unwrap_or(""));
+    if let Some(built) = builtin_http::lookup(&req.method, req.path(), &query) {
+        // no pack (or not in it): the server's own reply
+        let body = storm_config(state, req.path(), &builtin_http::body(&built));
+        return Reply::new(200, JSON, body, "builtin");
+    }
+    Reply::new(if cached_ui { 503 } else { 200 }, JSON, b"{}".to_vec(), "UNMATCHED")
 }
 
 /// The game's SDK configuration names its peer-to-peer helpers (Storm): this server, whether the reply comes
@@ -358,6 +369,57 @@ mod tests {
         let r = handle(&state(vec![], None), &req("GET", "/v1/nothing", &[]));
         assert_eq!((r.status, r.body.as_slice(), r.how.as_str()), (200, &b"{}"[..], "UNMATCHED"));
         assert_eq!(header(&r, "content-type"), Some(JSON));
+    }
+
+    #[test]
+    fn builtin_replies_without_a_pack() {
+        let st = state(vec![], None);
+        let path = format!("/v1/applications/{APP_ID}/configuration");
+        let r = handle(&st, &req("GET", &path, &[]));
+        assert_eq!((r.status, r.how.as_str()), (200, "builtin"));
+        assert_eq!(header(&r, "content-type"), Some(JSON));
+        // storm_config applies: the default config has Powder's Storm
+        let cfg = &st.config;
+        let plain = builtin_http::body(&crate::builtin::sdk::configuration(APP_ID).unwrap());
+        let settings = storm_settings(&cfg.server.public_host, cfg.server.storm_port);
+        assert_eq!(r.body, with_storm(&plain, Some(&settings)));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["configuration"]["punch"], settings);
+
+        let path = format!("/v1/spaces/global/ubiconnect/games/api?spaceIds=x%2C{}", crate::constants::SPACE_ID);
+        let games = handle(&st, &req("GET", &path, &[]));
+        assert_eq!(games.how, "builtin");
+        let v: Value = serde_json::from_slice(&games.body).unwrap();
+        assert_eq!(v["games"][0]["displayName"], "Steep");
+    }
+
+    #[test]
+    fn the_pack_answers_before_the_builtin_replies() {
+        let path = "/v4/spaces/a20f75db-9175-4df6-b1b3-ba42e291166c/configs/events";
+        let fx = HttpFixture { method: "GET".into(), host: "public-ubiservices.ubi.com".into(), path: path.into(),
+                               status: 200, content_type: JSON.into(), body: br#"{"types": ["x"]}"#.to_vec() };
+        let r = handle(&state(vec![fx], None), &req("GET", path, &[]));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("gamedata:exact", &br#"{"types": ["x"]}"#[..]));
+        let r = handle(&state(vec![], None), &req("GET", path, &[]));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("builtin", &br#"{"types": []}"#[..]));
+    }
+
+    #[test]
+    fn connect_ui_settings_keep_their_cache() {
+        let st = state(vec![], None);
+        let path = "/v1/spaces/e17be87d-2996-4f3b-97c4-19bb2dae2933/global/ubiconnect/configcache/api/other";
+        let r = handle(&st, &req("GET", path, &[("if-none-match", "\"abc\"")]));
+        assert_eq!((r.status, r.how.as_str(), r.body.len()), (304, "not-modified", 0));
+        let r = handle(&st, &req("GET", path, &[("if-modified-since", "Tue, 01 Dec 2016 00:00:00 GMT")]));
+        assert_eq!(r.status, 304);
+        // no cached copy, nothing built in: an error, never an empty 200 the browser would cache
+        let r = handle(&st, &req("GET", path, &[]));
+        assert_eq!((r.status, r.how.as_str(), r.body.as_slice()), (503, "UNMATCHED", &b"{}"[..]));
+        assert_eq!(header(&r, "content-type"), Some(JSON));
+        // a built-in one when there is no cached copy to keep
+        let postauth = "/v4/spaces/global/ubiconnect/configcache/api/postauth?applications=a";
+        assert_eq!(handle(&st, &req("GET", postauth, &[])).how, "builtin");
+        assert_eq!(handle(&st, &req("GET", postauth, &[("If-None-Match", "x")])).status, 304);
     }
 
     #[test]
