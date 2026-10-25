@@ -24,12 +24,14 @@
 
 static wchar_t g_dir[MAX_PATH];        // this DLL's directory (with trailing backslash), for armer.exe
 
-// Launch armer.exe (beside this DLL) to re-arm the guard from outside this process.
+// Launch armer.exe (beside this DLL) to patch ssl_verify_cert_chain to jump to our check, from outside this
+// process (VMProtect blocks the game's own writes to its code).
 static void launch_armer(void) {
     wchar_t exe[MAX_PATH], cmd[MAX_PATH * 2];
     _snwprintf(exe, MAX_PATH, L"%sarmer.exe", g_dir);
-    _snwprintf(cmd, MAX_PATH * 2, L"\"%s\" --pid %lu --page 0x%llx --log \"%s\"",
-               exe, GetCurrentProcessId(), (unsigned long long)g_page, g_log);
+    _snwprintf(cmd, MAX_PATH * 2, L"\"%s\" --pid %lu --target 0x%llx --patchfn 0x%llx --delayms 10000 --log \"%s\"",
+               exe, GetCurrentProcessId(), (unsigned long long)g_target,
+               (unsigned long long)(uintptr_t)(void *)tls_replacement, g_log);
     STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     PROCESS_INFORMATION pi;
     if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, g_dir, &si, &pi)) {
@@ -49,19 +51,17 @@ static DWORD WINAPI worker(LPVOID p) {
         }
         Sleep(50);
     }
-    // the handler is installed (DllMain): tell armer it may arm, and launch it
+    // the code is unpacked: tell armer it may act, and launch it to patch the function
     tls_log("attach: target=%p pid=%lu pin=%s", (void *)g_target, GetCurrentProcessId(), g_have_pin ? "yes" : "MISSING");
     launch_armer();
-    DWORD last = GetTickCount();
+    // after armer patches, each certificate check calls tls_replacement (which logs "verify -> ..."); report
+    // how many have run so the log shows whether the patch took and what it decided
+    LONG seen = -1;
     for (;;) {
-        Sleep(500);
-        DWORD now = GetTickCount();
-        if (now - last >= 2000) {
-            MEMORY_BASIC_INFORMATION mbi;
-            int guarded = VirtualQuery((void *)g_page, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD);
-            tls_log("status: guard faults=%ld, hook hits=%ld, guard currently %s", g_faults, g_hits,
-                    guarded ? "set" : "cleared");
-            last = now;
+        Sleep(2000);
+        if (g_hits != seen) {
+            tls_log("status: certificate checks handled=%ld", g_hits);
+            seen = g_hits;
         }
     }
     return 0;
@@ -81,8 +81,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     wchar_t *slash = wcsrchr(g_dir, L'\\');
     if (slash) slash[1] = 0; else g_dir[0] = 0;          // "<dir>\"
     tls_load_pin_at(pin);
-    tls_init_target();
-    AddVectoredExceptionHandler(1, tls_veh);
+    tls_init_target();     // the patch redirects ssl_verify_cert_chain to tls_replacement; no guard/VEH here
     tls_log("version.dll proxy loaded pid=%lu; waiting for the game code to unpack", GetCurrentProcessId());
     CreateThread(NULL, 0, worker, NULL, 0, NULL);
     return TRUE;

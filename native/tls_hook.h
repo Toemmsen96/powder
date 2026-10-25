@@ -110,6 +110,18 @@ static int tls_verify(const void *sk) {
     return memcmp(h, g_pin, 32) == 0;
 }
 
+// The replacement for ssl_verify_cert_chain when its entry is patched to jump here (Linux/Proton, where the
+// guarded-page trap cannot be kept armed tightly enough). Same ABI: s in rcx, sk in rdx, result in eax.
+static int tls_replacement(void *s, void *sk) __attribute__((noinline, used));
+static int tls_replacement(void *s, void *sk) {
+    (void)s;
+    int ok = tls_verify(sk);
+    LONG n = InterlockedIncrement(&g_hits);
+    if (n <= 5 || (n % 50) == 0) tls_log("verify #%ld -> %s", n, ok ? "server cert pinned, accept" : "rejected");
+    return ok;
+}
+
+static LONG CALLBACK tls_veh(PEXCEPTION_POINTERS ep) __attribute__((unused));
 static LONG CALLBACK tls_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != TLS_GUARD_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     InterlockedIncrement(&g_faults);

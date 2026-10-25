@@ -1,18 +1,17 @@
-// armer.exe - keeps the TLS helper's guarded page armed from OUTSIDE the game process.
+// armer.exe - arms or patches the TLS helper's hook from OUTSIDE the game process.
 //
-//   armer.exe --pid <game pid> --log <powder_tls.log / hook_guard.log> [--page <hex page address>]
+//   armer.exe --pid <game pid> --log <log> [--page <hex>]                       (guard mode, Windows)
+//   armer.exe --pid <game pid> --log <log> --target <hex> --patchfn <hex> [--delayms N]  (patch mode, Linux)
 //
-// PAGE_GUARD is one-shot (a fault clears it), and VMProtect blocks the game's OWN VirtualProtect on its code,
-// so re-arming must come from another process: this one re-arms with VirtualProtectEx, which VMProtect cannot
-// block. The hook itself (the guard handler + the pinned-certificate check) lives in the injected DLL
-// (hook_guard.dll on Windows, version.dll on Linux/Proton); this only keeps the guard set so each certificate
-// check is trapped. It never patches the function.
+// VMProtect blocks the game's OWN VirtualProtect/WriteProcessMemory on its code, so arming or patching must
+// come from another process; this one does it with VirtualProtectEx / WriteProcessMemory, which VMProtect
+// cannot block. The hook logic (the pinned-certificate check) lives in the injected DLL.
 //
-// On Windows the launcher injects hook_guard.dll then runs this. On Linux the version.dll proxy launches this
-// as a child (so it shares the game's wineserver) and passes --page (the page it already computed). Without
-// --page the page is found from the game's module base. Either way it waits for "attach" in the log (the DLL
-// installed its handler) before arming, re-arms tight until the first "hook hit", then eases off. Exit: 2 game
-// gone, 1 error.
+// Guard mode (Windows): keeps a one-shot PAGE_GUARD re-armed so the DLL's exception handler traps each call.
+// Patch mode (Linux/Proton): the guard cannot be kept armed tightly enough through the wineserver, so instead
+// write a 14-byte `jmp [rip+0]; <patchfn>` over ssl_verify_cert_chain's first bytes once, redirecting it to the
+// DLL's replacement. The patch is done after --delayms (past VMProtect's startup integrity check); the function
+// is not re-verified after boot (the Windows helper patches it too).
 //
 //   zig cc -target x86_64-windows-gnu -O2 -o bin/armer.exe armer.c
 //   (or x86_64-w64-mingw32-gcc -O2 -o bin/armer.exe armer.c)
@@ -49,21 +48,59 @@ static uintptr_t module_base(DWORD pid) {
     return base;
 }
 
+// Patch `target` in the process to jump to `patchfn` (14 bytes: jmp qword ptr [rip+0]; <patchfn>). -> ok.
+static int patch(HANDLE proc, uintptr_t target, uintptr_t patchfn, const char *log_path) {
+    unsigned char jmp[14] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    memcpy(jmp + 6, &patchfn, 8);
+    void *addr = (void *)target;
+    DWORD old;
+    if (!VirtualProtectEx(proc, addr, sizeof(jmp), PAGE_EXECUTE_READWRITE, &old)) {
+        printf("armer: VirtualProtectEx(RWX) failed %lu\n", GetLastError()); return 0;
+    }
+    SIZE_T wr = 0;
+    BOOL ok = WriteProcessMemory(proc, addr, jmp, sizeof(jmp), &wr);
+    DWORD old2;
+    VirtualProtectEx(proc, addr, sizeof(jmp), old, &old2);
+    FlushInstructionCache(proc, addr, sizeof(jmp));
+    unsigned char back[14] = {0}; SIZE_T rd = 0;
+    ReadProcessMemory(proc, addr, back, sizeof(back), &rd);
+    int good = ok && wr == sizeof(jmp) && memcmp(back, jmp, sizeof(jmp)) == 0;
+    (void)log_path;
+    printf("armer: patch %s (%zu bytes)\n", good ? "ok" : "FAILED", wr);
+    return good;
+}
+
 int main(int argc, char **argv) {
-    DWORD pid = 0;
+    DWORD pid = 0, delayms = 8000;
     const char *log = NULL;
-    uintptr_t page = 0;
+    uintptr_t page = 0, target = 0, patchfn = 0;
     for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--pid")) pid = (DWORD)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--log")) log = argv[++i];
         else if (!strcmp(argv[i], "--page")) page = (uintptr_t)strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--target")) target = (uintptr_t)strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--patchfn")) patchfn = (uintptr_t)strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--delayms")) delayms = (DWORD)strtoul(argv[++i], NULL, 0);
     }
-    if (!pid || !log) { printf("usage: armer.exe --pid <pid> --log <log> [--page <hex>]\n"); return 1; }
-    HANDLE proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!pid || !log) { printf("usage: armer.exe --pid <pid> --log <log> [--page <hex> | --target <hex> --patchfn <hex>]\n"); return 1; }
+    DWORD access = patchfn ? (PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+                           : (PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION);
+    HANDLE proc = OpenProcess(access, FALSE, pid);
     if (!proc) { printf("armer: OpenProcess(%lu) failed %lu\n", pid, GetLastError()); return 1; }
 
-    // the DLL must have installed its handler before the guard is armed, or a guard fault would crash the game
+    // the DLL must have installed its hook / unpacked the code before we touch it
     while (!log_has(log, "attach")) { if (!alive(proc)) return 2; Sleep(100); }
+
+    if (patchfn) {                                // ---- patch mode ----
+        if (!target) { printf("armer: --patchfn needs --target\n"); return 1; }
+        for (DWORD w = 0; w < delayms; w += 100) { if (!alive(proc)) return 2; Sleep(100); }  // integrity window
+        if (!alive(proc)) return 2;
+        int ok = patch(proc, target, patchfn, log);
+        fflush(stdout);
+        return ok ? 0 : 1;
+    }
+
+    // ---- guard mode (Windows) ----
     if (!page) {
         uintptr_t base = 0;
         while (!(base = module_base(pid))) { if (!alive(proc)) return 2; Sleep(200); }
@@ -72,7 +109,6 @@ int main(int argc, char **argv) {
     }
     void *addr = (void *)page;
     printf("armer: pid %lu page %p, re-arming for the session\n", pid, addr); fflush(stdout);
-
     unsigned c = 0;
     int warm = 1;
     for (;;) {
