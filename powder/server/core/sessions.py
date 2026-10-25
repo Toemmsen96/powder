@@ -4,9 +4,14 @@ A PlayerSession is created at UbiServices login and carries our own ticket. The 
 `Authorization: Ubi_v1 t=<ticket>` on HTTPS calls and the same ticket as the NEX LoginWithToken
 token, so both transports find the same session. The SessionRegistry knows each player's open
 WebSockets and NEX connection, which is what lets the server push messages to a player.
+
+A WebSocket is a WsQueue: pushes wait there for the socket's own task (transport/https/websocket.py) to send
+them, so pushing never waits for a client; a client that stopped reading gets no more than WS_QUEUE waiting
+notifications, further ones are dropped (logged) instead of piling up in memory or holding up the others.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -21,6 +26,9 @@ from .identity import Player
 
 log = logging.getLogger("powder.sessions")
 SESSION_TTL_S = 3 * 3600
+# Notifications waiting for one websocket. Its task sends them as they come, so only a client that stopped
+# reading (or a flood of pushes) fills this; further ones are dropped (logged).
+WS_QUEUE = 256
 
 
 def ubi_shaped_ticket(app_id: str, session_id: str) -> str:
@@ -37,6 +45,17 @@ class WsChannel(Protocol):
     async def send_json(self, data: Any) -> None: ...
 
 
+class WsQueue:
+    """A websocket's pushes waiting for its task to send them (at most `size`)."""
+
+    def __init__(self, size: int = WS_QUEUE):
+        self.queue: asyncio.Queue = asyncio.Queue(size)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class NexChannel(Protocol):
     def send_request(self, protocol: str, method: str, params: bytes, call_id: int | None = None) -> int: ...
 
@@ -50,7 +69,7 @@ class PlayerSession:
     connect: bool = False                               # Ubisoft Connect's session (not the game's)
     created: float = field(default_factory=time.time)
     expires: float = field(default_factory=lambda: time.time() + SESSION_TTL_S)
-    websockets: set = field(default_factory=set)        # WsChannel
+    websockets: set = field(default_factory=set)        # WsQueue (or any WsChannel: sent to directly)
     nex: NexChannel | None = None
     data: dict = field(default_factory=dict)            # per-session scratch (services/plugins)
 
@@ -113,13 +132,25 @@ class SessionRegistry:
     # ---- server push (the seam for notifications and multiplayer) ----------------------------
     async def push_ws(self, profile_id: str, notification_type: str, content, **extra) -> int:
         """Send a UbiServices notification over the player's WebSocket(s); returns how many got it. `extra`:
-        more fields of the notification (e.g. its sender)."""
+        more fields of the notification (e.g. its sender). A closed socket is dropped; a socket whose queue is
+        full does not get this one (logged) and stays registered."""
         s = self.by_player.get(profile_id)
+        msg = {"notificationType": notification_type, "content": content, "datePosted": iso_now(), **extra}
         sent = 0
         for ws in list(s.websockets if s else ()):
+            if isinstance(ws, WsQueue):
+                if ws.closed:
+                    log.warning("push_ws to %s failed: websocket closed", profile_id)
+                    s.websockets.discard(ws)
+                elif ws.queue.full():
+                    log.warning("push_ws to %s: %d notifications waiting for its websocket already, %s dropped",
+                                profile_id, ws.queue.maxsize, notification_type)
+                else:
+                    ws.queue.put_nowait(msg)
+                    sent += 1
+                continue
             try:
-                await ws.send_json({"notificationType": notification_type, "content": content,
-                                    "datePosted": iso_now(), **extra})
+                await ws.send_json(msg)
                 sent += 1
             except Exception as e:  # noqa: BLE001 - a dead socket must not break the caller
                 log.warning("push_ws to %s failed: %s", profile_id, e)

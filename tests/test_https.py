@@ -1,4 +1,5 @@
 """HTTPS (UbiServices) app through aiohttp's test client, with the game's real hostnames."""
+import asyncio
 import base64
 import json
 
@@ -171,6 +172,58 @@ async def test_connects_websocket_server_path(client):
     hello = json.loads((await ws.receive()).data)
     assert hello["notificationType"] == "US_CONNECTION_ESTABLISHED" and hello["content"]["connectionId"]
     await ws.close()
+
+
+async def test_big_client_messages_close_the_websocket(client, services):
+    """A client message over MAX_INCOMING ends the socket (1009) and unregisters it; smaller ones are only logged."""
+    from aiohttp import WSMsgType
+    from powder.server.transport.https.websocket import MAX_INCOMING
+    s = await login(client)
+    ws = await client.ws_connect("/v2/websocket", headers={"Host": "public-ws-ubiservices.ubi.com",
+                                                           "Authorization": f"Ubi_v1 t={s['ticket']}"})
+    await ws.receive()
+    await ws.send_str("x" * MAX_INCOMING)
+    assert await services.sessions.push_ws(s["profileId"], "STILL_OPEN", {}) == 1
+    assert json.loads((await ws.receive()).data)["notificationType"] == "STILL_OPEN"
+    await ws.send_bytes(b"\0" * (MAX_INCOMING + 1))
+    msg = await ws.receive()
+    assert msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING) and ws.close_code == 1009
+    await ws.close()
+    for _ in range(50):
+        if not services.sessions.for_player(s["profileId"]).websockets:
+            break
+        await asyncio.sleep(0.01)
+    assert await services.sessions.push_ws(s["profileId"], "GONE", {}) == 0
+
+
+async def test_a_full_websocket_queue_drops_pushes(services):
+    """A websocket that does not keep up: pushes beyond its queue are dropped, it stays registered, and gets the
+    next ones once it reads again; a closed one is forgotten."""
+    from powder.server.core.sessions import WS_QUEUE, WsQueue
+    a = services.sessions.issue(services.accounts.player(services.default_player_id()), "10.0.0.1")
+    q = WsQueue()
+    a.websockets.add(q)
+    for _ in range(WS_QUEUE):
+        assert await services.sessions.push_ws(a.profile_id, "TEST", {}) == 1
+    assert await services.sessions.push_ws(a.profile_id, "LOST", {}) == 0
+    assert a.websockets == {q}
+    assert q.queue.get_nowait()["notificationType"] == "TEST"
+    assert await services.sessions.push_ws(a.profile_id, "AFTER", {}) == 1
+    rest = [q.queue.get_nowait() for _ in range(q.queue.qsize())]
+    assert (len(rest), rest[-1]["notificationType"]) == (WS_QUEUE, "AFTER")
+    q.close()
+    assert await services.sessions.push_ws(a.profile_id, "TEST", {}) == 0
+    assert not a.websockets, "closed: forgotten"
+
+
+async def test_a_slow_websocket_does_not_hold_up_the_others(services):
+    """push_ws never waits for a socket: one whose client does not read cannot delay another's pushes."""
+    from powder.server.core.sessions import WsQueue
+    a = services.sessions.issue(services.accounts.player(services.default_player_id()), "10.0.0.1")
+    stuck, fine = WsQueue(), WsQueue()
+    a.websockets.update((stuck, fine))
+    await asyncio.wait_for(services.sessions.push_ws(a.profile_id, "TEST", {}), 0.5)
+    assert fine.queue.qsize() == stuck.queue.qsize() == 1
 
 
 async def test_personal_endpoints_are_generated_not_replayed(client):
