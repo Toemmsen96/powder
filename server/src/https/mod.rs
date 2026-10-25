@@ -8,16 +8,18 @@
 //!   mods            `api.before_http` hooks may answer a request themselves
 //!   session         `Authorization: Ubi_v1 t=<ticket>` -> the player's session (handed to the routes)
 //!   routes          method + path pattern -> handler, in the Python server's registration order:
-//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
+//!                   routes_powder.rs (client mods), routes_profile.rs (profile, friends, notifications, GraphQL,
+//!                   chat channels...), routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
 //! Routes match on the path only (the host matters only for the pack); a route whose path matches but whose
 //! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
-//! Not ported yet: the profile, UGC, /_powder/ and websocket routes, and routes_ubi's inventory, store, entity
+//! Not ported yet: the UGC, /_powder/ and websocket routes, and routes_ubi's inventory, store, entity
 //! and cloud-save routes; until they are, what they would answer falls through to the pack.
 
 pub mod routes_powder;
+pub mod routes_profile;
 pub mod routes_ubi;
 
 use crate::builtin::http as builtin_http;
@@ -179,9 +181,10 @@ impl Route {
 }
 
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
-/// routes_ugc, the websocket; ported so far: routes_ubi's sign-in part, routes_powder's client mods).
-static ROUTES: LazyLock<Vec<Route>> =
-    LazyLock::new(|| routes_powder::routes().into_iter().chain(routes_ubi::routes()).collect());
+/// routes_ugc, the websocket; ported so far: routes_ubi's sign-in part, routes_powder's client mods, routes_profile).
+static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
+    routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes()).collect()
+});
 
 /// `Authorization: Ubi_v1 t=<ticket>` -> the session it belongs to (Python's session_middleware).
 pub fn session_of(state: &HttpState, req: &Req) -> anyhow::Result<Option<Arc<PlayerSession>>> {
