@@ -89,13 +89,56 @@ The Python codecs on `main` (e.g. `transport/nex/prudp.py`) are handy cross-chec
 
 Never run `admin trust install/remove` yourself: it changes the system trust store; leave it to the user.
 
-## The user's setup
+## Starting on a new device
 
-Linux (Arch); Steep is installed through Lutris (Wine). Under Wine, Ubisoft Connect trusts the host's CA bundle
-(that is why `trust.rs` has a Linux path), but an existing prefix only checks the copy of the roots it made
-when it was set up (registry `HKLM\Software\Microsoft\SystemCertificates\Root\Certificates`): use
-`admin trust install --wine-prefix <prefix> --wine <the prefix's wine>`. Symptom when missing: `tls ok`, then the
-client closes without a request (no access-log line). Preferred on Linux: `linux/powder-wrap` (Lutris command prefix): a private user+mount+net namespace with its own
-/etc/hosts, the server inside, the CA in the prefix only for the session (tested with umu-run/GE-Proton offline).
-Still missing on Linux: injecting the game's TLS helper (`native/`) under Wine. The game itself can only be
-tested by the user.
+```
+git clone https://github.com/Toemmsen96/powder.git && cd powder && git checkout rework/rust-server
+cargo test                         # Rust (rustup/cargo needed)
+uv sync && uv run pytest           # Python (uv brings its own Python; 3.14 from the system also works)
+cp config.example.toml config.toml
+```
+
+Not in git (gitignored, per device): `config.toml`, `launcher.toml`, `data/` (database, local CA in `data/tls/`,
+NEX signing key, logs), `gamedata/` (game-data pack), `recordings/`. A new device makes a new local CA on first
+start; copy `data/` over to keep the same players, accounts and CA. No game-data pack exists on the first
+device either (the server runs on built-in replies).
+
+## The user's setup and live test results
+
+The user plays on Linux (Arch) with Steep installed through **Lutris** (Ubisoft Connect version, Wine prefix,
+GE-Proton through `umu-run`). Lutris' Steep entry runs `UbisoftConnect.exe uplay://launch/3279` (3279 = Steep).
+Paths differ per device; on the first PC the prefix is `~/Games/ubisoft-connect`, the game is in
+`drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Steep` (exe `steep.exe`, lowercase).
+
+**Use `linux/powder-wrap`** (README "Linux"): set as Lutris' Command prefix for the Steep entry. Per session it
+makes a private user+mount+net namespace (loopback only), a private `/etc/hosts` with the Ubisoft names, starts
+the Powder server inside (Python by default, `POWDER_SERVER=rust`), and puts the local CA into the prefix's root
+store only for the session. No system changes, no root. Server output: `$XDG_RUNTIME_DIR/powder-wrap.log`.
+After changing a game's config in Lutris, restart Lutris (it may rename the config file and keep a stale copy:
+"This game has no executable set").
+
+Why the CA goes into the prefix: a Wine/Proton prefix copies the host's root certificates into its registry
+(`HKLM\Software\Microsoft\SystemCertificates\Root\Certificates`) when it is set up and crypt32 checks that copy,
+so a CA added to the system later is not seen. Symptom: `tls ok` in the log, then the client closes without a
+request (no access-log line). `admin trust install --wine-prefix <prefix> --wine <the prefix's wine>` does it
+permanently; the wrapper does it per session.
+
+**Live test, 2026-10-25 (Python server via powder-wrap):** Ubisoft Connect is fully online against Powder:
+sign-in, friends, graphql, demux (ownership, cloud saves, friends), and it starts Steep (`product 3279 started`).
+The game then stays at "loading, please wait 3/3": its own TLS check rejects the server (two handshakes from the
+game right after start never complete; it sends no request). On Windows the launcher's TLS helper (`native/`,
+injected at game start) handles this; on Linux nothing does yet. After closing, the wrapper's cleanup was
+verified: CA gone from the prefix, server stopped, `/etc/hosts`, sysctl and the system CA store untouched.
+
+Never run `admin trust install/remove` without `--wine-prefix` yourself (it changes the system trust store), and
+don't run commands against the user's real prefix or data: test on scratch copies; the game is tested by the user.
+
+## Next steps
+
+1. Connect's notification websocket: it asks for `GET /v2/websocket/server?SpaceIds=...&NotificationTypes=...`,
+   which the Python server does not route (`/v2/websocket` only) -> UNMATCHED, retried every ~30 s. Fix in the
+   Python server (main) and when porting `websocket.py` to Rust.
+2. The game on Linux: the TLS helper from `native/` is Windows-only so far; getting the game past the loading
+   screen under Wine/Proton is the open problem (the user decides how to approach it).
+3. The Rust port: see "Not ported yet" above; once the HTTPS routes, NEX stats/matchmaking and the websocket are
+   done, `POWDER_SERVER=rust powder-wrap` can replace the Python server in the user's sessions.
