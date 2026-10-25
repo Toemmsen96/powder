@@ -111,6 +111,25 @@ impl ModHost {
         &self.loaded
     }
 
+    /// What the loaded mods registered, for the CLI (`powder-server mods`) and the status page.
+    pub fn report(&self) -> ModReport {
+        let reg = self.reg.lock();
+        let mut events: Vec<(String, Vec<String>)> = reg
+            .events
+            .iter()
+            .map(|(e, hs)| (e.clone(), hs.iter().map(|(m, _)| m.clone()).collect()))
+            .collect();
+        events.sort();
+        let http = reg.http.iter().map(|h| (h.mod_name.clone(), h.method.clone(), h.glob.clone())).collect();
+        let mut rmc: Vec<(String, Vec<String>)> = reg
+            .rmc
+            .iter()
+            .map(|(m, hs)| (m.clone(), hs.iter().map(|h| h.mod_name.clone()).collect()))
+            .collect();
+        rmc.sort();
+        ModReport { loaded: self.loaded.clone(), events, http, rmc }
+    }
+
     fn load_one(&mut self, name: &str, path: &Path) -> mlua::Result<()> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| mlua::Error::external(format!("reading {}: {e}", path.display())))?;
@@ -305,6 +324,16 @@ impl ModHost {
     }
 }
 
+/// What the loaded mods registered: the loaded names, and for each event / RMC method the mods watching it,
+/// plus every HTTP hook as (mod, method, glob).
+#[derive(Clone, Debug, Default)]
+pub struct ModReport {
+    pub loaded: Vec<String>,
+    pub events: Vec<(String, Vec<String>)>,
+    pub http: Vec<(String, String, String)>,
+    pub rmc: Vec<(String, Vec<String>)>,
+}
+
 /// A snapshot of the config a mod may read. Read-only: a mod changing this table changes nothing on the
 /// server.
 fn config_snapshot(config: &Config) -> Json {
@@ -481,6 +510,23 @@ mod tests {
         ]);
         assert_eq!(host.loaded(), &["ok".to_string()]);
         assert_eq!(host.repos.kv_get("mod:ok", "ran").unwrap(), Some(json!(true)));
+    }
+
+    #[test]
+    fn report_lists_registrations() {
+        let (_d, host) = host_with(&[(
+            "r",
+            r#"return function(api)
+                api.on("login", function() end)
+                api.before_rmc("P::M_V1", function() end)
+                api.before_http("GET", "/x/*", function() end)
+            end"#,
+        )]);
+        let r = host.report();
+        assert_eq!(r.loaded, vec!["r".to_string()]);
+        assert_eq!(r.events, vec![("login".to_string(), vec!["r".to_string()])]);
+        assert_eq!(r.rmc, vec![("P::M_V1".to_string(), vec!["r".to_string()])]);
+        assert_eq!(r.http, vec![("r".to_string(), "GET".to_string(), "/x/*".to_string())]);
     }
 
     #[test]
