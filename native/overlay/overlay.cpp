@@ -117,6 +117,7 @@ struct AppState {
 static AppState g_st;
 
 static void push_log(AppState &st, const std::string &s) {
+    olog("%s", s.c_str());   // mirror to the file log so failures are visible without the Debug tab
     std::lock_guard<std::mutex> lk(st.m);
     st.status = s;
     st.httplog.push_back(s);
@@ -180,6 +181,7 @@ static std::string api_err(const pw::HttpResponse &r) {
 static void job_players(pw::HttpClient &c, AppState &st) {
     auto r = c.get("/_powder/admin/api/players");
     if (!r.ok()) { push_log(st, "players: " + api_err(r)); return; }
+    olog("players request ok (HTTP %d)", r.status);
     try {
         auto j = json::parse(r.body);
         std::vector<Player> ps;
@@ -427,10 +429,13 @@ static void draw_server_tab() {
             std::string e = email, p = pass;
             g_net->enqueue([e, p](pw::HttpClient &c, AppState &st) {
                 json b = {{"email", e}, {"password", p}};
+                olog("sign in: POST /_powder/admin/api/login as '%s'", e.c_str());
                 auto r = c.post("/_powder/admin/api/login", b.dump());
                 if (r.ok()) {
-                    try { auto j = json::parse(r.body); std::lock_guard<std::mutex> lk(st.m);
-                          st.logged_in = true; st.who = j.value("name", ""); st.status = "signed in as " + st.who; } catch (...) {}
+                    std::string name;
+                    try { auto j = json::parse(r.body); name = j.value("name", ""); std::lock_guard<std::mutex> lk(st.m);
+                          st.logged_in = true; st.who = name; st.status = "signed in as " + name; } catch (...) {}
+                    olog("sign in ok as %s", name.c_str());
                     job_players(c, st);
                 } else push_log(st, "sign in: " + api_err(r));
             });
