@@ -262,11 +262,15 @@ Every Windows prompt is announced first: the launcher says why it is needed (the
 system file and firewall rules are system settings, so both need admin rights; Windows asks to confirm a
 new certificate) and only continues when you press the button for it.
 
-The TLS helper (`native/`) makes the game accept the server's certificate: `hook_guard.dll` traps the
-game's certificate check without changing code bytes at first, `armer.exe` keeps that trap armed and then
-patches the check once the game's integrity check is over. It only fits the `Steep.exe` builds listed in
-`powder/launcher/game.py` (the Steam and the Ubisoft Connect download of the final update: the same
-compiled game, packaged differently). Game files are never modified on disk.
+The TLS helper (`native/`) makes the game accept the Powder server's certificate, and only that one:
+`hook_guard.dll` traps the game's certificate check (OpenSSL's `ssl_verify_cert_chain`) with a guarded page,
+changing no code bytes, and `armer.exe` keeps the trap armed. On each trapped check the DLL accepts the chain
+only when the server's certificate is byte-for-byte the one the launcher pinned for this server (it writes
+`hook_guard.pin`, the SHA-256 of that certificate's signed body, before starting the game); any other
+certificate, or any certificate for another host, is rejected as it would be without the helper. It fails
+closed: with no pinned certificate the game stays offline, never trusting more than it should. It only fits
+the `Steep.exe` builds listed in `powder/launcher/game.py` (the Steam and the Ubisoft Connect download of the
+final update: the same compiled game, packaged differently). Game files are never modified on disk.
 
 ### Client mods
 

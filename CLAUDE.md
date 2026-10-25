@@ -105,8 +105,14 @@ server's CA is checked (one self-signed, name-constrained CA within ubi.com/ubis
 programs only in elevated steps, hosts file kept byte for byte, narrower firewall rules.
 
 Open (decide with the user before doing):
-- native/: the TLS helper makes the game accept ANY certificate for every host; pinning it to the server's CA
-  needs the game's OpenSSL layout per build (see the launcher review notes in the 2026-10-25 commits).
+- native/: the TLS helper now pins the server's own leaf certificate (2026-10-25). hook_guard.c verifies the
+  chain's leaf against hook_guard.pin (SHA-256 of the pinned leaf's tbsCertificate, which OpenSSL 1.0.2n caches
+  at X509_CINF+0x50), the launcher writes the pin from the live server leaf fetched against the pinned CA, and
+  armer.c keeps the guard armed for the session instead of patching the check to always-accept. Fails closed
+  (no pin -> offline). NOT yet run against the real game: the leaf/offset logic was read from a memory dump of
+  steep.exe (build e8b14fe6..., ssl_verify_cert_chain at RVA 0x1D3E290) and compile-checked, not executed.
+  First live test: the server should come online; hook_guard.log shows "hook hit -> server cert pinned, accept".
+  If it says "rejected" or stays offline, the offsets or the pinned-leaf assumption are wrong.
 - The launcher installs per user, so its elevated hosts step runs a user-writable powder-cli.exe; a
   per-machine install (`PrivilegesRequired=admin`) would close that (needs a Windows test).
 - New CAs could carry EKU serverAuth (today's are trusted by Windows for any purpose within their names),

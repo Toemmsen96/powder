@@ -923,6 +923,7 @@ class Session:
             self.set("game", FAILED, f"the TLS helper's log from an earlier start ({attach.LOG}) can't be deleted "
                                      f"({why}). Is an earlier Steep still running? Close it, then press Play again.")
             return False
+        self.pin_server_cert()
         os.startfile(launch_url(inst, self.cfg.steam_app_id))
         observer = attach.ProcessObserver(log)
         timeout = 180
@@ -951,6 +952,21 @@ class Session:
         elif self.step("game").state != FAILED:
             self.set("game", FAILED, "game closed before going online - press Play to try again")
         return True
+
+    def pin_server_cert(self) -> None:
+        """Write the certificate pin the TLS helper enforces: the server's leaf certificate, fetched over a
+        connection verified against the CA pinned for this server. Without a pinned CA, or if the server is
+        unreachable, the pin is cleared and the helper rejects every certificate (the game stays offline) -
+        it never falls back to accepting any certificate."""
+        trusted = self.trusted_ca()
+        leaf = server.leaf_der(self.cfg, trusted) if trusted else None
+        if leaf is None:
+            attach.clear_pin()
+            log.warning("no pinned server certificate (%s): the TLS helper will reject every certificate",
+                        "no trusted CA" if not trusted else "server unreachable")
+            return
+        attach.write_pin(certs.leaf_tbs_pin(leaf))
+        log.info("pinned the server's TLS certificate for the helper")
 
     def attach_and_watch(self, pid: int, observer) -> str:
         """Attach the helper to `pid` and wait until it exits: ONLINE / OFFLINE (it ran, never went online),

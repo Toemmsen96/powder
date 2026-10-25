@@ -7,6 +7,7 @@ are not followed (a redirect could lead a request off the pinned server, e.g. to
 from __future__ import annotations
 
 import json
+import socket
 import ssl
 import subprocess
 import time
@@ -97,6 +98,20 @@ def ca_pem(cfg: LauncherConfig) -> bytes | None:
         with open_url(url, _context(), 3) as r:
             return read_capped(r, MAX_CA)
     except (OSError, ValueError):
+        return None
+
+
+def leaf_der(cfg: LauncherConfig, ca_file: Path, timeout: float = 3.0) -> bytes | None:
+    """The server's leaf certificate (DER), from a TLS connection verified against `ca_file` (the CA the
+    player pinned for this server). None if it cannot be reached or does not verify. Used to pin the
+    certificate for the TLS helper; the SNI is a redirected Ubisoft name the server's certificate covers."""
+    try:
+        ctx = ssl.create_default_context(cafile=str(ca_file))
+        ctx.check_hostname = False                        # the server is reached by address; its cert carries the
+        with socket.create_connection((cfg.server_address, cfg.server_https_port), timeout) as tcp:
+            with ctx.wrap_socket(tcp, server_hostname="public-ubiservices.ubi.com") as tls:  # the CA pin is the trust
+                return tls.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError, ValueError):
         return None
 
 

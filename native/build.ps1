@@ -5,7 +5,7 @@ $bin = Join-Path $PSScriptRoot 'bin'
 New-Item -ItemType Directory -Force $bin | Out-Null
 Push-Location $PSScriptRoot
 try {
-    zig cc -target x86_64-windows-gnu -shared -O2 -o bin/hook_guard.dll hook_guard.c
+    zig cc -target x86_64-windows-gnu -shared -O2 -o bin/hook_guard.dll hook_guard.c -lbcrypt
     if ($LASTEXITCODE) { throw "hook_guard.dll failed" }
     zig cc -target x86_64-windows-gnu -O2 -o bin/armer.exe armer.c
     if ($LASTEXITCODE) { throw "armer.exe failed" }
