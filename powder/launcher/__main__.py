@@ -17,6 +17,8 @@ class ConsoleSession(Session):
 
     def ask(self, key, text, actions, details=""):
         print(f"\n{self.step(key).title}: {text}")
+        if details:                                 # fingerprints, file hashes, hosts lines
+            print(details)
         for i, a in enumerate(actions, 1):
             print(f"  {i}) {a}")
         while True:
