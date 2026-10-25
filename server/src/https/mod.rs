@@ -8,15 +8,16 @@
 //!   mods            `api.before_http` hooks may answer a request themselves
 //!   session         `Authorization: Ubi_v1 t=<ticket>` -> the player's session (handed to the routes)
 //!   routes          method + path pattern -> handler, in the Python server's registration order:
-//!                   routes_powder.rs (client mods), routes_profile.rs (profile, friends, notifications, GraphQL,
-//!                   chat channels...), routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
+//!                   routes_powder.rs (/_powder/: status, accounts, CA, overlay part, client mods),
+//!                   routes_profile.rs (profile, friends, notifications, GraphQL, chat channels...),
+//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
 //! Routes match on the path only (the host matters only for the pack); a route whose path matches but whose
 //! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
-//! Not ported yet: the UGC, /_powder/ and websocket routes, and routes_ubi's inventory, store, entity
-//! and cloud-save routes; until they are, what they would answer falls through to the pack.
+//! Not ported yet: the UGC and websocket routes, and routes_ubi's inventory, store, entity and cloud-save
+//! routes; until they are, what they would answer falls through to the pack.
 
 pub mod routes_powder;
 pub mod routes_profile;
@@ -181,7 +182,7 @@ impl Route {
 }
 
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
-/// routes_ugc, the websocket; ported so far: routes_ubi's sign-in part, routes_powder's client mods, routes_profile).
+/// routes_ugc, the websocket; ported so far: routes_powder, routes_profile, routes_ubi's sign-in part).
 static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
     routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes()).collect()
 });
@@ -226,20 +227,29 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
         _ => from_mods(state, req).unwrap_or_else(|| routed(state, req, &ROUTES)),
     };
     if let Some(origin) = origin {
-        reply.headers.push(("Access-Control-Allow-Origin".into(), origin));
-        reply.headers.push(("Access-Control-Allow-Credentials".into(), "true".into()));
-        reply.headers.push(("Access-Control-Expose-Headers".into(), CORS_EXPOSE.into()));
+        // set, not added: a route's own ("*" on the overlay part) is replaced, as aiohttp's headers[...] = does
+        let cors = [("Access-Control-Allow-Origin", origin.as_str()), ("Access-Control-Allow-Credentials", "true"),
+                    ("Access-Control-Expose-Headers", CORS_EXPOSE)];
+        for (name, value) in cors {
+            reply.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            reply.headers.push((name.into(), value.into()));
+        }
     }
+    access_log(req, &reply.how, reply.status, &reply.body.len().to_string());
+    reply
+}
+
+/// One line per request.
+pub fn access_log(req: &Req, how: &str, status: u16, size: &str) {
     let qs: String = req.path_qs.chars().take(160).collect();
-    let line = format!("{} {}{qs} -> {} {} ({}B)", req.method, req.host, reply.how, reply.status, reply.body.len());
-    if reply.how == "UNMATCHED" {
+    let line = format!("{} {}{qs} -> {how} {status} ({size}B)", req.method, req.host);
+    if how == "UNMATCHED" {
         log::warn!(target: "powder.https", "{line}");
     } else if req.path().starts_with("/_powder/") {
         log::debug!(target: "powder.https", "{line}"); // the launcher polls these every few seconds
     } else {
         log::info!(target: "powder.https", "{line}");
     }
-    reply
 }
 
 fn keep_upload(state: &HttpState, req: &Req) {
@@ -629,9 +639,9 @@ mod tests {
         (addr, std::fs::read(&pki.ca_pem).unwrap())
     }
 
-    /// One request over a real TLS connection (SNI public-ubiservices.ubi.com); -> the raw response.
-    async fn tls_request(addr: SocketAddr, ca: &[u8], request: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// A TLS connection to the server, checked against the CA, with this SNI.
+    async fn tls_connect(addr: SocketAddr, ca: &[u8], sni: &str)
+                         -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
         use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
         let mut roots = RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut &ca[..]) {
@@ -642,8 +652,14 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let name = ServerName::try_from("public-ubiservices.ubi.com").unwrap();
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap();
+        let name = ServerName::try_from(sni.to_string()).unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap()
+    }
+
+    /// One request over a real TLS connection (SNI public-ubiservices.ubi.com); -> the raw response.
+    async fn tls_request(addr: SocketAddr, ca: &[u8], request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = tls_connect(addr, ca, "public-ubiservices.ubi.com").await;
         tls.write_all(request.as_bytes()).await.unwrap();
         let mut out = vec![];
         let _ = tls.read_to_end(&mut out).await; // a peer closing without close_notify is fine here
@@ -686,6 +702,25 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 401"), "{text}");
         let text = tls_request(addr, &ca, &post(format!("Basic {}", crate::util::b64(b"rider@example.com:wrong")))).await;
         assert!(text.starts_with("HTTP/1.1 401") && text.contains(r#""errorCode": 1"#), "{text}");
+    }
+
+    /// The launcher's calls over TLS: the status, and the CA it makes (`run` keeps it in <data>/tls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn powder_status_and_ca_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_path_buf();
+        let (addr, ca) = tls_server(state_with(config, vec![], None), &dir.path().join("tls")).await;
+        let get = |path: &str| {
+            format!("GET {path} HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\nConnection: close\r\n\r\n")
+        };
+        let text = tls_request(addr, &ca, &get("/_powder/status")).await;
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        let b: Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!((&b["connect"], &b["you"]), (&json!([]), &json!("127.0.0.1")));
+        let text = tls_request(addr, &ca, &get("/_powder/ca.pem")).await;
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert_eq!(text.split_once("\r\n\r\n").unwrap().1.as_bytes(), ca);
     }
 
     #[test]
