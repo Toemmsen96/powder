@@ -201,7 +201,8 @@ fn create_session(c: &Ctx) -> Reply {
     // with empty credentials when Ubisoft Connect has none)
     let creds = if scheme.eq_ignore_ascii_case("basic") { basic_credentials(&value) } else { None };
     let email = creds.as_ref().map(|(e, _)| e.as_str()).unwrap_or("");
-    if creds.is_some() && state.login_failures.blocked(&ip, email) {
+    // counted before the password is hashed (concurrent guesses can't all pass), taken back if it works
+    if creds.is_some() && !state.login_failures.attempt(&ip, email) {
         log::warn!(target: "powder.https", "login from {ip} refused: too many failed sign-ins, try again in a few minutes");
         return auth_refused("Too many failed sign-ins, try again in a few minutes");
     }
@@ -211,9 +212,6 @@ fn create_session(c: &Ctx) -> Reply {
     let session = match state.accounts.login(&login) {
         Ok(s) => s,
         Err(AccountError::Auth(e)) => {
-            if creds.is_some() {
-                state.login_failures.failed(&ip, email);
-            }
             log::warn!(target: "powder.https", "login from {ip} refused: {e}");
             return auth_refused("Invalid credentials");
         }
@@ -943,6 +941,25 @@ mod tests {
         let r = connect_login(&st, &basic("rider@example.com", PASSWORD));
         assert_eq!(r.status, 401);
         assert!(body(&r)["message"].as_str().unwrap().contains("Too many"));
+    }
+
+    /// Guesses sent at once: each is counted before its password is hashed, so only max_failures get hashed.
+    #[test]
+    fn concurrent_guesses_are_limited_too() {
+        let st = Arc::new(limited(3));
+        register(&st, "rider@example.com", "Rider");
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12).map(|_| {
+            let (st, barrier) = (st.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                body(&connect_login(&st, &basic("rider@example.com", "wrong password")))["message"].as_str()
+                    .unwrap().to_string()
+            })
+        }).collect();
+        let messages: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(messages.iter().filter(|m| *m == "Invalid credentials").count(), 3, "{messages:?}");
+        assert_eq!(messages.iter().filter(|m| m.contains("Too many")).count(), 9);
     }
 
     #[test]

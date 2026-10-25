@@ -79,11 +79,49 @@ fn account_err<T>(msg: &str) -> Result<T> {
 }
 
 // ---- passwords ----------------------------------------------------------------------------------------------
+/// Most password hashes computed at once (each scrypt takes 16 MiB and tens of ms; the HTTPS pipeline's
+/// blocking pool would otherwise run hundreds): sign-ins beyond these wait their turn.
+const MAX_CONCURRENT_HASHES: usize = 4;
+
+/// A counting semaphore for blocking threads.
+struct Slots {
+    max: usize,
+    busy: parking_lot::Mutex<usize>,
+    freed: parking_lot::Condvar,
+}
+
+impl Slots {
+    const fn new(max: usize) -> Self {
+        Self { max, busy: parking_lot::Mutex::new(0), freed: parking_lot::Condvar::new() }
+    }
+
+    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct Release<'a>(&'a Slots);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                *self.0.busy.lock() -= 1;
+                self.0.freed.notify_one();
+            }
+        }
+        {
+            let mut busy = self.busy.lock();
+            while *busy >= self.max {
+                self.freed.wait(&mut busy);
+            }
+            *busy += 1;
+        }
+        let _release = Release(self);
+        f()
+    }
+}
+
+static HASH_SLOTS: Slots = Slots::new(MAX_CONCURRENT_HASHES);
+
 pub fn hash_password(password: &str) -> String {
     let salt = random_bytes(16);
     let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32).expect("valid scrypt parameters");
     let mut key = [0u8; 32];
-    scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key).expect("32-byte output");
+    HASH_SLOTS.run(|| scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)).expect("32-byte output");
     format!("scrypt${}${SCRYPT_R}${SCRYPT_P}${}${}", 1u32 << SCRYPT_LOG_N, hex::encode(salt), hex::encode(key))
 }
 
@@ -100,7 +138,7 @@ pub fn check_password(password: &str, stored: &str) -> bool {
     }
     let Ok(params) = scrypt::Params::new(n.trailing_zeros() as u8, r, p, key.len() / 2) else { return false };
     let mut got = vec![0u8; key.len() / 2];
-    if scrypt::scrypt(password.as_bytes(), &salt, &params, &mut got).is_err() {
+    if HASH_SLOTS.run(|| scrypt::scrypt(password.as_bytes(), &salt, &params, &mut got)).is_err() {
         return false;
     }
     // constant time, on the hex texts (as Python's hmac.compare_digest(got.hex(), key))
@@ -550,18 +588,41 @@ mod tests {
         assert!(matches!(acc.authenticate("ann@example.org", "wrong horse"), Err(Error::Auth(_))));
         assert!(matches!(acc.authenticate("nobody@example.org", "correct horse"), Err(Error::Auth(_))));
         assert!(matches!(acc.login(&basic("10.0.0.5", "ann@example.org", "nope", "")), Err(Error::Auth(_))));
-        // the route's loop: check, try, count
+        // the route's loop: count the try, then check the password
         let limiter = FailureLimiter::new(3, 30, 300.0);
         let mut refused = 0;
         for _ in 0..5 {
-            if limiter.blocked("10.0.0.5", "ann@example.org") {
+            if !limiter.attempt("10.0.0.5", "ann@example.org") {
                 refused += 1;
                 continue;
             }
             assert!(acc.authenticate("ann@example.org", "guess").is_err());
-            limiter.failed("10.0.0.5", "ann@example.org");
         }
         assert_eq!(refused, 2);
+    }
+
+    /// At most MAX_CONCURRENT_HASHES scrypt runs at once (16 MiB each), however many sign-ins come in.
+    #[test]
+    fn hashing_is_limited_to_a_few_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SLOTS: Slots = Slots::new(2);
+        let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let threads: Vec<_> = (0..8).map(|_| {
+            let (now, peak) = (now.clone(), peak.clone());
+            std::thread::spawn(move || SLOTS.run(|| {
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                now.fetch_sub(1, Ordering::SeqCst);
+            }))
+        }).collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(*SLOTS.busy.lock(), 0, "all released");
+        assert_eq!(HASH_SLOTS.max, MAX_CONCURRENT_HASHES);
+        // a panic inside gives its slot back
+        let _ = std::panic::catch_unwind(|| SLOTS.run(|| panic!("inside")));
+        assert_eq!(*SLOTS.busy.lock(), 0);
     }
 
     #[test]

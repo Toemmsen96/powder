@@ -112,15 +112,14 @@ fn account_call(c: &Ctx, change: Option<Change>) -> Reply {
     };
     let email = field(&body, "email");
     let key = if change.is_none() { REGISTER_KEY } else { email.as_str() };
-    if limiter.blocked(&ip, key) {
+    // counted before hashing (concurrent calls can't all pass); a registration always counts, a call whose
+    // password is right takes its count back
+    if !limiter.attempt(&ip, key) {
         return error("Too many attempts, try again in a few minutes.", 429);
     }
     let accounts = &st.accounts;
     let result = match change {
-        None => {
-            limiter.failed(&ip, REGISTER_KEY);
-            accounts.register(&email, &field(&body, "password"), &field(&body, "name"))
-        }
+        None => accounts.register(&email, &field(&body, "password"), &field(&body, "name")),
         Some(change) => accounts.authenticate(&email, &field(&body, "password")).and_then(|account| {
             limiter.succeeded(&ip, &email);
             change(accounts, account, &body)
@@ -128,10 +127,7 @@ fn account_call(c: &Ctx, change: Option<Change>) -> Reply {
     };
     match result.and_then(|account| accounts.info(&account).map_err(AccountError::from)) {
         Ok(info) => Reply::json(&info, "powder-account", 200),
-        Err(AccountError::Auth(_)) => {
-            limiter.failed(&ip, &email);
-            error("Wrong email or password.", 401)
-        }
+        Err(AccountError::Auth(_)) => error("Wrong email or password.", 401),
         Err(AccountError::Account(m)) => error(&m, 400),
         Err(e @ AccountError::Internal(_)) => Reply::internal_error(&e),
     }
