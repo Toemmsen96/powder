@@ -169,15 +169,25 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     reg=$(mktemp --suffix=.reg)
     ca_reg "$ca" "$key" > "$reg"
     winereg() { WINEDEBUG=-all "$wine" reg "$@" >/dev/null 2>&1; }
-    winereg import "$reg" || die "could not add the local CA to $WINEPREFIX (wine: $wine)"
+    # a session that was killed (SIGKILL, power loss) could not take its CA out: do it now, if it was another one
+    marker="$WINEPREFIX/.powder-wrap-ca"
+    if [ -f "$marker" ] && [ "$(cat "$marker")" != "$key" ]; then
+        winereg delete "$(cat "$marker")" /f && say "removed a CA a previous session left in $WINEPREFIX"
+    fi
+    printf '%s' "$key" > "$marker"
+    winereg import "$reg" || { rm -f "$reg" "$marker"; die "could not add the local CA to $WINEPREFIX (wine: $wine)"; }
     rm -f "$reg"
     "$wineserver" -w
     say "local CA trusted in $WINEPREFIX for this session"
     cleanup() {
         "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
-        winereg delete "$key" /f || say "could not remove the local CA from $WINEPREFIX"
+        if winereg delete "$key" /f; then
+            rm -f "$marker"
+            say "local CA removed from $WINEPREFIX"
+        else
+            say "could not remove the local CA from $WINEPREFIX (the next session tries again)"
+        fi
         "$wineserver" -w 2>/dev/null || true
-        say "local CA removed from $WINEPREFIX"
     }
     trap cleanup EXIT
     set +e
