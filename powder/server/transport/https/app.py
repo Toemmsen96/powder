@@ -186,6 +186,7 @@ def build_app(services, plugins=None, *, nex_public_key: str = "") -> web.Applic
     routes_ubi.add_routes(app)
     routes_ugc.add_routes(app)
     app.router.add_get("/v2/websocket", websocket)
+    app.router.add_get("/v2/websocket/server", websocket)     # Ubisoft Connect's ("websocket/server" in the SDK config)
     app.router.add_route("*", "/{tail:.*}", fallback)      # last: everything else
     return app
 

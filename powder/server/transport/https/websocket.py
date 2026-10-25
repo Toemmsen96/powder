@@ -1,4 +1,5 @@
-"""UbiServices notification WebSocket (public-ws-ubiservices.ubi.com/v2/websocket).
+"""UbiServices notification WebSocket (public-ws-ubiservices.ubi.com/v2/websocket, the game's, and
+/v2/websocket/server?SpaceIds=...&NotificationTypes=..., Ubisoft Connect's).
 
 The client's JobInitiateConnection waits for US_CONNECTION_ESTABLISHED with a connectionId; without
 it NEX Register fails ("Failed to get the connection Id ..."). Envelope format from FUN_7ff661c884e0.

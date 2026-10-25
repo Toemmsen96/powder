@@ -156,6 +156,17 @@ async def test_websocket_hello_and_server_push(client, services):
     await ws.close()
 
 
+async def test_connects_websocket_server_path(client):
+    """Ubisoft Connect opens /v2/websocket/server (not /v2/websocket); it gets the same hello."""
+    s = await login(client)
+    ws = await client.ws_connect("/v2/websocket/server?SpaceIds=x&NotificationTypes=US_CONNECTION_ESTABLISHED",
+                                 headers={"Host": "public-ws-ubiservices.ubi.com",
+                                          "Authorization": f"Ubi_v1 t={s['ticket']}"})
+    hello = json.loads((await ws.receive()).data)
+    assert hello["notificationType"] == "US_CONNECTION_ESTABLISHED" and hello["content"]["connectionId"]
+    await ws.close()
+
+
 async def test_personal_endpoints_are_generated_not_replayed(client):
     """Account details, friends and Club actions come from the player record: nothing of the recorded
     account (email, friends, action progress) is ever served."""
