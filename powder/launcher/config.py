@@ -18,6 +18,7 @@ class LauncherConfig:
     connect_exe: str = ""
     steam_app_id: int = 460920
     remove_hosts_on_exit: bool = False    # take the hosts entries out again when the launcher closes
+    remove_ca_on_exit: bool = False       # take the server's CA out of Windows' trusted roots when it closes
     # [client_mods]: code a server offers to load into the game. Off unless the player turns it on and
     # names each mod (see mods.py for the trust model)
     client_mods_enabled: bool = False

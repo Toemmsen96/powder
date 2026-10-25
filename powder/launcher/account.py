@@ -1,8 +1,10 @@
 """The player's account on the server (registered here, used to sign in to Ubisoft Connect).
 
-Calls go to the server's /_powder/account/* over HTTPS and are verified against the server's CA that the
-Certificate step saved (by address, so without a hostname check). Each call carries the email and current
-password; the launcher keeps only the email and player name (settings.json), never the password.
+Calls go to the server's /_powder/account/* over HTTPS and are verified against the server's CA as the
+Certificate step pinned it for this server (by address, so without a hostname check; session.trusted_ca()
+hands only a CA file that matches the pin). Redirects are not followed and replies are read up to a limit.
+Each call carries the email and current password; the launcher keeps only the email and player name
+(settings.json), never the password.
 """
 from __future__ import annotations
 
@@ -13,7 +15,10 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import server
 from .config import LauncherConfig
+
+MAX_REPLY = 64 << 10
 
 
 class AccountError(Exception):
@@ -45,13 +50,17 @@ def call(cfg: LauncherConfig, ca: Path, what: str, body: dict | None = None, tim
     req = urllib.request.Request(f"{_base(cfg)}/{what}", data=data, method="POST" if data else "GET",
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_context(ca)) as r:
-            return json.loads(r.read())
+        with server.open_url(req, _context(ca), timeout) as r:
+            reply = json.loads(server.read_capped(r, MAX_REPLY))
+        if not isinstance(reply, dict):
+            raise ValueError("not a JSON object")
+        return reply
     except urllib.error.HTTPError as e:
         try:
-            message = json.loads(e.read()).get("error")
-        except ValueError:
+            message = json.loads(server.read_capped(e, MAX_REPLY)).get("error")
+        except (ValueError, AttributeError, OSError):
             message = None
+        message = str(message)[:300] if message else None
         if e.code == 404:
             raise AccountError("This server has no accounts (an older Powder): no account needed.") from e
         raise AccountError(message or f"The server refused it (HTTP {e.code}).") from e
@@ -60,7 +69,10 @@ def call(cfg: LauncherConfig, ca: Path, what: str, body: dict | None = None, tim
 
 
 def account_of(reply: dict) -> Account:
-    return Account(reply["email"], reply["name"])
+    try:
+        return Account(str(reply["email"])[:254], str(reply["name"])[:64])
+    except KeyError as e:
+        raise AccountError("The server's reply is not what the launcher expects.") from e
 
 
 def takes_over(cfg: LauncherConfig, ca: Path) -> str | None:

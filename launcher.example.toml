@@ -14,6 +14,7 @@ server_https_port = 443
 # connect_exe = 'C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe'
 
 remove_hosts_on_exit = false     # take the hosts entries the launcher added out again when it closes
+remove_ca_on_exit = false        # same for the server's CA it added to Windows' trusted roots (asks first)
 
 # Client mods: DLLs a server offers to load into the game (see README, "Client mods"). They run on this PC
 # with your rights, so they are off by default and only the mods named here are used. Each is pinned to

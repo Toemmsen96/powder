@@ -10,6 +10,11 @@ Restore system:  Steep closed -> server stopped -> Connect quit -> hosts entries
 The server row of the window picks where the server is (remembered in settings.json, applied at the next
 Play): "Just this PC" (a local server for this PC only), "Host" (a local server other PCs on the network
 can join) or "Join" (a server on another PC).
+
+The server's CA is pinned per server address (trust on first use, settings.json "server_cas"): the first
+Play shows its fingerprint and asks, later a different CA stops Play with a warning (unless the player confirms
+that the host made a new one), and a Join address "host#<fingerprint>" lets the launcher compare it with what
+the host's Powder shows. The account calls and the client mods only use a CA file that matches the pin.
 """
 from __future__ import annotations
 
@@ -68,10 +73,19 @@ class Cancelled(Exception):
 
 @dataclass(frozen=True)
 class ServerSetup:
-    """Where the server is, as the server row says: LOCAL, HOST (for host_for, this PC's address) or JOIN."""
+    """Where the server is, as the server row says: LOCAL, HOST (for host_for, this PC's address) or JOIN
+    (join: the address as typed, maybe with "#<CA fingerprint>")."""
     mode: str
     host_for: str = ""
     join: str = ""
+
+    @property
+    def join_address(self) -> str:
+        return network.split_join(self.join)[0]
+
+    @property
+    def join_fingerprint(self) -> str | None:
+        return network.split_join(self.join)[1] if self.mode == JOIN else None
 
 
 def play_steps() -> list[Step]:
@@ -122,6 +136,7 @@ class Session:
         self.server_proc: server.ServerProcess | None = None
         self.armer = None
         self.hosts_added = False
+        self.installed_ca: str | None = None            # thumbprint of the CA installed in this session
         self.pack_changed = False                       # pack installed/removed since our server started
         self.thread: threading.Thread | None = None
         self.paths: dict[str, Path] = {}
@@ -351,7 +366,7 @@ class Session:
 
     def effective_cfg(self, setup: ServerSetup) -> LauncherConfig:
         if setup.mode == JOIN:
-            return replace(self.base_cfg, server_mode="remote", server_address=setup.join or "127.0.0.1")
+            return replace(self.base_cfg, server_mode="remote", server_address=setup.join_address or "127.0.0.1")
         address = self.base_cfg.server_address if self.base_cfg.server_mode == "local" else "127.0.0.1"
         return replace(self.base_cfg, server_mode="local", server_address=address)
 
@@ -383,10 +398,59 @@ class Session:
         """The CA of the server played on (each server has its own; account calls are checked against it)."""
         return self.data_dir / f"server-ca-{self._account_key().replace(':', '_')}.pem"
 
+    # ---- the server's CA, pinned per server (trust on first use) ----------------------------------------
+    def pinned_ca(self) -> str | None:
+        """SHA-256 fingerprint of the CA the player trusted for this server, if any."""
+        pin = (self._prefs().get("server_cas") or {}).get(self._account_key())
+        return pin if isinstance(pin, str) and len(pin) == 64 and certs.FINGERPRINT.fullmatch(pin) else None
+
+    def _pin_ca(self, fingerprint: str) -> None:
+        pins = dict(self._prefs().get("server_cas") or {})
+        pins[self._account_key()] = fingerprint
+        self._save_prefs(server_cas=pins)
+        log.info("server CA for %s pinned: %s", self._account_key(), fingerprint)
+
+    def trusted_ca(self) -> Path | None:
+        """ca_path if it holds the CA pinned for this server (what account calls and client mods check against)."""
+        pin = self.pinned_ca()
+        cert = certs.load(self.ca_path) if pin else None
+        return self.ca_path if cert is not None and certs.sha256(cert) == pin else None
+
+    def local_ca(self) -> str | None:
+        """Fingerprint of the CA in the local server's data folder (Just this PC / Host), None if there is none."""
+        if self.cfg.server_mode != "local":
+            return None
+        try:
+            cert = certs.load(self.server_config().data_dir / "tls" / "ca.pem")
+        except (OSError, ValueError):
+            return None
+        return certs.sha256(cert) if cert is not None else None
+
+    def join_text(self) -> str:
+        """What the other players enter under Join to reach this PC's server: its address and the start of its
+        CA's fingerprint (so their launcher can tell it is this server); "" if this PC is in no network."""
+        host = self.host_address()
+        fingerprint = self.local_ca() if host else None
+        return f"{host}#{fingerprint[:24]}" if fingerprint else host
+
+    def launcher_cas(self) -> list[str]:
+        """SHA-1 thumbprints of the CAs this launcher installed into Windows' trusted roots (settings.json)."""
+        return [t for t in self._prefs().get("trusted_cas") or [] if isinstance(t, str) and trust.THUMBPRINT.match(t)]
+
+    def _remember_installed(self, thumb: str, installed: bool = True) -> None:
+        cas = [t for t in self.launcher_cas() if t != thumb] + ([thumb] if installed else [])
+        self._save_prefs(trusted_cas=cas)
+
+    def _account_ca(self) -> Path:
+        ca = self.trusted_ca()
+        if ca is None:
+            raise account.AccountError("The server's certificate is not set up yet: press Play first.")
+        return ca
+
     def account_action(self, what: str, **kw) -> account.Account:
         """register / sign_in / change_email / change_password / rename (for the account row and step); raises
         account.AccountError with a text for the player. The result is remembered (not the password)."""
-        acc = getattr(account, what)(self.cfg, self.ca_path, **kw)
+        acc = getattr(account, what)(self.cfg, self._account_ca(), **kw)
         self._remember_account(acc)
         log.info("account: %s done (%s)", what, acc.name)
         return acc
@@ -404,8 +468,12 @@ class Session:
 
     def check_server(self) -> bool:
         setup = self.setup
-        if setup.mode == JOIN and not network.valid_address(setup.join):
+        if setup.mode == JOIN and not network.valid_address(setup.join_address):
             self.set("server", FAILED, "enter the address of the PC that hosts the server (Join, above)")
+            return False
+        if setup.join_fingerprint is not None and not certs.FINGERPRINT.fullmatch(setup.join_fingerprint):
+            self.set("server", FAILED, "after the \"#\" in the Join address comes the server's certificate "
+                                       "fingerprint as the host's Powder shows it (at least 16 hex digits)")
             return False
         host_for = setup.host_for or None
         if setup.mode == HOST and not host_for:
@@ -453,7 +521,7 @@ class Session:
             self.ask("server", f"The server runs Powder {theirs}, this launcher is Powder {__version__}. Different "
                      "major versions may not work together; update the older one.", ["Continue anyway"])
         started = " (run by the launcher)" if self.server_proc else " (already running)"
-        hosting = f"; others join with {host_for}" if host_for else ""
+        hosting = f"; others join with {self.join_text() or host_for}" if host_for else ""
         online = sorted({g["player"] for g in st.get("game") or []})
         self.set("server", OK, f"{self.cfg.server_address}{started}, Powder {theirs}, {st.get('players', 0)} "
                                f"player(s) registered, in the game now: {', '.join(online) or 'nobody'}{hosting}")
@@ -525,7 +593,7 @@ class Session:
             self.set("account", OK, f"{acc.name} ({acc.email})")
             return True
         try:
-            takes = account.takes_over(self.cfg, self.ca_path)
+            takes = account.takes_over(self.cfg, self._account_ca())
         except account.AccountError:
             takes = None
         intro = ("Every player on this server has their own account (email and password), also used to sign in to "
@@ -683,7 +751,16 @@ class Session:
         if not pem:
             self.set("cert", FAILED, "the server did not provide its CA certificate")
             return False
-        ca = certs.save_ca(pem, self.ca_path)
+        try:
+            cert = certs.check_ca(pem)
+        except certs.CaError as e:
+            log.warning("server CA refused: %s", e)
+            self.set("cert", FAILED, f"the server's certificate authority is refused: {e}. Windows was not asked to "
+                                     "trust it; ask the server's host (a Powder server makes a suitable one itself)")
+            return False
+        if not self.pin_server_ca(cert):
+            return False
+        ca = certs.save_ca(cert, self.ca_path)
         while not certs.is_trusted(ca):
             self.ask("cert", certs.EXPLANATION, ["Install certificate"])
             try:
@@ -691,7 +768,54 @@ class Session:
             except Exception as e:
                 self.set("cert", RUNNING, f"not installed: {e}")
                 self.wait(1.5)
-        self.set("cert", OK, "trusted for this Windows user")
+                continue
+            self.installed_ca = certs.thumbprint(cert)
+            self._remember_installed(self.installed_ca)
+        self.set("cert", OK, f"trusted for this Windows user (fingerprint {certs.pretty(certs.sha256(cert))[:19]}...)")
+        return True
+
+    def pin_server_ca(self, cert) -> bool:
+        """Trust on first use: is this the CA the player trusts for this server? Asks the first time and when it
+        changed; a fingerprint in the Join address decides by itself. False (step failed) if not."""
+        fingerprint, pinned = certs.sha256(cert), self.pinned_ca()
+        shown, where = certs.pretty(fingerprint), self._account_key()
+        expected = self.setup.join_fingerprint
+        if expected:
+            if not fingerprint.startswith(expected):
+                log.warning("server CA %s does not match the Join address' %s", fingerprint, expected)
+                self.set("cert", FAILED, f"the server at {where} presents a certificate authority with the fingerprint "
+                         f"{shown}, but the Join address says {certs.pretty(expected)}...: this is not the host's "
+                         "server, or someone is intercepting the connection. Nothing was sent to it. Check the "
+                         "address with the host (their Powder shows it under Host for others).")
+                return False
+            if pinned != fingerprint:
+                self._pin_ca(fingerprint)              # the host's own fingerprint vouches for it
+            return True
+        if pinned == fingerprint:
+            return True
+        if self.local_ca() == fingerprint:             # the CA in this PC's own server folder
+            self._pin_ca(fingerprint)
+            return True
+        if pinned is None:
+            text = (f"First connection to the server at {where}. Its certificate authority (checked: it can only "
+                    f"vouch for Ubisoft's names) has the fingerprint\n{shown}\nIf the host told you theirs, compare "
+                    "them (their Powder shows its start under Host for others; joining with address#fingerprint "
+                    "makes the launcher compare it). The launcher remembers it and warns if this server ever "
+                    "presents another one.")
+            actions = ["Trust this server", "Cancel"]
+        else:
+            text = (f"WARNING: the server at {where} presents a different certificate authority than the one you "
+                    f"trusted before.\nBefore: {certs.pretty(pinned)}\nNow:    {shown}\nEither its host made a "
+                    "new one (deleted data\\tls, moved the server to another PC), or someone is intercepting the "
+                    "connection to read your password. Ask the host; continue only if they confirm the new "
+                    "fingerprint. Client mods approved for the old one are asked about again.")
+            actions = ["Stop", "The host made a new CA: trust it"]
+        choice = self.ask("cert", text, actions, details=shown)
+        if choice not in ("Trust this server", "The host made a new CA: trust it"):
+            log.warning("server CA %s for %s not trusted by the player", fingerprint, where)
+            self.set("cert", FAILED, "not trusted: nothing was sent to the server. Press Play to decide again.")
+            return False
+        self._pin_ca(fingerprint)
         return True
 
     def my_connect(self, st: dict | None) -> list[dict]:
@@ -901,7 +1025,7 @@ class Session:
         return True
 
     def restore_cert(self) -> bool:
-        cas = trust.installed_cas()
+        cas = self.installed_cas()
         if not cas:
             self.set("cert", OK, "no server certificate installed")
             return True
@@ -920,10 +1044,23 @@ class Session:
                 except trust.TrustError as e:
                     if self.ask("cert", f"Not removed: {e}.", ["Try again", "Skip"]) == "Skip":
                         break
-        left = trust.installed_cas()
+        left = self.installed_cas()
+        for thumb, _ in cas:
+            if thumb not in {t for t, _ in left}:
+                self._remember_installed(thumb, installed=False)
         self.set("cert", FAILED if left else OK, f"{len(left)} server certificate(s) still trusted" if left else
                  f"removed {len(cas)} server certificate(s)")
         return True
+
+    def installed_cas(self) -> list[tuple[str, str]]:
+        """(thumbprint, subject) of the servers' CAs in Windows' trusted roots: every one named like a Powder CA,
+        and the ones this launcher recorded installing (whatever their name)."""
+        cas = trust.installed_cas()
+        recorded = [t for t in self.launcher_cas() if t not in {c[0] for c in cas}]
+        if recorded:
+            trusted = trust.trusted_thumbprints()
+            cas += [(t, "(installed by the launcher)") for t in recorded if t in trusted]
+        return cas
 
     def restore_firewall(self) -> bool:
         def current() -> list[firewall.Rule] | None:
@@ -957,7 +1094,7 @@ class Session:
         return True
 
     def restore_check(self) -> bool:
-        fp = footprint.scan(self.cfg)
+        fp = footprint.scan(self.cfg, self.data_dir)
         if not fp.clean:
             self.set("check", FAILED, "not everything could be undone: " + "; ".join(fp.lines()[:2]))
             return True
@@ -984,13 +1121,26 @@ class Session:
         """Closing would take the hosts entries out again (needs a UAC prompt, so the UI asks first)."""
         return self.cfg.remove_hosts_on_exit and self.hosts_added
 
-    def stop(self, remove_hosts: bool = True) -> None:
-        """The launcher closes: undo what it set up (the hosts entries only if the user agreed)."""
+    @property
+    def ca_removal_on_exit(self) -> bool:
+        """Closing would take the CA installed in this session out again (Windows asks to confirm, so the UI
+        asks first)."""
+        return self.cfg.remove_ca_on_exit and bool(self.installed_ca)
+
+    def stop(self, remove_hosts: bool = True, remove_ca: bool = True) -> None:
+        """The launcher closes: undo what it set up (the hosts entries and the CA only if the user agreed)."""
         self.cancel.set()
         self.end_game()
         if remove_hosts and self.hosts_removal_on_exit:
             elevate.hosts("remove", self.cfg.server_address, str(self.data_dir / "hosts-backups"))
             self.hosts_added = False
+        if remove_ca and self.ca_removal_on_exit:
+            try:
+                trust.remove_thumbprint(self.installed_ca)
+                self._remember_installed(self.installed_ca, installed=False)
+                self.installed_ca = None
+            except trust.TrustError as e:
+                log.warning("server CA not removed on exit: %s", e)
         if self.server_proc:
             self.server_proc.stop()
             self.server_proc = None

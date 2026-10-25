@@ -1,10 +1,12 @@
 """What the launcher has set up on this PC, checked without admin rights. Used by Restore system
-(and `powder --status`) to undo exactly that: the hosts-file block, the server's CA in the user's
-trusted roots and the firewall rules for playing on the local network (group "Powder"). Ubisoft Connect
+(and `powder --status`) to undo exactly that: the hosts-file block, the servers' CAs in the user's
+trusted roots (named like a Powder CA, or recorded in settings.json when the launcher installed them) and the
+firewall rules for playing on the local network (group "Powder"). Ubisoft Connect
 and Steep are listed because they must be closed first. Things the launcher never creates (e.g. firewall
 rules of the dev tools) are not part of this."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,9 +50,22 @@ def hosts_lines(path: Path = dns.HOSTS_PATH) -> list[str]:
         return []
 
 
-def scan(cfg: LauncherConfig) -> Footprint:
+def recorded_cas(data_dir: Path | None) -> list[str]:
+    """Thumbprints of the CAs the launcher installed (settings.json in its data folder)."""
+    try:
+        cas = json.loads((data_dir / "settings.json").read_text(encoding="utf-8")).get("trusted_cas") or []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    return [t for t in cas if isinstance(t, str) and trust.THUMBPRINT.match(t)]
+
+
+def scan(cfg: LauncherConfig, data_dir: Path | None = None) -> Footprint:
     try:
         cas = trust.installed_cas()
+        recorded = [t for t in recorded_cas(data_dir) if t not in {c[0] for c in cas}]
+        if recorded:
+            trusted = trust.trusted_thumbprints()
+            cas += [(t, "(installed by the launcher)") for t in recorded if t in trusted]
     except trust.TrustError:                           # not Windows
         cas = []
     try:

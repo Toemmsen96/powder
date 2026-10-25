@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from powder.launcher import account, firewall, network, server
+from powder.launcher import account, certs, firewall, network, server
 from powder.launcher.config import LauncherConfig
 from powder.launcher.session import ACTION, HOST, JOIN, LOCAL, OK, Session
+from powder.server import tls
 from test_launcher import FakePC, Scripted
 
 GAME = Path("C:/Games/Steep/Steep.exe")
@@ -15,6 +16,13 @@ GAME = Path("C:/Games/Steep/Steep.exe")
 def status(you="127.0.0.1", connect=(), game=(), **extra):
     return {"server": "powder", "version": "0", "you": you, "public_host": extra.pop("public_host", "127.0.0.1"),
             "accounts": True, "connect": list(connect), "game": list(game), **extra}
+
+
+def trust_server(s: Session) -> None:
+    """What the Certificate step leaves: the server's CA saved and pinned for this server."""
+    ca, _ = tls._make_ca()
+    certs.save_ca(ca, s.ca_path)
+    s._pin_ca(certs.sha256(ca))
 
 
 def test_status_entries_of_this_pc_only():
@@ -78,6 +86,22 @@ def test_hosting_starts_the_server_for_the_network(tmp_path, monkeypatch):
     up["st"] = status(public_host="192.0.2.10")
     s.set_mode(LOCAL)
     assert s.check_server() and FakeProcess.started == ["192.0.2.10", "stopped", None]
+
+
+@pytest.mark.parametrize("text, ok", [
+    ("192.0.2.10", True), ("host-pc", True), ("host-pc.lan", True), ("a" * 63 + ".lan", True),
+    ("", False), (" 192.0.2.10", False), ("192.0.2.300", False), ("1.2.3", False), ("::1", False),
+    ("host pc", False), ("host\tpc", False), ("host\npc", False), ("pc\\share", False), ("-pc", False),
+    ("pc-", False), ("a..b", False), ("a" * 64, False), ("pc.", False), ("ünï.lan", False), ("pc#x", False),
+    ("--", False), ("pc_1", True)])
+def test_valid_join_address(text, ok):
+    assert network.valid_address(text) is ok
+
+
+def test_join_address_with_fingerprint():
+    assert network.split_join(" 192.0.2.10 ") == ("192.0.2.10", None)
+    assert network.split_join("192.0.2.10#3F9A 0C11:22aa") == ("192.0.2.10", "3f9a0c1122aa")
+    assert network.split_join("pc.lan#") == ("pc.lan", "")
 
 
 def test_join_needs_an_address(tmp_path):
@@ -179,6 +203,7 @@ def test_account_step_registers_and_remembers_no_password(tmp_path, monkeypatch)
         return account.Account(email, name or "OldRider")
     monkeypatch.setattr(account, "register", register)
     s = Scripted(LauncherConfig(), tmp_path, answers=["Register…", "Register…"])
+    trust_server(s)
     asked_dialogs = []
     s.dialog = lambda kind, info: asked_dialogs.append((kind, info)) or {
         "email": "rider@example.com", "password": "secret password", "name": ""}

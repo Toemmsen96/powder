@@ -173,6 +173,8 @@ class LauncherWindow:
         entry.bind("<Return>", lambda e: self.mode_changed())
         self.server_note = tk.Label(bar, fg="gray")
         self.server_note.pack(side="left", padx=8)
+        # what the others enter under Join (address#fingerprint): a label can't be copied from
+        self.copy_join = ttk.Button(bar, text="Copy", command=lambda: self.copy(self.session.join_text()))
         self.update_server()
 
     def update_server(self) -> None:
@@ -180,11 +182,14 @@ class LauncherWindow:
         addresses = network.lan_addresses()
         self.host_box.configure(values=addresses, state="readonly" if mode == HOST and len(addresses) > 1
                                 else "disabled")
+        self.copy_join.pack_forget()
         if mode == HOST:
-            host = self.host_address.get()
-            note = f"friends choose Join and enter {host}" if host else "this PC is in no local network"
+            join = self.session.join_text()
+            note = f"friends choose Join and enter {join}" if join else "this PC is in no local network"
+            if join:
+                self.copy_join.pack(side="left")
         elif mode == JOIN:
-            note = "the address shown on the host's Powder"
+            note = "the address shown on the host's Powder (with the # part)"
         else:
             note = "nobody else can join"
         self.server_note.configure(text=note)
@@ -372,14 +377,21 @@ class LauncherWindow:
 
     def quit(self) -> None:
         remove = True
-        if self.session.hosts_removal_on_exit:          # announce the UAC prompt before it appears
+        what = []                                       # announce Windows' prompts before they appear
+        if self.session.hosts_removal_on_exit:
+            what.append("the hosts-file entries (remove_hosts_on_exit): the hosts file is a protected Windows "
+                        "system file, so Windows asks for admin rights (UAC)")
+        if self.session.ca_removal_on_exit:
+            what.append("the server's certificate (remove_ca_on_exit): Windows asks you to confirm in its own "
+                        "dialog; answer Yes")
+        if what:
             remove = messagebox.askyesnocancel(
-                "Powder", "Remove the hosts-file entries again before closing (remove_hosts_on_exit)?\n\n"
-                "The hosts file is a protected Windows system file, so Windows asks for admin rights (UAC) "
-                "after you click Yes.\n\nNo: close and keep the entries. Cancel: don't close.")
+                "Powder", "Remove before closing:\n\n- " + "\n- ".join(what) + "\n\nWindows' prompts appear "
+                "after you click Yes.\n\nNo: close and keep them (Restore system removes them later). Cancel: "
+                "don't close.")
             if remove is None:
                 return
-        self.session.stop(remove_hosts=remove)
+        self.session.stop(remove_hosts=remove, remove_ca=remove)
         self.root.destroy()
 
     def run(self) -> None:

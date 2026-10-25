@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("powder.launcher").info("Powder %s", __version__)
     if args.status:
         from .footprint import scan
-        fp = scan(cfg)
+        fp = scan(cfg, data_dir)
         print("\n".join(fp.lines()))
         print("nothing of the launcher's is set up" if fp.clean else
               "use --restore (or Restore system... in the launcher) to undo it")
