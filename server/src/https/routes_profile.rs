@@ -69,7 +69,7 @@ pub fn routes() -> Vec<Route> {
         Route::new("POST", "/v1/spaces/{space}/channels", |c| done(channel_create(c))),
         Route::new("*", "/v1/spaces/{space}/channels/{channel}/messages", |c| done(channel_messages(c))),
         Route::new("GET", "/v1/profiles/me/global/ubiconnect/entitlement/api/entitlements",
-                   |_| ok(json!({"entitlements": []}), "entitlements")),
+                   |_| entitlements()),
         Route::new("GET", &p("/v1/profiles/{pid}/richpresences/subscriptions"), |_| ok(json!({}), "richpresence")),
         Route::new("GET", &p("/v1/profiles/{pid}/global/ubiconnect/challenges/api"),
                    |_| ok(json!({"challenges": []}), "connect-challenges")),
@@ -98,6 +98,24 @@ pub fn routes() -> Vec<Route> {
         r.push(Route::new("POST", path, |_| ok(json!({"partialSuccess": {}}), "telemetry")));
     }
     r
+}
+
+/// Owned downloadable content, so the game does not show DLC worlds (Japan, Alaska, ...) as "to buy".
+/// Best-effort: Powder grants every DLC/ULC product it knows (product_table). The exact field set Steep reads
+/// is from its live service and not recorded here; this is a plausible shape and is tuned against the game.
+fn entitlements() -> Reply {
+    let list: Vec<Value> = crate::builtin::product_table::KINDS.iter()
+        .filter(|(_, kind)| *kind == "dlc" || *kind == "ulc")
+        .map(|(id, kind)| json!({
+            "entitlementId": format!("{SPACE_ID}:{id}"),
+            "productId": id,
+            "spaceId": SPACE_ID,
+            "type": if *kind == "dlc" { "DOWNLOADABLE_CONTENT" } else { "UNLOCKABLE_CONTENT" },
+            "obtentionDate": "2016-12-02T00:00:00.000Z",
+            "active": true,
+        }))
+        .collect();
+    ok(json!({"entitlements": list}), "entitlements")
 }
 
 fn ok(data: Value, how: &str) -> Reply {
