@@ -11,6 +11,8 @@ it reports that cleanly and still exits 0.
 """
 from __future__ import annotations
 
+import re
+
 from .launch import launch as do_launch
 from .model import Server, Settings
 
@@ -25,17 +27,16 @@ def _require_gtk():
     return Adw, Gio, GLib, Gtk
 
 
+_FINGERPRINT = re.compile(r"[0-9a-f]{16,64}")   # same shape powder.launcher.certs accepts after "#"
+
 def _fingerprint_ok(join: str) -> bool:
-    """True if a Join address has no fingerprint part or a plausible-looking one."""
+    """True if a Join address has no fingerprint part or a plausible-looking one. Self-contained so the GUI
+    runs under whatever Python has PyGObject, without needing the `powder` package importable; powder-wrap
+    re-checks the CA against the pin on connect anyway."""
     if "#" not in join:
         return True
-    try:
-        from powder.launcher import certs, network
-        fp = network.split_join(join)[1]
-        return not fp or bool(certs.FINGERPRINT.fullmatch(fp))
-    except Exception:
-        # powder not importable: accept, the launcher/powder-wrap re-checks the CA on connect anyway.
-        return True
+    fp = join.split("#", 1)[1].strip()
+    return not fp or _FINGERPRINT.fullmatch(fp) is not None
 
 
 class LauncherWindow:

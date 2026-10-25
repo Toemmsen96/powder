@@ -12,7 +12,9 @@
 #   By hand:        linux/powder-launcher                 # the GUI
 #                   linux/powder-launcher list-mods       # the CLI
 #
-# The Python interpreter is chosen like powder-wrap: the repo's .venv, else uv, else the system python3.
+# The launcher needs only the standard library (CLI) plus PyGObject/GTK4/Libadwaita (GUI). PyGObject usually
+# lives in the system python3, not in the repo's .venv, so for the GUI we pick the first interpreter that can
+# actually import gi; the CLI runs under any Python 3.
 set -euo pipefail
 
 SELF=$(readlink -f "$0")
@@ -21,21 +23,25 @@ export PYTHONPATH="$REPO/linux${PYTHONPATH:+:$PYTHONPATH}"
 
 die() { printf 'powder-launcher: %s\n' "$*" >&2; exit 1; }
 
-# the Python to run the launcher with, into the array PY (same precedence as powder-wrap)
-if [ -x "$REPO/.venv/bin/python" ]; then
-    PY=("$REPO/.venv/bin/python")
-elif command -v uv >/dev/null; then
-    PY=(uv run --frozen --offline --project "$REPO" -- python)
-elif command -v python3 >/dev/null; then
-    PY=(python3)
+# candidate interpreters, in order of preference
+candidates=()
+[ -x "$REPO/.venv/bin/python" ] && candidates+=("$REPO/.venv/bin/python")
+command -v python3 >/dev/null && candidates+=("$(command -v python3)")
+
+PY=""
+if [ $# -eq 0 ]; then
+    # GUI: the first candidate that can import gi (PyGObject + GTK4 + Libadwaita)
+    for p in "${candidates[@]}"; do
+        if "$p" -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("Adw","1")' 2>/dev/null; then
+            PY="$p"; break
+        fi
+    done
+    [ -n "$PY" ] || die "the GUI needs PyGObject (python-gobject) with GTK 4 and Libadwaita (gtk4, libadwaita);
+        install those (e.g. on Arch: pacman -S python-gobject gtk4 libadwaita), or use the CLI: $SELF list-mods"
 else
-    die "no Python found (install Python 3, or run 'uv sync' in $REPO)"
+    # CLI: any Python 3 (standard library only)
+    [ "${#candidates[@]}" -gt 0 ] && PY="${candidates[0]}"
+    [ -n "$PY" ] || die "no Python 3 found (install Python 3, or run 'uv sync' in $REPO)"
 fi
 
-# The GUI (no arguments) needs PyGObject + GTK4 + Libadwaita; the CLI subcommands do not, so only check then.
-if [ $# -eq 0 ] && ! "${PY[@]}" -c 'import gi' 2>/dev/null; then
-    die "the GUI needs PyGObject (python-gobject) with GTK 4 and Libadwaita (gtk4, libadwaita); install those
-        (e.g. on Arch: pacman -S python-gobject gtk4 libadwaita), or use the command line: $SELF list-mods"
-fi
-
-exec "${PY[@]}" -m launcher "$@"
+exec "$PY" -m launcher "$@"
