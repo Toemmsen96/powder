@@ -1,6 +1,6 @@
-//! The `powder-server` binary. The online-services server is still being ported to Rust: `run` serves HTTPS
-//! (sign-in, game-data pack + mods), the CA's revocation list, NEX (recorded replies + mods) and Storm, but not
-//! yet most UbiServices routes, the NEX handlers or the demux, so the game itself still needs the Python server.
+//! The `powder-server` binary, the Rust port of the Python server: `run` serves HTTPS (UbiServices, Ubisoft
+//! Connect's demux and the notification websocket on one TLS port), the CA's revocation list, NEX and Storm.
+//! Ported in full but not yet played against; the Python server is the one tested with the game.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -372,8 +372,8 @@ async fn run(config: Config) -> Result<()> {
     let services = Arc::new(Services::new(config.clone(), assets.clone(), repos.clone(), Some(mods.clone())));
     let accounts = services.accounts.clone();
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
-    log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX stats and \
-                                  matchmaking (use the Python server to play)");
+    log::warn!(target: "powder", "the Rust server is not tested with the game yet: if something fails, try the \
+                                  Python server");
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))
