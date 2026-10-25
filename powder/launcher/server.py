@@ -1,6 +1,9 @@
 """The server, from the launcher's side: start it locally (local mode) or just reach it (remote mode),
-and read /_powder/status. Status is fetched over the server's TLS port by IP with the server's own CA
-(the hostnames may not resolve yet when we first check)."""
+and read /_powder/status and /_powder/ca.pem. Both are fetched over the server's TLS port by address, before
+the server's CA is known, so without a certificate check: the status only says what the server reports, and the
+CA is checked and pinned by the Certificate step (certs.py, session.py) before anything relies on it.
+Every launcher request to the server goes through open_url(): replies are read up to a limit, and redirects
+are not followed (a redirect could lead a request off the pinned server, e.g. to plain HTTP)."""
 from __future__ import annotations
 
 import json
@@ -12,6 +15,28 @@ from pathlib import Path
 
 from .. import paths
 from .config import LauncherConfig
+
+MAX_STATUS = 1 << 20                     # bytes of /_powder/status read at most
+MAX_CA = 64 << 10                        # bytes of /_powder/ca.pem read at most
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None                      # urllib then raises HTTPError with the 3xx status
+
+
+def open_url(url, context: ssl.SSLContext, timeout: float):
+    """urlopen() for the server: this TLS context, no redirects."""
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=context))
+    return opener.open(url, timeout=timeout)
+
+
+def read_capped(response, limit: int) -> bytes:
+    """The body, or ValueError if it is larger than `limit`."""
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"reply larger than {limit} bytes")
+    return data
 
 
 class ServerProcess:
@@ -49,8 +74,8 @@ class ServerProcess:
 
 
 def _context() -> ssl.SSLContext:
-    # we connect by address, not by a Ubisoft hostname, so the name check is off; this endpoint carries
-    # no secrets and is only used to see what the server reports
+    # we connect by address, before the CA is known: no check here. These two endpoints carry no secrets; the
+    # status only informs, and the CA is checked and pinned before it is used (session.check_cert)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -59,18 +84,19 @@ def _context() -> ssl.SSLContext:
 
 def status(cfg: LauncherConfig, timeout: float = 2.0) -> dict | None:
     try:
-        with urllib.request.urlopen(cfg.status_url, timeout=timeout, context=_context()) as r:
-            return json.loads(r.read())
+        with open_url(cfg.status_url, _context(), timeout) as r:
+            st = json.loads(read_capped(r, MAX_STATUS))
     except (OSError, ValueError):
         return None
+    return st if isinstance(st, dict) else None
 
 
 def ca_pem(cfg: LauncherConfig) -> bytes | None:
     url = cfg.status_url.replace("/_powder/status", "/_powder/ca.pem")
     try:
-        with urllib.request.urlopen(url, timeout=3, context=_context()) as r:
-            return r.read()
-    except OSError:
+        with open_url(url, _context(), 3) as r:
+            return read_capped(r, MAX_CA)
+    except (OSError, ValueError):
         return None
 
 

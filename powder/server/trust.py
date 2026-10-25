@@ -14,7 +14,10 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 
+from .. import paths
 from .tls import CA_NAME, LEGACY_CA_NAMES
+
+THUMBPRINT = re.compile(r"^[0-9A-F]{40}$")
 
 
 class TrustError(RuntimeError):
@@ -29,8 +32,8 @@ def thumbprint(ca_pem: Path) -> str:
 def _certutil(*args: str) -> subprocess.CompletedProcess:
     if sys.platform != "win32":
         raise TrustError("only needed on Windows (Ubisoft Connect)")
-    return subprocess.run(["certutil", "-user", *args], capture_output=True, text=True, errors="replace",
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return subprocess.run([paths.system_exe("certutil.exe"), "-user", *args], capture_output=True, text=True,
+                          errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def trusted_thumbprints() -> set[str]:
@@ -69,6 +72,8 @@ def installed_cas(names: tuple[str, ...] = (CA_NAME, *LEGACY_CA_NAMES)) -> list[
 
 def remove_thumbprint(thumb: str) -> None:
     """Remove one trusted root; Windows shows a confirmation dialog, declining raises TrustError."""
+    if not THUMBPRINT.match(thumb):
+        raise TrustError(f"not a certificate thumbprint: {thumb!r}")
     r = _certutil("-delstore", "Root", thumb)
     if r.returncode or thumb in trusted_thumbprints():
         raise TrustError(f"certificate not removed (certutil exit {r.returncode})")

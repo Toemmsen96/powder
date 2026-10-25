@@ -1,8 +1,14 @@
-"""This PC's addresses in the local network: what friends type in to join a server hosted here."""
+"""This PC's addresses in the local network: what friends type in to join a server hosted here, and what a
+Join address may be: an IPv4 address or a host name, optionally followed by "#" and the server CA's SHA-256
+fingerprint (or its first 16+ hex digits) as the host's Powder shows it, so the launcher can compare it."""
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
+
+_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"            # "_": Windows PC names have it
+HOSTNAME = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 
 
 def _usable(ip: str) -> bool:
@@ -43,11 +49,21 @@ def lan_addresses() -> list[str]:
 
 
 def valid_address(text: str) -> bool:
-    """An IPv4 address or a host name someone could type to join."""
-    text = text.strip()
-    if not text or " " in text:
+    """An IPv4 address or a host name (RFC 1123 labels, ASCII) someone could type to join."""
+    if not isinstance(text, str) or text != text.strip() or not text or len(text) > 253:
         return False
     try:
         return ipaddress.ip_address(text).version == 4
     except ValueError:
-        return all(part and (part.isalnum() or "-" in part) for part in text.split("."))
+        pass
+    if re.fullmatch(r"[0-9.]+", text):               # looks like a (bad) IPv4 address, not a name
+        return False
+    return bool(HOSTNAME.fullmatch(text))
+
+
+def split_join(text: str) -> tuple[str, str | None]:
+    """A Join address as typed: (address, the CA fingerprint after "#" normalized to lower-case hex, or None)."""
+    address, sep, fingerprint = (text or "").strip().partition("#")
+    if not sep:
+        return address.strip(), None
+    return address.strip(), re.sub(r"[\s:]", "", fingerprint).lower()

@@ -18,6 +18,7 @@ class LauncherConfig:
     connect_exe: str = ""
     steam_app_id: int = 460920
     remove_hosts_on_exit: bool = False    # take the hosts entries out again when the launcher closes
+    remove_ca_on_exit: bool = False       # take the server's CA out of Windows' trusted roots when it closes
     path: Path | None = None
 
     @classmethod

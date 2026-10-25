@@ -198,9 +198,12 @@ these steps; each step only checks unless something is missing.
 Where the server is, is chosen in the **Server** row (remembered, applied at the next Play):
 
 - **Just this PC**: the launcher runs a server that only this PC can use.
-- **Host for others**: the launcher runs the server for the whole local network and shows this PC's
-  address (choose one if the PC has several). The other players enter it under Join.
-- **Join**: the address of a PC that hosts. Nothing runs here but the game.
+- **Host for others**: the launcher runs the server for the whole local network and shows what the
+  other players enter under Join (**Copy** copies it): this PC's address (choose one if the PC has several)
+  and, after a `#`, the start of the server CA's fingerprint, e.g. `192.168.1.20#3f9a0c...`.
+- **Join**: the address of a PC that hosts, as its Powder shows it. Nothing runs here but the game. With the
+  `#` part, the launcher checks that it reached that host's server (and not someone in between); without
+  it, the address alone works too (see Certificate below).
 
 Without a choice, `server_mode` and `server_address` in `launcher.toml` decide. The steps:
 
@@ -219,7 +222,15 @@ Without a choice, `server_mode` and `server_address` in `launcher.toml` decide. 
 4. **DNS**: every Ubisoft hostname (`powder/server/hostnames.py`) must resolve to the server address. If not,
    it shows the lines to add to your own DNS server, or adds them to the hosts file for you (the previous
    hosts file is backed up to `data/launcher/hosts-backups/`).
-5. **Certificate**: gets the server's CA and, if Windows doesn't trust it yet, installs it for your user.
+5. **Certificate**: gets the server's CA, checks that it can only vouch for Ubisoft's names (exactly one
+   self-signed CA certificate, path length 0, critical name constraints permitting only names within
+   `ubi.com` / `ubisoft.com` and addresses within `127.0.0.0/8`; anything else is refused before Windows
+   sees it) and, if Windows doesn't trust it yet, installs it for your user. Each server's CA is pinned
+   by its SHA-256 fingerprint (`server_cas` in `data/launcher/settings.json`): the first time, the
+   launcher shows the fingerprint and asks (no question for this PC's own server, or when the Join
+   address carries a matching `#` fingerprint); if the server later presents another CA, Play stops with
+   a warning, since that is either a new CA its host made or someone intercepting the connection to
+   read your password. The account calls and client mods use only the pinned CA.
 6. **Account**: registers your account on the server, or signs in to one you already have there (the
    launcher remembers the email, never the password).
 7. **Ubisoft Connect**: restarts it if it is not signed in to the server as this PC's player, then waits
@@ -248,9 +259,13 @@ compiled game, packaged differently). Game files are never modified on disk.
 
 **Restore system…** undoes everything the launcher set up: it stops the server it started, quits
 Ubisoft Connect (which otherwise stays connected to the server), removes the hosts-file entries (backup
-kept), the server's certificate and the launcher's firewall rules (group "Powder"). Each step asks before a Windows prompt, offers to skip, and
+kept), the servers' certificates (every one named like a Powder CA, and each one the launcher recorded
+installing, `trusted_cas` in `data/launcher/settings.json`) and the launcher's firewall rules (group
+"Powder"). Each step asks before a Windows prompt, offers to skip, and
 only acts if something is there, so it is safe to run any time. **Play** sets everything up again.
-`powder --status` and `powder --restore` do the same from a console.
+`powder --status` and `powder --restore` do the same from a console. With `remove_hosts_on_exit` /
+`remove_ca_on_exit` in `launcher.toml`, closing the launcher offers to take out the hosts entries / the
+certificate it added in that session.
 
 Only the launcher's own changes are undone. Your data (`data/`, the game-data pack) is kept, and game
 files are never changed.
