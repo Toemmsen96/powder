@@ -31,6 +31,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }   # the websocket's Stream/Sink
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "v5"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }

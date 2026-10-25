@@ -10,18 +10,21 @@
 //!   routes          method + path pattern -> handler, in the Python server's registration order:
 //!                   routes_powder.rs (/_powder/: status, accounts, CA, overlay part, client mods),
 //!                   routes_profile.rs (profile, friends, notifications, GraphQL, chat channels...),
-//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
+//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check), websocket.rs (the handshake)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
 //! Routes match on the path only (the host matters only for the pack); a route whose path matches but whose
 //! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
-//! Not ported yet: the UGC and websocket routes, and routes_ubi's inventory, store, entity and cloud-save
-//! routes; until they are, what they would answer falls through to the pack.
+//! A websocket handshake the route accepted (101) is answered by hyper, then the connection is websocket.rs's.
+//!
+//! Not ported yet: the UGC routes and routes_ubi's inventory, store, entity and cloud-save routes; until they
+//! are, what they would answer falls through to the pack.
 
 pub mod routes_powder;
 pub mod routes_profile;
 pub mod routes_ubi;
+pub mod websocket;
 
 use crate::builtin::http as builtin_http;
 use crate::constants::{APP_ID, DEMUX_HOST};
@@ -182,9 +185,10 @@ impl Route {
 }
 
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
-/// routes_ugc, the websocket; ported so far: routes_powder, routes_profile, routes_ubi's sign-in part).
+/// routes_ugc, the websocket; ported so far: routes_powder, routes_profile, routes_ubi's sign-in part, the websocket).
 static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
-    routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes()).collect()
+    routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes())
+        .chain(websocket::routes()).collect()
 });
 
 /// `Authorization: Ubi_v1 t=<ticket>` -> the session it belongs to (Python's session_middleware).
@@ -226,6 +230,9 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
         }
         _ => from_mods(state, req).unwrap_or_else(|| routed(state, req, &ROUTES)),
     };
+    if reply.how == websocket::HOW && reply.status == 101 {
+        return reply; // the upgrade: no CORS (as aiohttp's for a prepared reply), logged when the socket closes
+    }
     if let Some(origin) = origin {
         // set, not added: a route's own ("*" on the overlay part) is replaced, as aiohttp's headers[...] = does
         let cors = [("Access-Control-Allow-Origin", origin.as_str()), ("Access-Control-Allow-Credentials", "true"),
@@ -239,7 +246,7 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
     reply
 }
 
-/// One line per request.
+/// One line per request (the size is "-" for a websocket, as aiohttp's content_length is None).
 pub fn access_log(req: &Req, how: &str, status: u16, size: &str) {
     let qs: String = req.path_qs.chars().take(160).collect();
     let line = format!("{} {}{qs} -> {how} {status} ({size}B)", req.method, req.host);
@@ -380,8 +387,10 @@ fn to_response(reply: Reply) -> Response<Full<Bytes>> {
     resp
 }
 
-async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, req: Request<Incoming>)
+async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, mut req: Request<Incoming>)
                        -> Result<Response<Full<Bytes>>> {
+    // kept for the websocket route; hyper hands over the connection once its 101 is sent
+    let upgrade = websocket::is_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
     let body = Limited::new(body, MAX_BODY).collect().await.map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();
     let host = parts.headers.get("host").and_then(|h| h.to_str().ok())
@@ -389,7 +398,11 @@ async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, req
     let path_qs = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let req = Req { method: parts.method.to_string(), host, path_qs, headers: parts.headers, body, peer };
     // the pipeline blocks (SQLite, scrypt for password sign-ins, the mods' lock): off the async workers
-    let reply = tokio::task::spawn_blocking(move || handle(&state, &req)).await?;
+    let shared = state.clone();
+    let (reply, req) = tokio::task::spawn_blocking(move || (handle(&shared, &req), req)).await?;
+    if let Some(upgrade) = upgrade.filter(|_| reply.status == 101 && reply.how == websocket::HOW) {
+        tokio::spawn(websocket::run(state, req, upgrade));
+    }
     Ok(to_response(reply))
 }
 
@@ -440,7 +453,8 @@ pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<
                 return;
             }
             let service = service_fn(move |req| serve_request(state.clone(), sni.clone(), peer, req));
-            if let Err(e) = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await {
+            let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service).with_upgrades();
+            if let Err(e) = conn.await {
                 log::debug!(target: "powder.https", "connection from {peer}: {e}");
             }
         });
@@ -702,6 +716,83 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 401"), "{text}");
         let text = tls_request(addr, &ca, &post(format!("Basic {}", crate::util::b64(b"rider@example.com:wrong")))).await;
         assert!(text.starts_with("HTTP/1.1 401") && text.contains(r#""errorCode": 1"#), "{text}");
+    }
+
+    /// The notification websocket over TLS, at the game's path and Connect's: the 101 (first protocol echoed), the
+    /// hello, a push from the server, a ping answered, and the socket forgotten once closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_over_tls() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let dir = tempfile::tempdir().unwrap();
+        // a mod hears ws_connected
+        std::fs::write(dir.path().join("m.lua"), r#"return function(api)
+            api.on("ws_connected", function(ev) api.save("seen", { ev.profile_id, ev.connection_id }) end)
+        end"#).unwrap();
+        let db = Arc::new(crate::db::Db::memory().unwrap());
+        db.migrate().unwrap();
+        let mod_repos = Arc::new(crate::repos::Repos::new(db));
+        let mut config = Config::default();
+        config.mods.dir = dir.path().to_path_buf();
+        let st = state(vec![], Some(ModHost::load(&config, mod_repos.clone())));
+        let pid = st.accounts.default_profile_id().unwrap();
+        let session = st.sessions.issue(st.accounts.player(&pid).unwrap(), "127.0.0.1", "");
+        let sessions = st.sessions.clone();
+        let (addr, ca) = tls_server(st, dir.path()).await;
+        for path in ["/v2/websocket?NotificationTypes=US_CONNECTION_ESTABLISHED",
+                     "/v2/websocket/server?SpaceIds=x&NotificationTypes=US_CONNECTION_ESTABLISHED"] {
+            let tls = tls_connect(addr, &ca, "public-ws-ubiservices.ubi.com").await;
+            let mut request = format!("wss://public-ws-ubiservices.ubi.com{path}").into_client_request().unwrap();
+            let headers = request.headers_mut();
+            headers.insert("Authorization", HeaderValue::from_str(&format!("Ubi_v1 t={}", session.ticket)).unwrap());
+            headers.insert("Sec-WebSocket-Protocol", HeaderValue::from_static("ubiservices, other"));
+            let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+            assert_eq!(response.status(), 101);
+            assert_eq!(response.headers()["sec-websocket-protocol"], "ubiservices");
+            assert!(response.headers().get("content-length").is_none(), "{response:?}");
+            let next = |m: Option<Result<Message, _>>| m.expect("a message").expect("no error");
+            let hello: Value = serde_json::from_str(next(ws.next().await).to_text().unwrap()).unwrap();
+            let keys: Vec<_> = hello.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["notificationType", "content", "datePosted"]);
+            assert_eq!(hello["notificationType"], "US_CONNECTION_ESTABLISHED");
+            let id = hello["content"]["connectionId"].as_str().unwrap();
+            assert!(uuid::Uuid::parse_str(id).is_ok());
+            let mut tries = 0;
+            while mod_repos.kv_get("mod:m", "seen").unwrap() != Some(json!([pid, id])) {
+                tries += 1;
+                assert!(tries < 200, "no ws_connected event");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let contact = hello["content"]["contactUrl"].as_str().unwrap();
+            let node = contact.strip_prefix("https://public-im-ubiservices.ubi.com/v2/connections/").unwrap();
+            assert_eq!(node, format!("{}/8180/{id}/notifications", &node[..17]));
+            assert!(node[..17].bytes().all(|b| b.is_ascii_hexdigit()));
+            // registered right after the hello
+            let mut tries = 0;
+            while sessions.push_ws(&pid, "TEST_NOTIFICATION", json!({"x": 1}), Map::new()) == 0 {
+                tries += 1;
+                assert!(tries < 200, "the websocket was never registered");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let pushed: Value = serde_json::from_str(next(ws.next().await).to_text().unwrap()).unwrap();
+            assert_eq!(pushed["notificationType"], "TEST_NOTIFICATION");
+            assert_eq!(pushed["content"], json!({"x": 1}));
+            ws.send(Message::text("hi")).await.unwrap();
+            ws.send(Message::Ping(b"p".to_vec())).await.unwrap();
+            assert_eq!(next(ws.next().await), Message::Pong(b"p".to_vec()));
+            ws.close(None).await.unwrap();
+            while ws.next().await.is_some() {}
+            let mut tries = 0;
+            while session.channels.websocket_count() > 0 {
+                tries += 1;
+                assert!(tries < 200, "the websocket was never removed");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        // a plain GET there is refused
+        let text = tls_request(addr, &ca, "GET /v2/websocket HTTP/1.1\r\nHost: public-ws-ubiservices.ubi.com\r\n\
+                                           Connection: close\r\n\r\n").await;
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
     }
 
     /// The launcher's calls over TLS: the status, and the CA it makes (`run` keeps it in <data>/tls).
