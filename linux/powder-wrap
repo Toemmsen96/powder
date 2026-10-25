@@ -254,7 +254,10 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         else
             cp -f "$proxy" "$sdir/version.dll" && cp -f "$sysver" "$sdir/vers_powder.dll"
             rm -f "$sdir/powder_tls.log"
+            # load our version.dll over the builtin. The env var may not survive Proton/umu to the game, so
+            # set the override in the prefix registry too (that always applies); both are removed on cleanup.
             export WINEDLLOVERRIDES="version=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+            winereg add 'HKCU\Software\Wine\DllOverrides' /v version /t REG_SZ /d native,builtin /f
             helper="$sdir"
             say "TLS helper in $sdir (its log: $sdir/powder_tls.log)"
         fi
@@ -262,8 +265,11 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
 
     cleanup() {
         "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
-        [ -n "$helper" ] && rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/powder_tls.pin" \
-                                  "$helper/powder_tls.log"
+        # powder_tls.log is kept (it is the helper's diagnostic; the next session resets it)
+        if [ -n "$helper" ]; then
+            rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/powder_tls.pin"
+            winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
+        fi
         if winereg delete "$key" /f; then
             rm -f "$marker"
             say "local CA removed from $WINEPREFIX"
