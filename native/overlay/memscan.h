@@ -27,6 +27,10 @@ struct Value {
 
 enum class Compare { Exact, Changed, Unchanged, Greater, Less };
 
+// Read/write an arbitrary address with a given type (for the Trainer tab's slots, fly and teleport).
+bool peek(uintptr_t addr, ValType t, Value &out);   // false if unreadable
+void poke(uintptr_t addr, const Value &v);          // makes the page writable, writes, restores protection
+
 struct Frozen {
     uintptr_t addr;
     Value value;
@@ -36,6 +40,9 @@ class MemScan {
 public:
     // First scan: find every readable aligned slot equal to `v`. Returns match count.
     size_t first_scan(const Value &v);
+    // First scan with no known value: snapshot every writable aligned slot of type `t`, to refine later with
+    // next_scan (changed/unchanged/greater/less). Writable-only keeps it tractable and skips code. Returns count.
+    size_t first_scan_unknown(ValType t);
     // Refine: keep matches that satisfy cmp (Exact uses `v`; others compare against the last read).
     size_t next_scan(Compare cmp, const Value &v);
     void reset();

@@ -196,8 +196,13 @@ don't run commands against the user's real prefix or data: test on scratch copie
    `/_powder/admin/api/*` (needs POWDER_SERVER=rust); Debug tab = status, the broadcast feed (new `feed`
    action in mods/admin/mod.lua), FPS, HTTP log, and a generic in-process memory scanner. Build with
    `native/build.sh overlay`; `native/bin/nettest.exe` checks the networking without the game. Verified
-   headless: DLL loads, Present hooked, ImGui init, auto-login + players fetched. Deferred: trainer features
-   (need per-feature Steep RE; the scanner is the groundwork); live POWDER_* delivery to non-admin players'
+   headless: DLL loads, Present hooked, ImGui init, auto-login + players fetched. Trainer tab (2026-10-25):
+   a generic chassis for trainer features - the memory scanner (incl. unknown-value first scan over writable
+   memory) feeds found addresses into slots with freeze, set, X/Y/Z assignment, Fly (hold position, move with
+   the numpad) and Teleport (save/go-to spot). It needs no Steep RE itself; finding the player position is an
+   interactive in-game hunt (scan float, move -> changed, stand -> unchanged) the user does. Deferred:
+   per-feature Steep RE for real noclip (collision off) and camera-relative fly; live POWDER_* delivery to
+   non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
    `native/build.ps1` overlay target for Windows builds.

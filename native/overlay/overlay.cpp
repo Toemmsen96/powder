@@ -266,6 +266,77 @@ static bool g_autologin_done = false;
 static pw::MemScan g_scan;
 static std::atomic<bool> g_scanning{false};
 
+// ---- Trainer: addresses the user found (via the scanner), with freeze, fly and teleport ------------------
+struct Slot {
+    char label[32];
+    char input[32];       // the "set value" field (persists across frames)
+    uintptr_t addr;
+    pw::ValType type;
+    bool freeze;
+    pw::Value frozen;     // value held while freeze is on
+};
+static std::vector<Slot> g_slots;
+static int g_axis[3] = {-1, -1, -1};    // slot indices used as X, Y, Z for fly / teleport
+static bool g_fly = false;
+static float g_fly_speed = 2.0f;
+static bool g_have_spot = false;
+static pw::Value g_spot[3];
+
+static void add_slot(const char *label, uintptr_t addr, pw::ValType type) {
+    Slot s{};
+    strncpy(s.label, label, sizeof(s.label) - 1);
+    s.addr = addr; s.type = type; s.freeze = false;
+    pw::peek(addr, type, s.frozen);     // seed the hold value with the current one
+    g_slots.push_back(s);
+}
+
+static double slot_as_double(const pw::Value &v) {
+    switch (v.type) {
+        case pw::ValType::F32: return v.f32;
+        case pw::ValType::F64: return v.f64;
+        case pw::ValType::I32: return v.i32;
+        case pw::ValType::I64: return (double)v.i64;
+    }
+    return 0;
+}
+static pw::Value double_as(pw::ValType t, double d) {
+    pw::Value v; v.type = t;
+    switch (t) {
+        case pw::ValType::F32: v.f32 = (float)d; break;
+        case pw::ValType::F64: v.f64 = d; break;
+        case pw::ValType::I32: v.i32 = (int)d; break;
+        case pw::ValType::I64: v.i64 = (long long)d; break;
+    }
+    return v;
+}
+
+// Run every frame: hold frozen slots, and (when fly is on) move the X/Y/Z slots with the numpad, overwriting
+// the game's physics for those addresses. Numpad 4/6 = X-, X+; 8/2 = Z+, Z-; 9/3 = Y up, down.
+static void trainer_apply() {
+    for (auto &s : g_slots)
+        if (s.freeze) pw::poke(s.addr, s.frozen);
+
+    bool axes_ok = g_axis[0] >= 0 && g_axis[1] >= 0 && g_axis[2] >= 0 &&
+                   g_axis[0] < (int)g_slots.size() && g_axis[1] < (int)g_slots.size() &&
+                   g_axis[2] < (int)g_slots.size();
+    if (!g_fly || !axes_ok) return;
+    auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    double mv[3] = {0, 0, 0};
+    if (held(VK_NUMPAD6)) mv[0] += 1;
+    if (held(VK_NUMPAD4)) mv[0] -= 1;
+    if (held(VK_NUMPAD9)) mv[1] += 1;
+    if (held(VK_NUMPAD3)) mv[1] -= 1;
+    if (held(VK_NUMPAD8)) mv[2] += 1;
+    if (held(VK_NUMPAD2)) mv[2] -= 1;
+    for (int k = 0; k < 3; ++k) {
+        Slot &s = g_slots[g_axis[k]];
+        pw::Value cur;
+        if (!pw::peek(s.addr, s.type, cur)) continue;
+        pw::Value nv = double_as(s.type, slot_as_double(cur) + mv[k] * g_fly_speed);
+        pw::poke(s.addr, nv);     // writing every frame (even with no key) holds position = hover/fly
+    }
+}
+
 static void create_rtv(IDXGISwapChain *sc) {
     ID3D11Texture2D *back = nullptr;
     if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back)) && back) {
@@ -346,7 +417,7 @@ static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT 
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         }
     }
-    if (!g_scanning.load()) g_scan.apply_frozen();
+    if (!g_scanning.load()) { g_scan.apply_frozen(); trainer_apply(); }
     return g_present_orig(sc, sync, flags);
 }
 
@@ -623,7 +694,13 @@ static void draw_debug_tab() {
         }
     }
     ImGui::SameLine();
+    if (ImGui::Button("First scan (unknown)")) {   // no value known: snapshot, then narrow with the buttons below
+        g_scanning = true;
+        std::thread([vt] { g_scan.first_scan_unknown(vt); g_scanning = false; }).detach();
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Reset##scan")) g_scan.reset();
+    ImGui::TextDisabled("For coords: type float, First scan (unknown), move -> changed, stand still -> unchanged, repeat.");
     // next-scan comparisons
     auto next = [&](pw::Compare cmp) {
         pw::Value v; pw::Value::parse(vt, sval, v);
@@ -660,6 +737,9 @@ static void draw_debug_tab() {
                     pw::Value v;
                     if (pw::Value::parse(vt, sval, v)) g_scan.frozen.push_back({g_scan.addr(i), v});
                 }
+                ImGui::SameLine();
+                if (ImGui::SmallButton((std::string("-> Trainer##") + std::to_string(i)).c_str()))
+                    add_slot("value", g_scan.addr(i), vt);
             }
             ImGui::EndTable();
         }
@@ -676,13 +756,98 @@ static void draw_debug_tab() {
     }
 }
 
+static const char *TYPE_NAMES[] = {"int32", "int64", "float", "double"};
+
+static void draw_trainer_tab() {
+    ImGui::TextWrapped("Addresses you found (Debug tab's scanner -> \"-> Trainer\"). Freeze a value, or set three "
+                       "slots as X/Y/Z and enable Fly to move with the numpad.");
+
+    // manual add
+    static char maddr[32] = "";
+    static int mtype = 2;   // default float (positions are floats)
+    ImGui::SetNextItemWidth(160); ImGui::InputText("addr (hex)##add", maddr, sizeof(maddr));
+    ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::Combo("##mtype", &mtype, TYPE_NAMES, 4);
+    ImGui::SameLine();
+    if (ImGui::Button("Add slot")) {
+        uintptr_t a = (uintptr_t)strtoull(maddr, nullptr, 16);
+        if (a) add_slot("slot", a, (pw::ValType)mtype);
+    }
+
+    if (g_slots.empty()) { ImGui::TextDisabled("no slots yet"); return; }
+
+    if (ImGui::BeginTable("slots", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Label"); ImGui::TableSetupColumn("Address"); ImGui::TableSetupColumn("Value");
+        ImGui::TableSetupColumn("Freeze"); ImGui::TableSetupColumn("Set"); ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        int remove = -1;
+        for (int i = 0; i < (int)g_slots.size(); ++i) {
+            Slot &s = g_slots[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::SetNextItemWidth(90); ImGui::InputText("##lbl", s.label, sizeof(s.label));
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%p", (void *)s.addr);
+            const char *ax = g_axis[0] == i ? " [X]" : g_axis[1] == i ? " [Y]" : g_axis[2] == i ? " [Z]" : "";
+            if (ax[0]) { ImGui::SameLine(); ImGui::TextDisabled("%s", ax); }
+            ImGui::TableSetColumnIndex(2);
+            pw::Value cur;
+            if (pw::peek(s.addr, s.type, cur)) ImGui::TextUnformatted(cur.str().c_str()); else ImGui::TextDisabled("?");
+            ImGui::TableSetColumnIndex(3);
+            if (ImGui::Checkbox("##fz", &s.freeze) && s.freeze) pw::peek(s.addr, s.type, s.frozen);
+            ImGui::TableSetColumnIndex(4);
+            ImGui::SetNextItemWidth(70);
+            ImGui::InputText("##set", s.input, sizeof(s.input));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("set")) {
+                pw::Value v;
+                if (s.input[0] && pw::Value::parse(s.type, s.input, v)) { pw::poke(s.addr, v); s.frozen = v; }
+            }
+            ImGui::TableSetColumnIndex(5);
+            if (ImGui::SmallButton("X")) g_axis[0] = i;
+            ImGui::SameLine(); if (ImGui::SmallButton("Y")) g_axis[1] = i;
+            ImGui::SameLine(); if (ImGui::SmallButton("Z")) g_axis[2] = i;
+            ImGui::SameLine(); if (ImGui::SmallButton("del")) remove = i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (remove >= 0) {
+            for (int k = 0; k < 3; ++k) { if (g_axis[k] == remove) g_axis[k] = -1; else if (g_axis[k] > remove) --g_axis[k]; }
+            g_slots.erase(g_slots.begin() + remove);
+        }
+    }
+
+    ImGui::SeparatorText("Fly / noclip-lite");
+    bool axes_ok = g_axis[0] >= 0 && g_axis[1] >= 0 && g_axis[2] >= 0;
+    ImGui::BeginDisabled(!axes_ok);
+    ImGui::Checkbox("Fly (hold position; move with numpad 8/2 4/6 9/3)", &g_fly);
+    ImGui::EndDisabled();
+    if (!axes_ok) ImGui::TextDisabled("assign X, Y and Z first (the buttons in each row)");
+    ImGui::SetNextItemWidth(120); ImGui::InputFloat("speed (units/frame)", &g_fly_speed);
+
+    ImGui::SeparatorText("Teleport");
+    ImGui::BeginDisabled(!axes_ok);
+    if (ImGui::Button("Save spot")) {
+        g_have_spot = pw::peek(g_slots[g_axis[0]].addr, g_slots[g_axis[0]].type, g_spot[0]) &&
+                      pw::peek(g_slots[g_axis[1]].addr, g_slots[g_axis[1]].type, g_spot[1]) &&
+                      pw::peek(g_slots[g_axis[2]].addr, g_slots[g_axis[2]].type, g_spot[2]);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!g_have_spot);
+    if (ImGui::Button("Teleport to spot"))
+        for (int k = 0; k < 3; ++k) pw::poke(g_slots[g_axis[k]].addr, g_spot[k]);
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+}
+
 static void draw_ui() {
-    ImGui::SetNextWindowSize(ImVec2(480, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 580), ImGuiCond_FirstUseEver);
     ImGui::Begin("Powder");
     if (g_st.busy.load()) { ImGui::SameLine(ImGui::GetWindowWidth() - 60); ImGui::TextDisabled("..."); }
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Server")) { draw_server_tab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Debug")) { draw_debug_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Trainer")) { draw_trainer_tab(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::End();

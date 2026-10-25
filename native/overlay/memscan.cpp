@@ -61,9 +61,63 @@ bool MemScan::readable(const void *p, size_t n) const {
     return (uintptr_t)p + n <= end;
 }
 
+static const size_t MAX_MATCHES = 2'000'000;   // cap so a first scan can't blow up memory
+
+bool peek(uintptr_t addr, ValType t, Value &out) {
+    size_t n = (t == ValType::I64 || t == ValType::F64) ? 8 : 4;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)addr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
+        return false;
+    DWORD prot = mbi.Protect & 0xFF;
+    if (prot == PAGE_NOACCESS) return false;
+    if ((uintptr_t)mbi.BaseAddress + mbi.RegionSize < addr + n) return false;
+    out.type = t;
+    memcpy(&out.i64, (void *)addr, n);
+    return true;
+}
+
+void poke(uintptr_t addr, const Value &v) {
+    void *p = (void *)addr;
+    size_t n = v.size();
+    DWORD old;
+    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) return;
+    memcpy(p, &v.i64, n);
+    DWORD tmp;
+    VirtualProtect(p, n, old, &tmp);
+}
+
 void MemScan::reset() { matches_.clear(); last_.clear(); }
 
-static const size_t MAX_MATCHES = 2'000'000;   // cap so a first scan can't blow up memory
+static bool is_writable(DWORD protect) {
+    if (protect & PAGE_GUARD) return false;
+    DWORD prot = protect & 0xFF;
+    return prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+}
+
+size_t MemScan::first_scan_unknown(ValType t) {
+    reset();
+    type_ = t;
+    size_t step = (t == ValType::I64 || t == ValType::F64) ? 8 : 4;
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    uintptr_t max = (uintptr_t)si.lpMaximumApplicationAddress;
+    while (addr < max && matches_.size() < MAX_MATCHES) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)addr, &mbi, sizeof(mbi))) break;
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        uintptr_t next = base + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && is_writable(mbi.Protect)) {
+            for (uintptr_t p = base; p + step <= next && matches_.size() < MAX_MATCHES; p += step) {
+                matches_.push_back(p);
+                uint64_t raw = 0; memcpy(&raw, (void *)p, step);
+                last_.push_back(raw);
+            }
+        }
+        addr = next > addr ? next : addr + si.dwPageSize;
+    }
+    return matches_.size();
+}
 
 size_t MemScan::first_scan(const Value &v) {
     reset();
@@ -137,15 +191,7 @@ bool MemScan::read(size_t i, Value &out) const {
     return true;
 }
 
-void MemScan::write(uintptr_t addr, const Value &v) {
-    void *p = (void *)addr;
-    size_t n = v.size();
-    DWORD old;
-    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) return;
-    memcpy(p, &v.i64, n);
-    DWORD tmp;
-    VirtualProtect(p, n, old, &tmp);
-}
+void MemScan::write(uintptr_t addr, const Value &v) { poke(addr, v); }
 
 void MemScan::apply_frozen() {
     for (auto &f : frozen) write(f.addr, f.value);
