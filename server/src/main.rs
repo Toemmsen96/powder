@@ -1,13 +1,18 @@
-//! The `powder-server` binary. The online-services server itself is still being ported to Rust; what runs
-//! today is the modding toolchain, so the game's own traffic is still served by the Python server.
+//! The `powder-server` binary. The online-services server is still being ported to Rust: `run` serves HTTPS
+//! (game-data pack + mods) and the CA's revocation list, but not yet the UbiServices routes, NEX, the demux or
+//! Storm, so the game itself still needs the Python server.
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use powder_server::assets::Assets;
 use powder_server::config::Config;
 use powder_server::db::Db;
+use powder_server::https::{self, HttpState};
 use powder_server::logging;
 use powder_server::mods::ModHost;
 use powder_server::repos::Repos;
+use powder_server::tls;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +34,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the server (the default).
+    Run,
     /// Load the configured mods and print what they registered, then exit (no server, no saved state).
     Mods,
 }
@@ -36,11 +43,43 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(Some(&cli.config))?;
-    logging::setup(None, &config.server.log_level);
-    match cli.command {
-        Some(Command::Mods) => check_mods(&config),
-        None => bail!("the Rust server is still being ported; for now try `powder-server mods`"),
+    match cli.command.unwrap_or(Command::Run) {
+        Command::Run => {
+            logging::setup(Some(&config.data_dir().join("logs")), &config.server.log_level);
+            tokio::runtime::Runtime::new()?.block_on(run(config))
+        }
+        Command::Mods => {
+            logging::setup(None, &config.server.log_level);
+            check_mods(&config)
+        }
     }
+}
+
+async fn run(config: Config) -> Result<()> {
+    let config = Arc::new(config);
+    log::info!(target: "powder", "Powder {} ({}): config {}", version(), config.server.name,
+               config.path.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "(defaults)".into()));
+    let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
+    db.migrate()?;
+    log::info!(target: "powder", "data: {} (schema v{})", config.data_dir().display(), db.version()?);
+    let assets = if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() };
+    let mods = ModHost::load(&config, Arc::new(Repos::new(db)));
+    let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
+    log::info!(target: "powder", "local CA thumbprint {}", pki.ca_thumbprint()?);
+    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX, demux, Storm (use the Python server to play)");
+
+    let addr = |port: u16| -> Result<SocketAddr> {
+        format!("{}:{port}", config.server.bind).parse().with_context(|| format!("[server] bind {:?}", config.server.bind))
+    };
+    let state = Arc::new(HttpState { config: config.clone(), assets: Arc::new(assets),
+                                     mods: Some(Arc::new(parking_lot::Mutex::new(mods))) });
+    let crl_paths = std::iter::once(tls::CRL_PATH).chain(tls::LEGACY_CRL_PATHS.iter().copied()).map(String::from).collect();
+    let crl_pki = pki.clone();
+    tokio::try_join!(
+        https::serve(addr(config.server.https_port)?, pki.server_config()?, state),
+        https::serve_plain(addr(config.server.crl_port)?, crl_paths, "application/pkix-crl", move || crl_pki.crl()),
+    )?;
+    Ok(())
 }
 
 /// Load the mods against a throwaway in-memory database (so a mod's setup can save/load without touching the

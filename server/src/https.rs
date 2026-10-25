@@ -254,6 +254,11 @@ async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, req
 pub async fn serve(addr: SocketAddr, tls: Arc<ServerConfig>, state: Arc<HttpState>) -> Result<()> {
     let listener = TcpListener::bind(addr).await.with_context(|| format!("HTTPS on {addr}"))?;
     log::info!(target: "powder.https", "listening on {addr}");
+    serve_on(listener, tls, state).await
+}
+
+/// [`serve`] on a listener that is already bound.
+pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<HttpState>) -> Result<()> {
     let acceptor = TlsAcceptor::from(tls);
     loop {
         let (tcp, peer) = match listener.accept().await {
@@ -390,6 +395,39 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap(), json!({"seen": "/v1/spaces/abc", "ip": "127.0.0.1"}));
         assert_eq!(header(&r, "x-mod"), Some("m"));
         assert_eq!(header(&r, "content-type"), Some(JSON));
+    }
+
+    /// A real TLS connection: the local CA's server certificate, SNI, hyper, the pipeline.
+    #[tokio::test]
+    async fn end_to_end_over_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pki = crate::tls::ensure_pki(dir.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_on(listener, pki.server_config().unwrap(), Arc::new(state(vec![], None))));
+
+        let mut roots = RootCertStore::empty();
+        let ca = std::fs::read(&pki.ca_pem).unwrap();
+        for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions().unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("public-ubiservices.ubi.com").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap();
+        tls.write_all(b"GET /v1/nothing HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\nConnection: close\r\n\r\n")
+            .await.unwrap();
+        let mut out = vec![];
+        let _ = tls.read_to_end(&mut out).await; // a peer closing without close_notify is fine here
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.ends_with("\r\n\r\n{}"), "{text}");
     }
 
     #[test]
