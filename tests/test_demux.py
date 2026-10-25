@@ -33,6 +33,33 @@ def test_pb_round_trip():
         pb.decode(b"\x0a\x05ab")                             # truncated
 
 
+def test_huge_lengths_are_errors():
+    for n in (2**64 - 1, 2**64 - 2, 2**63):
+        raw = b"\x0a" + pb.varint(n) + b"\x01"
+        with pytest.raises(pb.DecodeError, match="truncated"):
+            pb.decode(raw)
+        assert pb.try_decode(raw) is None
+    for short in (b"\x09\x01\x02\x03", b"\x0d\x01\x02\x03"):         # fixed64 / fixed32
+        assert pb.try_decode(short) is None
+
+
+async def test_messages_are_read_within_the_limit():
+    from powder.server.transport.demux.connection import MAX_MESSAGE, read_message
+    reader = asyncio.StreamReader()
+    reader.feed_data(pb.frame(b"\x08\x01"))
+    assert await read_message(reader, "p") == b"\x08\x01"
+    reader.feed_data((MAX_MESSAGE + 1).to_bytes(4, "big"))          # over the limit: refused from the header
+    assert await read_message(reader, "p") is None
+    reader = asyncio.StreamReader()                                   # a header announcing more than follows
+    reader.feed_data(MAX_MESSAGE.to_bytes(4, "big") + b"0123456789")
+    reader.feed_eof()
+    with pytest.raises(asyncio.IncompleteReadError):
+        await read_message(reader, "p")
+    reader = asyncio.StreamReader()                                   # exactly the limit is fine
+    reader.feed_data(pb.frame(b"\x07" * MAX_MESSAGE))
+    assert len(await read_message(reader, "p")) == MAX_MESSAGE
+
+
 def test_request_styles_and_id_rewrite():
     nested = pb.encode([(1, [(1, 7), (14, [(1, 3280)])])])
     req = parse_request("ownership_service", nested)
