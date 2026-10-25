@@ -1,6 +1,6 @@
 //! The `powder-server` binary. The online-services server is still being ported to Rust: `run` serves HTTPS
-//! (game-data pack + mods) and the CA's revocation list, but not yet the UbiServices routes, NEX, the demux or
-//! Storm, so the game itself still needs the Python server.
+//! (game-data pack + mods), the CA's revocation list, NEX (recorded replies + mods) and Storm, but not yet the
+//! UbiServices routes, the NEX handlers or the demux, so the game itself still needs the Python server.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -173,12 +173,21 @@ async fn run(config: Config) -> Result<()> {
     let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
     db.migrate()?;
     log::info!(target: "powder", "data: {} (schema v{})", config.data_dir().display(), db.version()?);
-    let assets = if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() };
-    let mods = ModHost::load(&config, Arc::new(Repos::new(db)));
+    let assets = Arc::new(if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() });
+    let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, Arc::new(Repos::new(db)))));
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
-    log::info!(target: "powder", "local CA thumbprint {}", pki.ca_thumbprint()?);
-    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX, demux (use the Python server to play)");
+    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX handlers, demux (use the Python server to play)");
     let s = &config.server;
+    let addr = |port: u16| -> Result<SocketAddr> {
+        format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))
+    };
+
+    // The NEX handshake is signed with this key; its public half goes into the rendezvous config.
+    let signing_key = powder_server::nex::secure::load_or_create_signing_key(&config.data_dir().join("nex_signing_key.pem"))?;
+    let dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
+    powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port).await?;
+    log::info!(target: "powder", "NEX listening on udp {}:{} (game reaches it at {})", s.bind, s.nex_port, s.public_host);
+
     if config.multiplayer.storm == "powder" {
         match powder_server::storm::start(&s.bind, s.storm_port).await {
             Ok(_) => log::info!(target: "powder", "Storm (peer-to-peer helpers) on udp {}:{}-{}", s.bind,
@@ -188,18 +197,17 @@ async fn run(config: Config) -> Result<()> {
         }
     }
 
-    let addr = |port: u16| -> Result<SocketAddr> {
-        format!("{}:{port}", config.server.bind).parse().with_context(|| format!("[server] bind {:?}", config.server.bind))
-    };
-    let state = Arc::new(HttpState { config: config.clone(), assets: Arc::new(assets),
-                                     mods: Some(Arc::new(parking_lot::Mutex::new(mods))) });
     let crl_paths = std::iter::once(tls::CRL_PATH).chain(tls::LEGACY_CRL_PATHS.iter().copied()).map(String::from).collect();
-    let crl_pki = pki.clone();
-    tokio::try_join!(
-        https::serve(addr(config.server.https_port)?, pki.server_config()?, state),
-        https::serve_plain(addr(config.server.crl_port)?, crl_paths, "application/pkix-crl", move || crl_pki.crl()),
-    )?;
-    Ok(())
+    let (crl_pki, crl_addr) = (pki.clone(), addr(s.crl_port)?);
+    tokio::spawn(async move {
+        // returns only if the port can't be bound
+        if let Err(e) = https::serve_plain(crl_addr, crl_paths, "application/pkix-crl", move || crl_pki.crl()).await {
+            log::warn!(target: "powder", "cannot serve the CRL ({e:#}): Ubisoft Connect will reject our certificate");
+        }
+    });
+    log::info!(target: "powder", "HTTPS on {}:{} (local CA {})", s.bind, s.https_port, pki.ca_thumbprint()?);
+    let state = Arc::new(HttpState { config: config.clone(), assets, mods: Some(mods) });
+    https::serve(addr(s.https_port)?, pki.server_config()?, state).await
 }
 
 /// Load the mods against a throwaway in-memory database (so a mod's setup can save/load without touching the
