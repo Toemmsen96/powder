@@ -14,3 +14,4 @@ launcher.toml
 /dist/
 /.claude/
 /target/
+native/third_party/

@@ -113,12 +113,13 @@ Open (decide with the user before doing):
   version.dll), forwarding to vers_powder.dll and arming the hook in-process; powder-wrap deploys it into
   Steep's folder, writes powder_tls.pin from server.pem, and sets WINEDLLOVERRIDES=version=n,b. Build with
   native/build.sh (mingw/zig). Fails closed (no pin -> offline), never patches bytes (VMProtect-safe).
-  The injection vector is proven under plain Wine (the proxy loads, DllMain runs, forwarders keep version info
-  working); the offsets are from a live steep.exe memory dump. NOT yet confirmed online against the running
-  game. First live test (POWDER_SERVER unchanged, just relaunch): powder_tls.log in Steep's folder should show
-  "armed" then "hook hit -> server cert pinned, accept" and the game comes online. Unknowns to watch: whether
-  in-process VirtualProtect(PAGE_GUARD) is allowed under Wine ("could not arm" if not), and whether VMProtect
-  under Wine lets the guard fault reach our VEH.
+  CONFIRMED ONLINE 2026-10-25 (Linux/Proton, the user's PC): powder_tls.log showed the armer patch the
+  function and `verify #N -> server cert pinned, accept`, and the game went online. On Linux the final
+  mechanism is a byte-patch, not in-process PAGE_GUARD: VMProtect under Wine blocks the game's own
+  VirtualProtect, so `armer.exe` (launched as a child by the proxy once the code is unpacked) uses
+  VirtualProtectEx to write a 14-byte `jmp` over ssl_verify_cert_chain's entry, redirecting it to our pinned
+  check after a short delay past the startup integrity check. The guard+VEH path in tls_hook.h/hook_guard.c
+  remains the Windows helper's approach. The offsets are from a live steep.exe memory dump.
 - The launcher installs per user, so its elevated hosts step runs a user-writable powder-cli.exe; a
   per-machine install (`PrivilegesRequired=admin`) would close that (needs a Windows test).
 - New CAs could carry EKU serverAuth (today's are trusted by Windows for any purpose within their names),
@@ -171,26 +172,41 @@ permanently; the wrapper does it per session.
 sign-in, friends, graphql, demux (ownership, cloud saves, friends), and it starts Steep (`product 3279 started`).
 The game then stays at "loading, please wait 3/3": its own TLS check rejects the server (two handshakes from the
 game right after start never complete; it sends no request). On Windows the launcher's TLS helper (`native/`,
-injected at game start) handles this; on Linux nothing does yet. After closing, the wrapper's cleanup was
-verified: CA gone from the prefix, server stopped, `/etc/hosts`, sysctl and the system CA store untouched.
+injected at game start) handles this. **On Linux this is now solved too (2026-10-25): the version.dll proxy +
+armer byte-patch make the game accept Powder's pinned certificate and go online** (see the native/ bullet
+above). After closing, the wrapper's cleanup was verified: CA gone from the prefix, server stopped,
+`/etc/hosts`, sysctl and the system CA store untouched.
 
 Never run `admin trust install/remove` without `--wine-prefix` yourself (it changes the system trust store), and
 don't run commands against the user's real prefix or data: test on scratch copies; the game is tested by the user.
 
 ## Next steps
 
-1. The game on Linux: the TLS helper from `native/` is Windows-only so far; getting the game past the loading
-   screen under Wine/Proton is the open problem (the user decides how to approach it).
+1. Done 2026-10-25: the game runs on Linux. The `native/` TLS helper (version.dll proxy + armer byte-patch)
+   gets Steep past the loading screen and online under Wine/Proton (confirmed on the user's PC).
 2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
    Python server in the user's sessions.
    Watch for the hardening (2026-10-25) locking out real clients: "wrong signature" in the log means the
    game fills PRUDP's signature field differently than our vectors (`[server] nex_check_signatures`: "log", the default, only logs; "enforce" refuses; see
    nex/connection.rs); also 401/403 "cors-refused" / "origin not allowed" for Connect's UI, 413 bodies, demux
    frames over 1 MiB, NEX messages over 1 MiB, more than 128 HTTPS connections from one address.
-3. In-game UI from mods (asked for with the admin mod, 2026-10-25). Today: `mods/admin/` is a web page;
-   its broadcast goes out as a `POWDER_ADMIN_MESSAGE` websocket notification (nothing in the game shows it yet)
-   and optionally as a Ubisoft Connect chat DM (`api.admin.chat`, untested: whether Connect's overlay shows
-   a `TEXT_MESSAGE` with `textMessage` in game). Options: (a) check live whether Connect's overlay shows the
-   chat message (quickest in-game text); (b) a client mod (DLL, Windows/launcher only) drawing an overlay
-   (D3D hook) that listens for `POWDER_*` notifications; (c) find a notification type Steep itself displays.
+3. In-game UI from mods (asked for with the admin mod, 2026-10-25). DONE for Linux/Proton: `native/overlay/`
+   is a Dear ImGui overlay (D3D11 Present hook via MinHook; the version.dll proxy LoadLibrary's it when
+   powder-wrap runs with POWDER_OVERLAY=1). Toggle HOME. Server tab = the admin actions over
+   `/_powder/admin/api/*` (needs POWDER_SERVER=rust); Debug tab = status, the broadcast feed (new `feed`
+   action in mods/admin/mod.lua), FPS, HTTP log, and a generic in-process memory scanner. Build with
+   `native/build.sh overlay`; `native/bin/nettest.exe` checks the networking without the game. Verified
+   headless: DLL loads, Present hooked, ImGui init, auto-login + players fetched. Deferred: trainer features
+   (need per-feature Steep RE; the scanner is the groundwork); live POWDER_* delivery to non-admin players'
+   overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
+   `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
+   `native/build.ps1` overlay target for Windows builds.
 4. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
+5. Linux launcher GUI (asked for 2026-10-25): a desktop app to pick/enable server mods, add/remove servers
+   (Join addresses with their pinned `host#<fingerprint>`), choose POWDER_SERVER python|rust and
+   POWDER_OVERLAY, and launch Steep via powder-wrap. Today the Linux "launcher" is only the powder-wrap
+   shell script set as Lutris' Command prefix; the Python launcher GUI is Windows-oriented.
+6. Server management interface (asked for 2026-10-25): access control for a Powder server - whitelist /
+   blacklist mode, add/remove players, ban/kick - enforced in the accounts/sign-in + NEX/HTTPS auth paths,
+   with admin CLI commands and an entry in the admin mod (web + the new overlay). Decide storage (config vs
+   DB) and enforcement points with the user.

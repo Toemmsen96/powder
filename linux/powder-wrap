@@ -262,6 +262,23 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
             winereg add 'HKCU\Software\Wine\DllOverrides' /v version /t REG_SZ /d native,builtin /f
             helper="$sdir"
             say "TLS helper in $sdir (its log: $sdir/powder_tls.log)"
+
+            # ---- optional in-game overlay (native/overlay/): the version.dll proxy loads it once the game
+            # code is unpacked. Opt in with POWDER_OVERLAY=1; the admin tab needs POWDER_SERVER=rust. ---------
+            if [ "${POWDER_OVERLAY:-}" = 1 ]; then
+                ov="$REPO/native/bin/powder_overlay.dll"
+                if [ -f "$ov" ]; then
+                    cp -f "$ov" "$sdir/powder_overlay.dll"
+                    rm -f "$sdir/powder_overlay.log"
+                    p=$(https_port)
+                    url="https://public-ubiservices.ubi.com"
+                    [ "$p" != 443 ] && url="$url:$p"
+                    printf '%s\n' "$url" > "$sdir/powder_overlay.cfg"
+                    say "in-game overlay in $sdir (press Home in-game; admin tab needs POWDER_SERVER=rust)"
+                else
+                    say "overlay not built (run 'native/build.sh overlay'): skipping POWDER_OVERLAY"
+                fi
+            fi
         fi
     fi
 
@@ -270,6 +287,8 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         # powder_tls.log is kept (it is the helper's diagnostic; the next session resets it)
         if [ -n "$helper" ]; then
             rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/armer.exe" "$helper/powder_tls.pin"
+            # the overlay (if it was deployed); powder_overlay.log is kept, like powder_tls.log
+            rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg"
             winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
         fi
         if winereg delete "$key" /f; then

@@ -54,6 +54,16 @@ static DWORD WINAPI worker(LPVOID p) {
     // the code is unpacked: tell armer it may act, and launch it to patch the function
     tls_log("attach: target=%p pid=%lu pin=%s", (void *)g_target, GetCurrentProcessId(), g_have_pin ? "yes" : "MISSING");
     launch_armer();
+    // optional in-game overlay (powder-wrap deploys it beside this DLL when POWDER_OVERLAY=1): load it now
+    // that the code is unpacked. Absent by default, so this is a no-op unless the user opted in.
+    {
+        wchar_t overlay[MAX_PATH];
+        _snwprintf(overlay, MAX_PATH, L"%spowder_overlay.dll", g_dir);
+        if (GetFileAttributesW(overlay) != INVALID_FILE_ATTRIBUTES) {
+            HMODULE m = LoadLibraryW(overlay);
+            tls_log(m ? "loaded powder_overlay.dll" : "could not load powder_overlay.dll (%lu)", GetLastError());
+        }
+    }
     // after armer patches, each certificate check calls tls_replacement (which logs "verify -> ..."); report
     // how many have run so the log shows whether the patch took and what it decided
     LONG seen = -1;

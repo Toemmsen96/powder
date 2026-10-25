@@ -367,6 +367,14 @@ return function(api)
         return json(200, { ok = true, result = value })
     end
 
+    -- recent broadcasts, so the in-game overlay (and any poller) can show them; kept in memory only
+    local feed, feed_seq, FEED_MAX = {}, 0, 50
+    local function feed_push(from, message)
+        feed_seq = feed_seq + 1
+        feed[#feed + 1] = { n = feed_seq, from = from, message = message }
+        if #feed > FEED_MAX then table.remove(feed, 1) end
+    end
+
     local actions = {}
 
     function actions.players(req, admin)
@@ -414,11 +422,22 @@ return function(api)
                 end
             end
         end
+        feed_push(admin.name, text)
         api.log.info(admin.name, "broadcast to", sockets, "websocket(s),", chats, "chat(s):", text)
         return json(200, { ok = true, result = { websockets = sockets, chats = chats } })
     end
 
-    local READS = { players = true, player = true }
+    -- recent broadcasts since the given sequence number (for the in-game overlay's feed)
+    function actions.feed(req)
+        local since = math.tointeger(tonumber(query_param(req, "since"))) or 0
+        local entries = {}
+        for _, e in ipairs(feed) do
+            if e.n > since then entries[#entries + 1] = e end
+        end
+        return json(200, { entries = entries, last = feed_seq })
+    end
+
+    local READS = { players = true, player = true, feed = true }
 
     api.before_http("*", "/_powder/admin*", function(req)
         local path, method = req.path, req.method
