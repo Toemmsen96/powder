@@ -218,23 +218,36 @@ impl AccountService {
     }
 
     // ---- accounts ---------------------------------------------------------------------------------------------
-    /// A player registering (the launcher): refused while [players] registration = "closed".
+    /// A player registering on the server's own PC: refused while [players] registration = "closed".
     pub fn register(&self, email: &str, password: &str, name: &str) -> Result<AccountRow> {
+        self.register_from(email, password, name, "127.0.0.1")
+    }
+
+    /// A player registering from `client_ip` (the launcher's /_powder/account/register): refused while
+    /// [players] registration = "closed". Only from the server's own PC (loopback) may the first account take
+    /// over the default player; from elsewhere it gets a new player, so a stranger can't claim the host's
+    /// (imported) progress on a fresh server.
+    pub fn register_from(&self, email: &str, password: &str, name: &str, client_ip: &str) -> Result<AccountRow> {
         if self.config.players.registration == Registration::Closed {
             return account_err("This server does not take registrations; ask its host for an account.");
         }
-        self.create_account(email, password, name)
+        self.new_account(email, password, name, may_take_over(client_ip))
     }
 
     /// A new account with its own player (the host's `admin account-create`, or `register`). The first account on
     /// a server takes over the existing default player (and its progress) if no account owns it yet.
     pub fn create_account(&self, email: &str, password: &str, name: &str) -> Result<AccountRow> {
+        self.new_account(email, password, name, true)
+    }
+
+    fn new_account(&self, email: &str, password: &str, name: &str, take_over: bool) -> Result<AccountRow> {
         let (email, name) = (email.trim(), name.trim());
         self.check_email(email, None)?;
         check_new_password(password)?;
         let password_hash = hash_password(password);
         let (account_id, profile_id) = self.repos.db.tx(|| -> anyhow::Result<Result<(String, String)>> {
-            let profile_id = match self.claimable_player()? {
+            let claimable = if take_over { self.claimable_player()? } else { None };
+            let profile_id = match claimable {
                 None => {
                     if let Err(e) = self.check_name(name, None)? {
                         return Ok(Err(e));
@@ -269,6 +282,14 @@ impl AccountService {
             Some(pid) => self.repos.player(&pid)?.map(|p| p.name),
             None => None,
         })
+    }
+
+    /// The same for a registration from `client_ip` (see register_from).
+    pub fn claimable_player_name_for(&self, client_ip: &str) -> anyhow::Result<Option<String>> {
+        if !may_take_over(client_ip) {
+            return Ok(None);
+        }
+        self.claimable_player_name()
     }
 
     fn claimable_player(&self) -> anyhow::Result<Option<String>> {
@@ -468,6 +489,15 @@ impl AccountService {
     }
 }
 
+/// Whether a registration from this address may take over the default player: only from the server's own PC.
+fn may_take_over(client_ip: &str) -> bool {
+    match client_ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 fn check_new_password(password: &str) -> Result<()> {
     if password.chars().count() < MIN_PASSWORD {
         return Err(Error::Account(format!("The password needs at least {MIN_PASSWORD} characters.")));
@@ -623,6 +653,22 @@ mod tests {
         // a panic inside gives its slot back
         let _ = std::panic::catch_unwind(|| SLOTS.run(|| panic!("inside")));
         assert_eq!(*SLOTS.busy.lock(), 0);
+    }
+
+    #[test]
+    fn only_the_servers_pc_takes_over_the_default_player() {
+        let acc = service(Config::default());
+        let host = acc.login(&LoginRequest::new("127.0.0.1", "", "")).unwrap().profile_id().to_string();
+        assert!(acc.claimable_player_name_for("192.168.1.20").unwrap().is_none());
+        assert!(acc.claimable_player_name_for("::ffff:127.0.0.1").unwrap().is_some());
+        let stranger = acc.register_from("s@example.org", "correct horse", "Stranger", "192.168.1.20").unwrap();
+        assert_ne!(stranger.profile_id, host);
+        assert!(acc.claimable_player_name_for("127.0.0.1").unwrap().is_none(), "an account exists now");
+        assert!(may_take_over("::1") && may_take_over("127.0.0.2") && !may_take_over("10.0.0.1") && !may_take_over(""));
+        // the host's own ways still take it over
+        let acc = service(Config::default());
+        let host = acc.login(&LoginRequest::new("127.0.0.1", "", "")).unwrap().profile_id().to_string();
+        assert_eq!(acc.create_account("h@example.org", "correct horse", "Host").unwrap().profile_id, host);
     }
 
     #[test]

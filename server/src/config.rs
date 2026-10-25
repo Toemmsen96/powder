@@ -96,7 +96,8 @@ pub struct PlayersConfig {
     /// Client IP -> profile id (legacy, before accounts).
     pub bind: BTreeMap<String, String>,
     /// "open": anyone who reaches the server can register an account; "closed": only the host creates
-    /// accounts (`admin account-create`).
+    /// accounts (`admin account-create`). Either way only a registration from the server's own PC (or
+    /// `admin account-create`) takes over the default player as the first account.
     pub registration: Registration,
 }
 

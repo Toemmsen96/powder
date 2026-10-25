@@ -25,7 +25,8 @@ strict_tickets = false      # true: refuse requests with tickets the server did 
 [players]
 # Players sign in with accounts (registered in the launcher). Only while a server has no account yet:
 # default = "<profile id>"  # the player every login becomes. Unset: the imported player, or else the
-#                           # first player, created on the first login. The first account takes it over.
+#                           # first player, created on the first login. The first account takes it over
+#                           # if registered on this PC (launcher) or made with `admin account-create`.
 # [players.bind]            # (legacy, before accounts) a client IP -> its own player
 # "192.168.1.20" = "<profile id>"
 

@@ -147,7 +147,7 @@ fn account_call(c: &Ctx, change: Option<Change>) -> Reply {
     }
     let accounts = &st.accounts;
     let result = match change {
-        None => accounts.register(&email, &field(&body, "password"), &field(&body, "name")),
+        None => accounts.register_from(&email, &field(&body, "password"), &field(&body, "name"), &ip),
         Some(change) => accounts.authenticate(&email, &field(&body, "password")).and_then(|account| {
             limiter.succeeded(&ip, &email);
             change(accounts, account, &body)
@@ -184,9 +184,10 @@ fn account_name(c: &Ctx) -> Reply {
     }))
 }
 
-/// What registering would do here: take over an existing player (the first account on a server).
+/// What registering would do here: take over an existing player (the first account on a server, registered
+/// from the server's own PC; services/accounts.rs register_from).
 fn account_new(c: &Ctx) -> Reply {
-    match c.state.accounts.claimable_player_name() {
+    match c.state.accounts.claimable_player_name_for(&c.req.client_ip()) {
         Ok(name) => Reply::json(&json!({"takes_over": name}), "powder-account", 200),
         Err(e) => Reply::internal_error(&e),
     }
@@ -273,6 +274,33 @@ mod tests {
                                                              "new_password": "brand new secret"}));
         assert_eq!(r.status, 200);
         assert!(st.accounts.authenticate("moved@example.com", "brand new secret").is_ok());
+    }
+
+    /// A fresh server: only a registration from its own PC takes over the default player (and its progress).
+    #[test]
+    fn only_the_servers_pc_takes_over_the_player() {
+        for public in [false, true] {
+            let mut config = Config::default();
+            config.server.public = public;
+            let (st, name) = with_player(config);
+            let pid = st.accounts.default_profile_id().unwrap();
+            let remote = |path: &str, body: Option<Value>| {
+                let mut r = req_from("203.0.113.7", if body.is_some() { "POST" } else { "GET" }, path, &[]);
+                r.body = Bytes::from(body.map(|b| crate::util::dumps(&b)).unwrap_or_default());
+                handle(&st, &r)
+            };
+            assert_eq!(body(&remote("/_powder/account/new", None)), json!({"takes_over": null}));
+            let r = remote("/_powder/account/register",
+                           Some(json!({"email": "stranger@example.com", "password": PASSWORD, "name": "Stranger"})));
+            assert_eq!(r.status, 200);
+            assert_ne!(body(&r)["profile_id"], pid.as_str(), "a new player, not the host's");
+            assert_eq!(st.repos.player(&pid).unwrap().unwrap().name, name, "the default player untouched");
+            assert!(st.repos.account_by_profile(&pid).unwrap().is_none());
+        }
+        // from the server's PC (also over IPv6): taken over
+        let (st, name) = with_player(Config::default());
+        let r = handle(&st, &req_from("[::1]", "GET", "/_powder/account/new", &[]));
+        assert_eq!(body(&r), json!({"takes_over": name}));
     }
 
     #[test]
