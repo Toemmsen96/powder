@@ -28,6 +28,7 @@ import uuid
 
 from aiohttp import web
 
+from ...util import clip
 from .keys import DATA_DIR, HOW, SERVICES, SESSION
 from .routes_ubi import accounts_required, acting, forbidden, json_response, no_session
 
@@ -102,7 +103,7 @@ async def ugc_create(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     pictures = {field: body.pop(field, None) for field in FILE_FIELDS}
-    log.info("ugc create from %s (%d B): %s", me, len(raw), json.dumps(body)[:1500])
+    log.info("ugc create from %s (%d B): %s", me, len(raw), clip(json.dumps(body)))
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     type_id = _int(body.get("typeId", body.get("type_id"))) or 0
     world_id = _int(body.get("worldId", body.get("world_id", metadata.get("worldId"))))

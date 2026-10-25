@@ -15,8 +15,8 @@ from aiohttp import web
 
 from ...constants import APP_ID, SPACE_ID
 from ...services import friends
-from ...util import iso_now
-from .keys import HOW, SERVICES
+from ...util import clip, iso_now
+from .keys import HOW, SERVICES, SESSION
 from .routes_ubi import acting, json_response, reader
 
 log = logging.getLogger("powder.https")
@@ -325,7 +325,7 @@ async def channels_mine(request: web.Request) -> web.Response:
 
 async def channel_create(request: web.Request) -> web.Response:
     body = await _json_body(request)
-    log.info("channel create request from %s: %s", _me(request), json.dumps(body)[:2000])
+    log.info("channel create request from %s: %s", _me(request), clip(json.dumps(body)))
     data = _services(request).channels.create(_me(request) or "", request.match_info["space"], body)
     return json_response(request, data, "channel-created")
 
@@ -334,7 +334,7 @@ async def channel_messages(request: web.Request) -> web.Response:
     channels, cid = _services(request).channels, request.match_info["channel"]
     if request.method == "POST":
         body = await _json_body(request)
-        log.info("channel %s message from %s: %s", cid, _me(request), json.dumps(body)[:2000])
+        log.info("channel %s message from %s: %s", cid, _me(request), clip(json.dumps(body)))
         if body.get("type") == "GAME_INVITE":
             # Accepting needs Ubisoft Connect's own pages (pop-up, chat), which can't be shown here: refuse,
             # so the inviting game says the invite failed instead of nothing happening for the friend.
@@ -355,7 +355,7 @@ async def send_notification(request: web.Request) -> web.Response:
     "Spectate" asks the friend this way, STEEP_SPECTATOR). Delivered over the target's notification
     websocket; the request is logged, as no recording of one exists."""
     body, sender, target = await _json_body(request), _me(request), _pid(request)
-    log.info("notification from %s to %s: %s", sender, target, json.dumps(body)[:2000])
+    log.info("notification from %s to %s: %s", sender, target, clip(json.dumps(body)))
     kind = body.get("notificationType") or body.get("type") or ""
     content = body.get("content", body)
     sent = await _services(request).sessions.push_ws(target, kind, content, source={"profileId": sender},

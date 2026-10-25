@@ -91,6 +91,29 @@ def test_change_email_and_password(services, player):
     services.accounts.authenticate("new@example.com", "another password")
 
 
+def test_remember_me_tickets_are_stored_hashed_and_expire(services, player):
+    """The database holds `sha256:<hex>`, not the ticket; a row holding the ticket itself (older servers, the
+    Rust server) works once more and is then stored hashed; a ticket older than TTL_DAYS is gone."""
+    import hashlib
+    from powder.server.util import iso_now
+    repo = services.repos.remember_tickets
+    acc = services.accounts.register("host@example.com", PASSWORD, "")
+    repo.add("rm-ticket", acc.account_id)
+    rows = services.db.execute("SELECT ticket FROM remember_tickets").fetchall()
+    assert [r["ticket"] for r in rows] == ["sha256:" + hashlib.sha256(b"rm-ticket").hexdigest()]
+    assert repo.account("rm-ticket") == acc.account_id
+    assert repo.account(rows[0]["ticket"]) is None, "the stored value is no ticket"
+    services.db.execute("INSERT INTO remember_tickets(ticket, account_id, created_at) VALUES (?,?,?)",
+                        ("plain-ticket", acc.account_id, iso_now()))
+    assert repo.account("plain-ticket") == acc.account_id
+    stored = {r["ticket"] for r in services.db.execute("SELECT ticket FROM remember_tickets").fetchall()}
+    assert "plain-ticket" not in stored and repo.stored("plain-ticket") in stored
+    assert repo.account("plain-ticket") == acc.account_id
+    services.db.execute("UPDATE remember_tickets SET created_at = ?", (iso_now(-(repo.TTL_DAYS * 86400 + 60)),))
+    assert repo.account("rm-ticket") is None
+    assert services.db.execute("SELECT COUNT(*) AS n FROM remember_tickets").fetchone()["n"] == 0
+
+
 async def test_launcher_account_api(client, services):
     r = await client.get("/_powder/account/new")
     assert (await r.json())["takes_over"] == syn.PLAYER_NAME
@@ -361,3 +384,9 @@ def test_the_rust_servers_settings_load(tmp_path):
     path.write_text('[players]\nregistration = "maybe"\n', encoding="utf-8")
     with pytest.raises(ValueError):
         Config.load(path)
+
+
+def test_log_lines_keep_players_texts_short():
+    from powder.server.util import clip
+    assert clip("short") == "short"
+    assert clip("x" * 500) == "x" * 200 + "... (500 chars)"

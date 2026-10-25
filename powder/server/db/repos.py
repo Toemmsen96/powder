@@ -1,6 +1,7 @@
 """Thin repositories over the shared Database. All game logic lives in services/, not here."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -306,22 +307,45 @@ class AccountsRepo:
 
 
 class RememberTicketsRepo:
+    """Remember-me tickets handed to Ubisoft Connect. Stored as `sha256:<hex of SHA-256(ticket)>` (whoever reads
+    the database cannot sign in with them; the tickets are long random strings, so no salt or key is needed),
+    and valid for TTL_DAYS after they were handed out (Connect gets a new one at every sign-in). Rows from before
+    (and from servers that store the ticket itself) are accepted once more and then stored hashed."""
+
+    KEEP = 20                                         # per account: the newest ones (one per Connect sign-in)
+    TTL_DAYS = 90
+    PREFIX = "sha256:"
+
     def __init__(self, db: Database):
         self.db = db
 
-    KEEP = 20                                         # per account: the newest ones (one per Connect sign-in)
+    @classmethod
+    def stored(cls, ticket: str) -> str:
+        return cls.PREFIX + hashlib.sha256(ticket.encode()).hexdigest()
 
     def add(self, ticket: str, account_id: str) -> None:
         with self.db.transaction():
             self.db.execute("INSERT OR REPLACE INTO remember_tickets(ticket, account_id, created_at) "
-                            "VALUES (?,?,?)", (ticket, account_id.lower(), utc_now()))
+                            "VALUES (?,?,?)", (self.stored(ticket), account_id.lower(), utc_now()))
             self.db.execute("DELETE FROM remember_tickets WHERE account_id = ? AND rowid NOT IN (SELECT rowid "
                             "FROM remember_tickets WHERE account_id = ? ORDER BY rowid DESC LIMIT ?)",
                             (account_id.lower(), account_id.lower(), self.KEEP))
 
     def account(self, ticket: str) -> str | None:
+        """The account a (live) ticket belongs to; expired tickets are deleted first."""
+        self.db.execute("DELETE FROM remember_tickets WHERE created_at < ?", (utc_now(-self.TTL_DAYS * 86400),))
+        r = self.db.execute("SELECT account_id FROM remember_tickets WHERE ticket = ?",
+                            (self.stored(ticket),)).fetchone()
+        if r:
+            return r["account_id"]
+        if ticket.startswith(self.PREFIX):
+            return None
         r = self.db.execute("SELECT account_id FROM remember_tickets WHERE ticket = ?", (ticket,)).fetchone()
-        return r["account_id"] if r else None
+        if not r:
+            return None
+        self.db.execute("UPDATE OR REPLACE remember_tickets SET ticket = ? WHERE ticket = ?",
+                        (self.stored(ticket), ticket))
+        return r["account_id"]
 
     def revoke_all(self, account_id: str) -> int:
         return self.db.execute("DELETE FROM remember_tickets WHERE account_id = ?",

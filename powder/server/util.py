@@ -11,6 +11,13 @@ def iso_now(delta_s: float = 0) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def clip(text, limit: int = 200) -> str:
+    """`text` for a log line: at most `limit` characters (chat messages, notifications and UGC bodies are the
+    players' own; the log needs only what kind of thing it was)."""
+    text = str(text)
+    return text if len(text) <= limit else f"{text[:limit]}... ({len(text)} chars)"
+
+
 def write_private(path, data: bytes) -> None:
     """Write a file holding a secret (a private key): readable by its owner only (0600 on Unix), also when it
     existed with another mode (set before the secret is written). On Windows the data folder's ACLs apply."""
