@@ -3,6 +3,7 @@
 
 use super::{Ctx, Reply, Route};
 use crate::client_mods;
+use crate::util::unquote_path;
 
 pub fn routes() -> Vec<Route> {
     vec![
@@ -20,8 +21,10 @@ fn client_mod_index(ctx: &Ctx) -> Reply {
     Reply::json(&index, "powder", 200)
 }
 
+/// The launcher quotes each path segment (a space is %20); after decoding, only listed files match.
 fn client_mod_file(ctx: &Ctx) -> Reply {
-    let data = ctx.state.mods.as_ref().and_then(|m| client_mods::file(m.lock().client_mods(), ctx.param("rest")));
+    let rest = unquote_path(ctx.param("rest"));
+    let data = ctx.state.mods.as_ref().and_then(|m| client_mods::file(m.lock().client_mods(), &rest));
     match data {
         Some(bytes) => Reply::new(200, "application/octet-stream", bytes, "powder"),
         None => Reply::new(404, "text/plain; charset=utf-8", b"404: Not Found".to_vec(), "powder"),

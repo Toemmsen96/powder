@@ -126,6 +126,27 @@ fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// A URL path with its %xx escapes decoded (as aiohttp's request.path; "+" stays "+").
+pub fn unquote_path(s: &str) -> String {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push(hi << 4 | lo);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// A float as Python's repr() writes it: shortest round-trip digits, positional between 1e-4 and 1e16,
 /// otherwise scientific with a signed, at least two-digit exponent ("1e+16", "1.5e-05").
 pub fn py_float(f: f64) -> String {
@@ -161,6 +182,12 @@ mod tests {
         assert_eq!(dumps(&v), r#"{"code": 1, "params": {"a": "x", "b": [1, 2.5]}, "facility": "Matchmaking", "n": null}"#);
         assert_eq!(dumps(&json!("é\u{1F600}\"")), r#""\u00e9\ud83d\ude00\"""#);
         assert_eq!(dumps_compact(&json!({"a": [1, true]})), r#"{"a":[1,true]}"#);
+    }
+
+    #[test]
+    fn unquote_paths() {
+        assert_eq!(unquote_path("my%20mod/a+b%2Fc.dll"), "my mod/a+b/c.dll");
+        assert_eq!(unquote_path("bad%zz%4"), "bad%zz%4");
     }
 
     #[test]

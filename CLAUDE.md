@@ -37,6 +37,10 @@ Crate layout (`server/src/`, library `lib.rs` + binary `main.rs`):
 
 CLI: `run` (default), `mods`, `admin trust|players|accounts|account-*`, `gamedata build|verify|zip|install`.
 
+Python tests (`tests/`, pytest; `uv run pytest`): on Linux 4 fail before and after any change
+(`test_launcher.py` run_game tests and `test_packaging.py::test_busy_port_is_detected` need Windows). The launcher's
+client mods are `powder/launcher/mods.py` (+ the "Client mods" step in `session.py`, `tests/test_client_mods.py`).
+
 ### Not ported yet (pick from here)
 
 - HTTPS: `routes_profile.py` (users/me, profiles, friends, graphql…), `routes_ugc.py`, the rest of
@@ -46,7 +50,6 @@ CLI: `run` (default), `mods`, `admin trust|players|accounts|account-*`, `gamedat
 - Services: `matchmaking.py`, `channels.py`, `importer.py`. The cloud-save HTTPS routes must use the same
   `CloudSaveService` as the demux (built in `run`); `/_powder/status` lists `ConnectClients::snapshot()`.
 - Admin: inventory, grant, stats, ledger, events, cloud-saves, scores, achievements, entities, import, reset, offers.
-- Launcher client mods (Python side): see the latest commits / open worktrees.
 - `run` logs a warning listing what is missing; keep it accurate.
 
 ## Conventions
