@@ -12,6 +12,7 @@
 
 use super::{access_log, Ctx, HttpState, Reply, Req, Route};
 use crate::core::identity::parse_authorization;
+use crate::core::sessions::WS_QUEUE;
 use crate::util::{dumps, iso_now, token_hex};
 use futures_util::{SinkExt, StreamExt};
 use hyper::header::HeaderMap;
@@ -20,12 +21,25 @@ use hyper_util::rt::TokioIo;
 use serde_json::json;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 /// The access log's "how" of an accepted upgrade (the server takes the connection over when it sees it).
 pub const HOW: &str = "websocket";
+/// The largest message (and frame) a client may send; a bigger one closes the socket. Clients send nothing we
+/// use (what arrives is only logged): 64 KiB is plenty (tungstenite's default was 64 MiB).
+pub const MAX_INCOMING: usize = 64 << 10;
+
+/// The server's side of an upgraded connection, with the limits.
+async fn server_stream<S>(io: S) -> WebSocketStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limit = Some(MAX_INCOMING);
+    let config = WebSocketConfig { max_message_size: limit, max_frame_size: limit, ..Default::default() };
+    WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await
+}
 
 pub fn routes() -> Vec<Route> {
     vec![
@@ -82,8 +96,7 @@ fn accept(req: &Req) -> Option<Vec<(String, String)>> {
 pub async fn run(state: Arc<HttpState>, req: Req, upgrade: OnUpgrade) {
     match upgrade.await {
         Ok(upgraded) => {
-            let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
-            if let Err(e) = talk(&state, &req, ws).await {
+            if let Err(e) = talk(&state, &req, server_stream(TokioIo::new(upgraded)).await).await {
                 log::warn!(target: "powder.https", "websocket from {}: {e:#}", req.peer);
             }
         }
@@ -111,7 +124,7 @@ where
                        "content": {"connectionId": connection_id, "contactUrl": contact}, "datePosted": iso_now()});
     ws.send(Message::text(dumps(&hello))).await?;
 
-    let (tx, mut pushed) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut pushed) = tokio::sync::mpsc::channel(WS_QUEUE);
     let registered = session.as_ref().map(|s| s.channels.add_websocket(tx));
     if let (Some(s), Some(mods)) = (&session, &state.mods) {
         let (mods, event) = (mods.clone(), json!({"profile_id": s.profile_id(), "name": s.player.name,
@@ -186,5 +199,22 @@ mod tests {
             let got = (r.status, r.how.as_str(), r.body.len(), r.headers.len());
             assert_eq!(got, (400, "ws-rejected", 0, 3), "no Content-Type, only CORS headers");
         }
+    }
+
+    /// A client message over MAX_INCOMING ends the socket (an error, logged); smaller ones are only logged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn big_client_messages_close_the_socket() {
+        let st = Arc::new(state(vec![], None));
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let request = req("GET", "/v2/websocket", &[]);
+        let server = tokio::spawn(async move { talk(&st, &request, server_stream(server_io).await).await });
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let hello = client.next().await.unwrap().unwrap();
+        assert!(hello.to_text().unwrap().contains("US_CONNECTION_ESTABLISHED"));
+        client.send(Message::text("x".repeat(MAX_INCOMING))).await.unwrap();
+        client.send(Message::binary(vec![0u8; MAX_INCOMING + 1])).await.unwrap();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+        let error = ended.unwrap_err().to_string();
+        assert!(error.contains("Space limit exceeded") || error.contains("too long"), "{error}");
     }
 }

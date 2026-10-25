@@ -6,8 +6,9 @@
 //! which is what lets the server push messages to a player.
 //!
 //! Sessions are shared as `Arc<PlayerSession>`; the registry's maps sit behind one lock, and pushes copy the
-//! channel out before sending, so nothing is called (or awaited) while it is held. A WebSocket is an unbounded
-//! channel to its connection's task (sending never blocks); a NEX connection is anything implementing NexChannel.
+//! channel out before sending, so nothing is called (or awaited) while it is held. A WebSocket is a bounded
+//! channel to its connection's task (sending never blocks; a slow client's notifications beyond [`WS_QUEUE`] are
+//! dropped, logged); a NEX connection is anything implementing NexChannel.
 
 use crate::core::identity::Player;
 use crate::util::{iso_now, token_urlsafe, unix_now};
@@ -16,9 +17,44 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
 
 pub const SESSION_TTL_S: f64 = 3.0 * 3600.0;
+/// Notifications waiting for one websocket. Its task sends them as they come, so only a client that stopped
+/// reading (or a flood of pushes) fills this; further ones are dropped (logged) instead of piling up in memory.
+pub const WS_QUEUE: usize = 256;
+
+/// The sending end of a websocket's queue (made with `tokio::sync::mpsc::channel(WS_QUEUE)`).
+pub enum WsSender {
+    Bounded(Sender<Value>),
+    /// Tests that do not care about the bound.
+    #[cfg(test)]
+    Unbounded(tokio::sync::mpsc::UnboundedSender<Value>),
+}
+
+impl From<Sender<Value>> for WsSender {
+    fn from(tx: Sender<Value>) -> Self {
+        WsSender::Bounded(tx)
+    }
+}
+
+#[cfg(test)]
+impl From<tokio::sync::mpsc::UnboundedSender<Value>> for WsSender {
+    fn from(tx: tokio::sync::mpsc::UnboundedSender<Value>) -> Self {
+        WsSender::Unbounded(tx)
+    }
+}
+
+impl WsSender {
+    fn try_send(&self, msg: Value) -> Result<(), TrySendError<Value>> {
+        match self {
+            WsSender::Bounded(tx) => tx.try_send(msg),
+            #[cfg(test)]
+            WsSender::Unbounded(tx) => tx.send(msg).map_err(|e| TrySendError::Closed(e.0)),
+        }
+    }
+}
 
 /// A ticket shaped like Ubisoft's (base64 JSON header . payload . MAC), for Ubisoft Connect, in case it reads the
 /// header. The payload is random: only this server ever validates tickets.
@@ -39,7 +75,7 @@ pub trait NexChannel: Send + Sync {
 /// A player's live connections; kept across a re-login (the new session shares them).
 #[derive(Default)]
 pub struct Channels {
-    websockets: Mutex<Vec<(u64, UnboundedSender<Value>)>>,
+    websockets: Mutex<Vec<(u64, WsSender)>>,
     nex: Mutex<Option<Arc<dyn NexChannel>>>,
 }
 
@@ -47,9 +83,9 @@ static NEXT_WS: AtomicU64 = AtomicU64::new(1);
 
 impl Channels {
     /// Register a WebSocket (its task forwards what arrives on the channel); -> id for `remove_websocket`.
-    pub fn add_websocket(&self, tx: UnboundedSender<Value>) -> u64 {
+    pub fn add_websocket(&self, tx: impl Into<WsSender>) -> u64 {
         let id = NEXT_WS.fetch_add(1, Ordering::Relaxed);
-        self.websockets.lock().push((id, tx));
+        self.websockets.lock().push((id, tx.into()));
         id
     }
 
@@ -198,7 +234,8 @@ impl SessionRegistry {
 
     // ---- server push (the seam for notifications and multiplayer) -------------------------------------------
     /// Send a UbiServices notification over the player's WebSocket(s); returns how many got it. `extra`: more
-    /// fields of the notification (e.g. its sender). A closed socket is dropped.
+    /// fields of the notification (e.g. its sender). A closed socket is dropped; a socket whose queue is full
+    /// does not get this one (logged).
     pub fn push_ws(&self, profile_id: &str, notification_type: &str, content: Value, extra: Map<String, Value>)
                    -> usize {
         let Some(s) = self.for_player(profile_id) else { return 0 };
@@ -209,12 +246,17 @@ impl SessionRegistry {
         msg.extend(extra);
         let msg = Value::Object(msg);
         let mut sent = 0;
-        s.channels.websockets.lock().retain(|(_, tx)| match tx.send(msg.clone()) {
+        s.channels.websockets.lock().retain(|(_, tx)| match tx.try_send(msg.clone()) {
             Ok(()) => {
                 sent += 1;
                 true
             }
-            Err(_) => {
+            Err(TrySendError::Full(_)) => {
+                log::warn!(target: "powder.sessions", "push_ws to {profile_id}: {WS_QUEUE} notifications waiting \
+                                                       for its websocket already, {notification_type} dropped");
+                true
+            }
+            Err(TrySendError::Closed(_)) => {
                 log::warn!(target: "powder.sessions", "push_ws to {profile_id} failed: websocket closed");
                 false
             }
@@ -261,6 +303,28 @@ mod tests {
         assert_eq!(a.channels.websocket_count(), 0);
         reg.drop_player("a");
         assert!(reg.by_token(&a2.ticket).is_none() && reg.for_player("a").is_none());
+    }
+
+    /// A websocket that does not keep up: pushes beyond its queue are dropped, it stays registered, and gets the
+    /// next ones once it reads again.
+    #[test]
+    fn a_full_websocket_queue_drops_pushes() {
+        let reg = SessionRegistry::new();
+        let a = reg.issue(player("a"), "10.0.0.1", "");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WS_QUEUE);
+        a.channels.add_websocket(tx);
+        for _ in 0..WS_QUEUE {
+            assert_eq!(reg.push_ws("a", "TEST", json!({}), Map::new()), 1);
+        }
+        assert_eq!(reg.push_ws("a", "LOST", json!({}), Map::new()), 0);
+        assert_eq!(a.channels.websocket_count(), 1);
+        assert_eq!(rx.try_recv().unwrap()["notificationType"], "TEST");
+        assert_eq!(reg.push_ws("a", "AFTER", json!({}), Map::new()), 1);
+        let rest: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!((rest.len(), rest.last().unwrap()["notificationType"].as_str()), (WS_QUEUE, Some("AFTER")));
+        drop(rx);
+        assert_eq!(reg.push_ws("a", "TEST", json!({}), Map::new()), 0);
+        assert_eq!(a.channels.websocket_count(), 0, "closed: forgotten");
     }
 
     #[test]
