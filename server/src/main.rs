@@ -370,6 +370,7 @@ async fn run(config: Config) -> Result<()> {
     let repos = Arc::new(Repos::new(db));
     let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, repos.clone())));
     let services = Arc::new(Services::new(config.clone(), assets.clone(), repos.clone(), Some(mods.clone())));
+    mods.lock().attach(&services);
     let accounts = services.accounts.clone();
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
     log::warn!(target: "powder", "the Rust server is not tested with the game yet: if something fails, try the \

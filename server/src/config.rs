@@ -37,6 +37,9 @@ pub struct ServerConfig {
     /// An internet-facing server: sign-ins always need an account, and /_powder/status shows a caller only
     /// its own connections (no other players' addresses).
     pub public: bool,
+    /// Profile ids of the server's admins (`admin accounts` lists them): who may use admin tools such as
+    /// the admin mod's page. Ids, not emails or names, which players can change.
+    pub admins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -60,6 +63,7 @@ impl Default for ServerConfig {
             name: "Powder".into(),
             motd: String::new(),
             public: false,
+            admins: vec![],
         }
     }
 }

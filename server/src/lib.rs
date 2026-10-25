@@ -16,6 +16,7 @@ pub mod gamedata;
 pub mod https;
 pub mod logging;
 pub mod mods;
+pub mod mods_admin;
 pub mod nex;
 pub mod repos;
 pub mod services;

@@ -26,6 +26,8 @@
 //!   api.before_http(method, glob, fn)   method "GET"/… or "*"; glob matches the URL path (`*` and `?`)
 //!   api.before_rmc(method, fn)          method e.g. "PlayerStatsProtocol::GetProfile_V1"
 //!   api.save(key, value) / api.load(key, default)   per-mod storage (SQLite kv, scope "mod:<name>")
+//!   api.json.{decode,encode}, api.admin.*   JSON, and players / inventory / stats / notifications for admin
+//!                                       tools (see mods_admin.rs; admins are `[server] admins`)
 //!
 //! A hook runs on the request path: `before_http(req) -> response | nil` and `before_rmc(ctx, params) ->
 //! bytes | nil`, where `nil` lets the server answer as usual and the first non-nil wins. Errors raised by a
@@ -33,6 +35,7 @@
 
 use crate::client_mods::{self, ClientMod};
 use crate::config::Config;
+use crate::mods_admin::ServicesSlot;
 use crate::repos::Repos;
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Variadic};
 use parking_lot::Mutex;
@@ -77,6 +80,9 @@ pub struct ModHost {
     config: Json,
     loaded: Vec<String>,
     client: Vec<ClientMod>,
+    /// The services, for `api.admin` (attached once the server has built them).
+    services: ServicesSlot,
+    admins_configured: bool,
 }
 
 impl ModHost {
@@ -90,6 +96,8 @@ impl ModHost {
             config: config_snapshot(config),
             loaded: vec![],
             client: vec![],
+            services: ServicesSlot::default(),
+            admins_configured: !config.server.admins.is_empty(),
         };
         let dir = &config.mods.dir;
         if !dir.is_dir() {
@@ -123,6 +131,11 @@ impl ModHost {
         }
         log::info!(target: "powder.mods", "{} mod(s) loaded, {} with client files", host.loaded.len(), host.client.len());
         host
+    }
+
+    /// Give the mods' `api.admin` the server's services (a weak link: the services own this host).
+    pub fn attach(&self, services: &Arc<crate::services::Services>) {
+        let _ = self.services.set(Arc::downgrade(services));
     }
 
     /// Names of the mods that loaded, in load order.
@@ -192,6 +205,8 @@ impl ModHost {
         api.set("name", name)?;
         api.set("config", self.lua.to_value(&self.config)?)?;
         api.set("log", self.build_log(name)?)?;
+        api.set("json", crate::mods_admin::json_table(&self.lua)?)?;
+        api.set("admin", crate::mods_admin::admin_table(&self.lua, self.services.clone(), self.admins_configured)?)?;
 
         let reg = self.reg.clone();
         let who = name.to_string();

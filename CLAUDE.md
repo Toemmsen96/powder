@@ -143,4 +143,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
    screen under Wine/Proton is the open problem (the user decides how to approach it).
 2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
    Python server in the user's sessions.
-3. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
+3. In-game UI from mods (asked for with the admin mod, 2026-10-25). Today: `mods/admin/` is a web page;
+   its broadcast goes out as a `POWDER_ADMIN_MESSAGE` websocket notification (nothing in the game shows it yet)
+   and optionally as a Ubisoft Connect chat DM (`api.admin.chat`, untested: whether Connect's overlay shows
+   a `TEXT_MESSAGE` with `textMessage` in game). Options: (a) check live whether Connect's overlay shows the
+   chat message (quickest in-game text); (b) a client mod (DLL, Windows/launcher only) drawing an overlay
+   (D3D hook) that listens for `POWDER_*` notifications; (c) find a notification type Steep itself displays.
+4. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
