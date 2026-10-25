@@ -2,8 +2,10 @@
 # powder-wrap: run Ubisoft Connect / Steep (Wine, Proton, Lutris) against a Powder server, changing nothing
 # on the system. Everything lasts only as long as the wrapped command:
 #
-#   - a private network namespace: the session sees loopback only, so the game and Connect cannot reach
-#     Ubisoft (or anything else), and nothing outside sees the session
+#   - a private network namespace: the session sees loopback only, so the game and Connect have no network
+#     route out (to Ubisoft or anywhere else) and nothing on the network sees the session. It is not a
+#     sandbox: the session keeps the host's files, so Unix sockets on the filesystem stay reachable (D-Bus,
+#     X11/Wayland, PulseAudio/PipeWire, systemd-resolved: hence the nsswitch.conf below)
 #   - the Ubisoft hostnames point at 127.0.0.1 through a bind-mounted /etc/hosts (and an nsswitch.conf that
 #     resolves names from it only), inside the session only (no /etc/hosts edit, no sysctl: port 443 can be
 #     bound inside the namespace)
@@ -16,6 +18,7 @@
 #
 # Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (python | rust, default
 # python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version).
+# Log: $XDG_RUNTIME_DIR/powder-wrap.log, without XDG_RUNTIME_DIR ${XDG_CACHE_HOME:-~/.cache}/powder/powder-wrap.log.
 # Close Ubisoft Connect before starting: a Connect already running outside the session would be reused.
 set -euo pipefail
 
@@ -23,7 +26,17 @@ SELF=$(readlink -f "$0")
 REPO=$(cd "$(dirname "$SELF")/.." && pwd)
 CONFIG=${POWDER_CONFIG:-$REPO/config.toml}
 SERVER=${POWDER_SERVER:-python}
-LOG=${XDG_RUNTIME_DIR:-/tmp}/powder-wrap.log
+# never a fixed name in /tmp (anyone could put a link there first); the inner stages use the outer's
+if [ "${POWDER_WRAP_STAGE:-outer}" != outer ] && [ -n "${POWDER_WRAP_LOG:-}" ]; then
+    LOG=$POWDER_WRAP_LOG
+elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -O "$XDG_RUNTIME_DIR" ]; then
+    LOG=$XDG_RUNTIME_DIR/powder-wrap.log
+else
+    LOG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/powder
+    mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
+    LOG=$LOG_DIR/powder-wrap.log
+fi
+export POWDER_WRAP_LOG=$LOG
 HOSTS=(public-ubiservices.ubi.com msr-public-ubiservices.ubi.com public-im-ubiservices.ubi.com
        public-ws-ubiservices.ubi.com steep-prod-pc.steep.olympus.ubi.com
        dmx.upc.ubisoft.com channel-service.upc.ubi.com static3.cdn.ubi.com)
@@ -60,17 +73,18 @@ print((cfg.parent / d).resolve())
 EOF
 }
 
+# the server to run, into the array SERVER_CMD (a repository path with spaces stays one argument)
 server_command() {
     case $SERVER in
     python)
-        if [ -x "$REPO/.venv/bin/powder-server" ]; then echo "$REPO/.venv/bin/powder-server"
-        elif command -v uv >/dev/null; then echo "uv run --frozen --offline --project $REPO powder-server"
-        elif python3 -I -c "import aiohttp, cryptography" 2>/dev/null; then echo "env PYTHONPATH=$REPO python3 -m powder.server"
+        if [ -x "$REPO/.venv/bin/powder-server" ]; then SERVER_CMD=("$REPO/.venv/bin/powder-server")
+        elif command -v uv >/dev/null; then SERVER_CMD=(uv run --frozen --offline --project "$REPO" powder-server)
+        elif python3 -I -c "import aiohttp, cryptography" 2>/dev/null; then SERVER_CMD=(env "PYTHONPATH=$REPO" python3 -m powder.server)
         else die "no Python server to run: no $REPO/.venv, no uv, and the system python3 lacks aiohttp/cryptography (install uv and run 'uv sync' in $REPO, or POWDER_SERVER=rust)"
         fi ;;
     rust)
         for b in "$REPO/target/release/powder-server" "$REPO/target/debug/powder-server"; do
-            [ -x "$b" ] && { echo "$b"; return; }
+            [ -x "$b" ] && { SERVER_CMD=("$b"); return; }
         done
         die "no Rust server built (cargo build --release in $REPO)" ;;
     *) die "POWDER_SERVER must be python or rust, not $SERVER" ;;
@@ -124,7 +138,7 @@ outer)  # ---- as the user: check, then enter a new user + mount + network names
     command -v unshare >/dev/null || die "unshare (util-linux) is needed"
     command -v ip >/dev/null || die "ip (iproute2) is needed"
     say "session log: $LOG"
-    server_command >/dev/null
+    server_command
     export POWDER_WRAP_STAGE=net POWDER_WRAP_UID=$(id -u) POWDER_WRAP_GID=$(id -g)
     exec unshare --user --map-root-user --mount --net --fork -- "$SELF" "$@"
     ;;
@@ -141,8 +155,8 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
     mount --bind "$nss" /etc/nsswitch.conf
     port=$(https_port)
-    # shellcheck disable=SC2046
-    $(server_command) -c "$CONFIG" run >> "$LOG" 2>&1 &
+    server_command
+    "${SERVER_CMD[@]}" -c "$CONFIG" run >> "$LOG" 2>&1 &
     server=$!
     trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"' EXIT
     for _ in $(seq 100); do
@@ -172,7 +186,14 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     # a session that was killed (SIGKILL, power loss) could not take its CA out: do it now, if it was another one
     marker="$WINEPREFIX/.powder-wrap-ca"
     if [ -f "$marker" ] && [ "$(cat "$marker")" != "$key" ]; then
-        winereg delete "$(cat "$marker")" /f && say "removed a CA a previous session left in $WINEPREFIX"
+        old=$(cat "$marker")
+        case $old in                                    # only ever a root-store certificate key
+        'HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates\'[0-9A-F]*)
+            if [ ${#old} -eq ${#key} ] && winereg delete "$old" /f; then
+                say "removed a CA a previous session left in $WINEPREFIX"
+            fi ;;
+        *) say "ignoring $marker: not a CA key" ;;
+        esac
     fi
     printf '%s' "$key" > "$marker"
     winereg import "$reg" || { rm -f "$reg" "$marker"; die "could not add the local CA to $WINEPREFIX (wine: $wine)"; }

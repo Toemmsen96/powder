@@ -463,8 +463,9 @@ copy.
 ## Linux (Lutris, Proton)
 
 `linux/powder-wrap` runs Ubisoft Connect and Steep against Powder for one session and changes nothing on
-the system: the session gets its own network (loopback only: the game and Connect cannot reach Ubisoft or
-anything else), the Ubisoft names point at the server through a private `/etc/hosts`, the Powder server
+the system: the session gets its own network (loopback only: the game and Connect have no network route
+to Ubisoft or anywhere else; it is not a sandbox, Unix sockets on the filesystem such as D-Bus or X11 stay
+reachable), the Ubisoft names point at the server through a private `/etc/hosts`, the Powder server
 runs inside it, and the local CA is trusted by the Wine prefix only while the session lasts. No hosts
 entries, no system CA, no `sysctl`, no root.
 
@@ -472,7 +473,8 @@ In Lutris: Configure the game (Steep, and Ubisoft Connect if you start it on its
 (show advanced options) > **Command prefix**: `/path/to/powder/linux/powder-wrap`. Close Ubisoft Connect
 first, and don't run another Powder server on the same `config.toml`. By hand:
 `WINEPREFIX=~/Games/ubisoft-connect linux/powder-wrap <command>`. Settings: `POWDER_CONFIG`,
-`POWDER_SERVER=python|rust`, `POWDER_WINE`; the server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log`.
+`POWDER_SERVER=python|rust`, `POWDER_WINE`; the server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log`
+(without `XDG_RUNTIME_DIR`: `~/.cache/powder/powder-wrap.log`).
 
 Steep itself still needs the TLS helper the Windows launcher injects; under Linux that is not done yet,
 so for now the session gets Ubisoft Connect online, and the game reports its services unavailable.
