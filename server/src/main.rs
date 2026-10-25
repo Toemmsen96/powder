@@ -110,7 +110,16 @@ async fn run(config: Config) -> Result<()> {
     let mods = ModHost::load(&config, Arc::new(Repos::new(db)));
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
     log::info!(target: "powder", "local CA thumbprint {}", pki.ca_thumbprint()?);
-    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX, demux, Storm (use the Python server to play)");
+    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX, demux (use the Python server to play)");
+    let s = &config.server;
+    if config.multiplayer.storm == "powder" {
+        match powder_server::storm::start(&s.bind, s.storm_port).await {
+            Ok(_) => log::info!(target: "powder", "Storm (peer-to-peer helpers) on udp {}:{}-{}", s.bind,
+                                s.storm_port, s.storm_port + 5),
+            Err(e) => log::warn!(target: "powder", "cannot start Storm on udp {}:{}-{} ({e:#}): multiplayer will \
+                                 not find other players", s.bind, s.storm_port, s.storm_port + 5),
+        }
+    }
 
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", config.server.bind).parse().with_context(|| format!("[server] bind {:?}", config.server.bind))

@@ -14,6 +14,7 @@ pub mod logging;
 pub mod mods;
 pub mod nex;
 pub mod repos;
+pub mod storm;
 pub mod tls;
 pub mod trust;
 pub mod util;
