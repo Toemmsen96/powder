@@ -35,6 +35,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from ...util import make_private, write_private
+
 log = logging.getLogger("powder.nex")
 
 ECK1 = b"ECK1"  # BCRYPT_ECDH_PUBLIC_P256_MAGIC
@@ -58,26 +60,13 @@ def load_or_create_signing_key(path: Path) -> ec.EllipticCurvePrivateKey:
     """Load the server's ECDSA key (PRIVATE: never publish it), creating it on first run. On POSIX the file
     is the owner's only (0600; an existing file's mode is tightened when loaded)."""
     if path.exists():
-        _private_mode(path)
+        make_private(path, log)
         return serialization.load_pem_private_key(path.read_bytes(), password=None)
     key = ec.generate_private_key(ec.SECP256R1())
     path.parent.mkdir(parents=True, exist_ok=True)
-    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                            serialization.NoEncryption())
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(pem)
+    write_private(path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
     return key
-
-
-def _private_mode(path: Path) -> None:
-    """Make a private file readable by its owner only (POSIX; on Windows the folder's ACL decides)."""
-    if os.name != "posix":
-        return
-    mode = path.stat().st_mode
-    if mode & 0o077:
-        path.chmod(0o600)
-        log.info("%s: was readable by others (mode %o), now 0600", path, mode & 0o777)
 
 
 def config_public_key(signing_key: ec.EllipticCurvePrivateKey) -> str:
