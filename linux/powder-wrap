@@ -4,8 +4,9 @@
 #
 #   - a private network namespace: the session sees loopback only, so the game and Connect cannot reach
 #     Ubisoft (or anything else), and nothing outside sees the session
-#   - the Ubisoft hostnames point at 127.0.0.1 through a bind-mounted /etc/hosts, inside the session only
-#     (no /etc/hosts edit, no sysctl: port 443 can be bound inside the namespace)
+#   - the Ubisoft hostnames point at 127.0.0.1 through a bind-mounted /etc/hosts (and an nsswitch.conf that
+#     resolves names from it only), inside the session only (no /etc/hosts edit, no sysctl: port 443 can be
+#     bound inside the namespace)
 #   - the Powder server runs inside the session and stops with it
 #   - the local CA is added to the Wine prefix's own root store for the session and removed afterwards
 #     (the system's CA store is not touched)
@@ -27,8 +28,13 @@ HOSTS=(public-ubiservices.ubi.com msr-public-ubiservices.ubi.com public-im-ubise
        public-ws-ubiservices.ubi.com steep-prod-pc.steep.olympus.ubi.com
        dmx.upc.ubisoft.com channel-service.upc.ubi.com static3.cdn.ubi.com)
 
-say() { printf 'powder-wrap: %s\n' "$*" >&2; }
-die() { say "$*"; exit 1; }
+# Lutris does not show a command prefix's output: messages also go to the log, and a failure to the desktop
+say() { printf 'powder-wrap: %s\n' "$*" >&2; printf 'powder-wrap: %s\n' "$*" >> "$LOG" 2>/dev/null || true; }
+die() {
+    say "$*"
+    command -v notify-send >/dev/null && notify-send -a powder-wrap "Powder: the game was not started" "$*" 2>/dev/null
+    exit 1
+}
 
 # [server] https_port from the config (443 if unset or no config)
 https_port() {
@@ -58,7 +64,9 @@ server_command() {
     case $SERVER in
     python)
         if [ -x "$REPO/.venv/bin/powder-server" ]; then echo "$REPO/.venv/bin/powder-server"
-        else command -v uv >/dev/null || die "no $REPO/.venv (run 'uv sync' in $REPO)"; echo "uv run --frozen --offline powder-server"
+        elif command -v uv >/dev/null; then echo "uv run --frozen --offline --project $REPO powder-server"
+        elif python3 -I -c "import aiohttp, cryptography" 2>/dev/null; then echo "env PYTHONPATH=$REPO python3 -m powder.server"
+        else die "no Python server to run: no $REPO/.venv, no uv, and the system python3 lacks aiohttp/cryptography (install uv and run 'uv sync' in $REPO, or POWDER_SERVER=rust)"
         fi ;;
     rust)
         for b in "$REPO/target/release/powder-server" "$REPO/target/debug/powder-server"; do
@@ -110,13 +118,13 @@ EOF
 case ${POWDER_WRAP_STAGE:-outer} in
 
 outer)  # ---- as the user: check, then enter a new user + mount + network namespace -------------------------
+    : > "$LOG"
     [ $# -gt 0 ] || die "usage: powder-wrap <command...>   (e.g. as Lutris' command prefix; see the top of $SELF)"
     [ -n "${WINEPREFIX:-}" ] || die "WINEPREFIX is not set (Lutris sets it; by hand: WINEPREFIX=... powder-wrap ...)"
     command -v unshare >/dev/null || die "unshare (util-linux) is needed"
     command -v ip >/dev/null || die "ip (iproute2) is needed"
-    server_command >/dev/null
-    : > "$LOG"
     say "session log: $LOG"
+    server_command >/dev/null
     export POWDER_WRAP_STAGE=net POWDER_WRAP_UID=$(id -u) POWDER_WRAP_GID=$(id -g)
     exec unshare --user --map-root-user --mount --net --fork -- "$SELF" "$@"
     ;;
@@ -127,11 +135,16 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     { echo "127.0.0.1 localhost"; echo "::1 localhost ip6-localhost"
       for h in "${HOSTS[@]}"; do echo "127.0.0.1 $h"; done; } > "$hosts"
     mount --bind "$hosts" /etc/hosts
+    # names from that file only: nss-resolve (Arch's default, before "files") would ask systemd-resolved over
+    # its socket, which the network namespace does not cut off, and get Ubisoft's real addresses
+    nss=$(mktemp)
+    sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
+    mount --bind "$nss" /etc/nsswitch.conf
     port=$(https_port)
     # shellcheck disable=SC2046
     $(server_command) -c "$CONFIG" run >> "$LOG" 2>&1 &
     server=$!
-    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts"' EXIT
+    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"' EXIT
     for _ in $(seq 100); do
         (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
         kill -0 "$server" 2>/dev/null || die "the Powder server stopped; see $LOG"
