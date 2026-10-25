@@ -5,6 +5,7 @@ The actual hosts-file write runs elevated in hostsfix.py; this module only check
 """
 from __future__ import annotations
 
+import ipaddress
 import socket
 import subprocess
 from dataclasses import dataclass
@@ -12,7 +13,9 @@ from pathlib import Path
 
 from powder.server.hostnames import REDIRECT_HOSTS
 
-HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
+from .. import paths
+
+HOSTS_PATH = Path(str(paths.system32() / "drivers" / "etc" / "hosts"))
 MARKER = "Powder launcher redirect"
 LEGACY_MARKERS = ("steep-re launcher redirect",     # the launcher before the rename to Powder
                   "steep-re emulator redirect")     # block comment written by tools/redirect.ps1
@@ -30,6 +33,16 @@ def resolve(host: str) -> list[str]:
         return sorted({info[4][0] for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)})
     except socket.gaierror:
         return []
+
+
+def ipv4_of(address: str) -> str | None:
+    """The IPv4 address the hosts entries need for the server `address` (an IPv4 address, or a host name: the
+    first IPv4 address it resolves to); None if it has none."""
+    try:
+        return str(ipaddress.IPv4Address(address))
+    except ValueError:
+        pass
+    return next((a for a in resolve(address) if "." in a and ":" not in a), None)
 
 
 def check(address: str, hosts: list[str] = REDIRECT_HOSTS) -> list[HostStatus]:
@@ -74,5 +87,5 @@ def strip_block(text: str) -> str:
 
 
 def flush_dns() -> None:
-    subprocess.run(["ipconfig", "/flushdns"], capture_output=True,
+    subprocess.run([paths.system_exe("ipconfig.exe"), "/flushdns"], capture_output=True,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

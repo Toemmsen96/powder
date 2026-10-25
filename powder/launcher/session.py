@@ -49,8 +49,13 @@ HOSTS_ADMIN_WHY = ("Changing the hosts file needs admin rights because it is a p
                    "when you click \"{button}\", Windows asks for permission (UAC). Only these lines are {verb}, "
                    "and the current file is backed up first.")
 FIREWALL_WHY = ("Windows Firewall lets other PCs reach this one only for programs it was told about. "
-                "{what} The rules allow only PCs in your local network. Adding them needs admin rights: when you "
-                "click \"Add firewall rules\", Windows asks for permission (UAC). Restore system removes them again.")
+                "{what} The rules allow only PCs in your local network, on networks Windows treats as private. "
+                "Adding them needs admin rights: when you click \"Add firewall rules\", Windows asks for "
+                "permission (UAC). Restore system removes them again.")
+PUBLIC_NETWORK = ("Windows treats the network this PC is on as Public, and the launcher's firewall rules only let "
+                  "other PCs in on private networks (on a public Wi-Fi, \"local network\" means everyone there). If "
+                  "this is your own network, make it private: Settings > Network & internet > Wi-Fi or Ethernet > "
+                  "this network > Network profile type: Private network. Then check again.")
 LOCAL, HOST, JOIN = "local", "host", "join"      # where the server is (the server row)
 
 
@@ -491,12 +496,8 @@ class Session:
             return False
         self.pack_changed = False
         if st is None and self.cfg.server_mode == "local":
-            settings = self.server_config()
-            srv = settings.server
-            needed = [ports.Port(srv.https_port, "TCP", "HTTPS"), ports.Port(srv.crl_port, "TCP", "certificate list"),
-                      ports.Port(srv.nex_port, "UDP", "game server")]
-            if settings.multiplayer.storm == "powder":
-                needed += [ports.Port(srv.storm_port + o, "UDP", "peer-to-peer helper") for o in (0, 1, 2, 3, 5)]
+            srv = self.server_config().server
+            needed = self.server_ports()
             while taken := ports.busy("0.0.0.0" if host_for else srv.bind, needed):
                 self.ask("server", "The local server cannot start: " + "; ".join(taken) + ". Close that program "
                          "(or change the port in config.toml), then check again.", ["Check again"])
@@ -522,11 +523,25 @@ class Session:
                                f"player(s) registered, in the game now: {', '.join(online) or 'nobody'}{hosting}")
         return True
 
+    def server_ports(self) -> list[ports.Port]:
+        """The ports the local server listens on (config.toml)."""
+        settings = self.server_config()
+        srv = settings.server
+        needed = [ports.Port(srv.https_port, "TCP", "HTTPS"), ports.Port(srv.crl_port, "TCP", "certificate list"),
+                  ports.Port(srv.nex_port, "UDP", "game server")]
+        if settings.multiplayer.storm == "powder":
+            needed += [ports.Port(srv.storm_port + o, "UDP", "peer-to-peer helper") for o in (0, 1, 2, 3, 5)]
+        return needed
+
     def firewall_programs(self) -> list[firewall.Program]:
-        """What the other PCs must reach: the game, and when hosting Powder's server program."""
+        """What the other PCs must reach: the game, and when hosting Powder's server program (on its ports)."""
         programs = []
         if self.setup.mode == HOST:
-            programs.append(firewall.Program(Path(paths.self_command()[0]), firewall.SERVER_RULE, ("TCP", "UDP")))
+            listens = self.server_ports()
+            by_protocol = tuple((proto, tuple(p.number for p in listens if p.proto == proto))
+                                for proto in ("TCP", "UDP"))
+            programs.append(firewall.Program(Path(paths.self_command()[0]), firewall.SERVER_RULE, ("TCP", "UDP"),
+                                             by_protocol))
         if self.install:
             programs.append(firewall.Program(self.install.exe, firewall.GAME_RULE, ("UDP",)))
         return programs
@@ -536,7 +551,7 @@ class Session:
             self.set("firewall", OK, "nothing needed (only this PC plays on the server)")
             return True
         programs = self.firewall_programs()
-        ignore_blocks = False
+        ignore_blocks = ignore_public = False
         while True:
             self.set("firewall", RUNNING, "checking Windows Firewall")
             try:
@@ -547,6 +562,10 @@ class Session:
                     self.set("firewall", OK, "not checked: the firewall rules could not be read")
                     return True
                 continue
+            if categories and not firewall.TRUSTED_CATEGORIES & set(categories) and not ignore_public:
+                if self.ask("firewall", PUBLIC_NETWORK, ["Check again", "Continue anyway"]) == "Check again":
+                    continue
+                ignore_public = True
             blocks = [r for p in programs for r in firewall.blocked(p, rules, categories)]
             if blocks and not ignore_blocks:
                 names = ", ".join(f'"{r.name}"' for r in blocks[:3])
@@ -559,6 +578,10 @@ class Session:
                     continue
                 ignore_blocks = True
             missing = [p for p in programs if not firewall.allowed(p, rules, categories)]
+            if missing and ignore_public:
+                self.set("firewall", OK, "not set up: this network is Public in Windows, so other PCs may not be "
+                                         "able to reach this one")
+                return True
             if not missing:
                 self.set("firewall", OK, "other PCs in the network can reach " +
                          ("the server and the game" if self.setup.mode == HOST else "the game"))
@@ -612,7 +635,11 @@ class Session:
             return True
 
     def check_dns(self) -> bool:
-        addr = self.cfg.server_address
+        addr = dns.ipv4_of(self.cfg.server_address)        # hosts entries need an IPv4 address
+        if addr is None:
+            self.set("dns", FAILED, f"the server address {self.cfg.server_address} does not resolve to an IPv4 "
+                                    "address; enter the host's IPv4 address under Join")
+            return False
         while True:
             self.set("dns", RUNNING, "resolving the Ubisoft hostnames")
             bad = dns.mismatches(addr)
@@ -627,7 +654,7 @@ class Session:
                               ["Add to hosts file", "Check again"],
                               details=dns.lines_for_display(addr))
             if choice == "Add to hosts file":
-                code = elevate.hosts("add", addr, str(self.data_dir / "hosts-backups"))
+                code = elevate.hosts("add", addr)
                 if code != 0:
                     self.set("dns", RUNNING, "hosts file not changed" + (" (declined)" if code == -1 else ""))
                     self.wait(1.5)
@@ -893,12 +920,12 @@ class Session:
             return True
         while footprint.hosts_lines():
             self.set("hosts", RUNNING, "removing the redirect entries (waiting for the Windows admin prompt)")
-            backups = self.data_dir / "hosts-backups"
-            code = elevate.hosts("remove", self.cfg.server_address, str(backups))
+            code = elevate.hosts("remove")
             if code == 0:
                 dns.flush_dns()
                 self.hosts_added = False
-                self.set("hosts", OK, f"redirect entries removed (previous file backed up to {backups})")
+                self.set("hosts", OK, "redirect entries removed (previous file backed up next to it as "
+                                      "hosts.powder-<time>.bak)")
                 return True
             choice = self.ask("hosts", "The hosts file was not changed" + (" (admin rights declined)." if code == -1
                               else f" (error {code})."), ["Try again", "Skip"])
@@ -1016,7 +1043,7 @@ class Session:
         self.cancel.set()
         self.end_game()
         if remove_hosts and self.hosts_removal_on_exit:
-            elevate.hosts("remove", self.cfg.server_address, str(self.data_dir / "hosts-backups"))
+            elevate.hosts("remove")
             self.hosts_added = False
         if remove_ca and self.ca_removal_on_exit:
             try:

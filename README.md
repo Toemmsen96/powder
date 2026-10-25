@@ -211,17 +211,21 @@ Without a choice, `server_mode` and `server_address` in `launcher.toml` decide. 
    that `Steep.exe` is a build the TLS helper supports.
 2. **Firewall** (hosting or joining): Windows Firewall must let the other PCs in. The host needs a rule
    for Powder's server program, every player one for Steep itself (the games connect to each other
-   directly). Rules are per program, since Windows asks about any program that listens without one. Both
-   allow only the local network. If one is missing, the launcher explains it and adds it after you press
-   the button (Windows asks for admin rights), before the server starts listening. It also warns if a rule
-   from an earlier Windows prompt blocks Steep or Powder.
+   directly). Rules are per program, since Windows asks about any program that listens without one. They
+   allow only the local network, only on networks Windows treats as private (Domain or Private, never
+   Public: the launcher says how to switch a home network to Private), the server's only on its ports
+   (TCP: HTTPS, CRL; UDP: game server, Storm), Steep's only UDP. If one is missing, the launcher explains
+   it and adds it after you press the button (Windows asks for admin rights), before the server starts
+   listening. It also warns if a rule from an earlier Windows prompt blocks Steep or Powder.
 3. **Server**: reaches it, or starts it locally (Just this PC / Host) after checking that its ports are
    free (if not, it names the program using them), with or without the game-data pack as the checkbox says
    (a server it started with another setting is restarted). Joining, it uses the server on the other PC
    (its pack is that server's business), and warns if that server's major version differs.
 4. **DNS**: every Ubisoft hostname (`powder/server/hostnames.py`) must resolve to the server address. If not,
    it shows the lines to add to your own DNS server, or adds them to the hosts file for you (the previous
-   hosts file is backed up to `data/launcher/hosts-backups/`).
+   hosts file is backed up next to it, as `hosts.powder-<time>.bak` in `C:\Windows\System32\drivers\etc`,
+   the last 10 kept; lines that are not Powder's are kept byte for byte). A server address given as a
+   host name is resolved first: the entries need its IPv4 address.
 5. **Certificate**: gets the server's CA, checks that it can only vouch for Ubisoft's names (exactly one
    self-signed CA certificate, path length 0, critical name constraints permitting only names within
    `ubi.com` / `ubisoft.com` and addresses within `127.0.0.0/8`; anything else is refused before Windows
