@@ -145,11 +145,26 @@ async def test_links_and_entities_belong_to_one_player(client, services):
     assert (await client.put(f"{path.rsplit('/', 1)[0]}/2?t={token}", data=b"x", headers=UBI)).status == 403
     assert (await client.get(f"/_powder/cloudsaves/{PRODUCT}/1?t=made-up", headers=UBI)).status == 403
     services.entities.put("00000000-0000-4000-8000-0000000000aa", {**entity_body(), "type": "cloudSave"}, other)
-    r = await client.put("/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", headers=UBI,
+    ticket = services.sessions.issue(services.accounts.player(me), "127.0.0.1").ticket
+    auth = {**UBI, "Authorization": f"Ubi_v1 t={ticket}"}
+    r = await client.put("/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", headers=auth,
                          json=entity_body(revision=1))
     assert r.status == 403                                                            # not the requester's
-    assert (await (await client.get(f"/v1/profiles/{other}/entities?name={NAME}", headers=UBI)).json()) == \
+    assert (await (await client.get(f"/v1/profiles/{other}/entities?name={NAME}", headers=auth)).json()) == \
         {"entities": []}
+    r = await client.post(f"/v1/profiles/{other}/entities", headers=auth, json={"name": "x"})
+    assert r.status == 400 and (await r.json())["message"] == "not a cloud save"
+    # creating one in another player's name, or anything without a session (accounts exist)
+    r = await client.post(f"/v1/profiles/{other}/entities", headers=auth, json=entity_body())
+    assert r.status == 403 and (await r.json())["message"] == "not your profile"
+    assert services.cloudsaves.entity(other, PRODUCT)["profileId"] == other
+    r = await client.put("/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", headers=UBI,
+                         json=entity_body(revision=1))
+    assert r.status == 401 and (await r.json())["httpCode"] == 401
+    assert (await client.get(f"/v1/profiles/{other}/entities?name={NAME}", headers=UBI)).status == 401
+    # the owner comes from the session, never from the body
+    r = await client.post(f"/v1/profiles/{me}/entities", headers=auth, json={**entity_body(), "profileId": other})
+    assert r.status == 200 and (await r.json())["profileId"] == me
 
 
 async def test_nothing_to_migrate_from_the_old_cloud_saves(client, services):
@@ -182,3 +197,14 @@ def test_admin_listing_and_deleting(services, player):
     assert item["product"] == PRODUCT and item["complete"]
     assert services.cloudsaves.delete(me) == 1
     assert services.cloudsaves.all(me) == [] and not services.cloudsaves.path(me, PRODUCT, "1").exists()
+
+
+def test_profile_ids_are_checked_before_they_become_paths(services):
+    from powder.server.services.cloudsaves import CloudSaveError
+    me = services.default_player_id()
+    assert services.cloudsaves.path(me.upper(), PRODUCT, "1") == services.cloudsaves.path(me, PRODUCT, "1")
+    for bad in ("../../etc", "..", "", "00000000-0000-4000-8000-00000000000/", "c:\\x", me + "/.."):
+        with pytest.raises(CloudSaveError, match="bad profile id"):
+            services.cloudsaves.path(bad, PRODUCT, "1")
+        with pytest.raises(CloudSaveError):
+            services.cloudsaves.link(bad, PRODUCT, "1")

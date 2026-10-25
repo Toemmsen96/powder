@@ -24,6 +24,12 @@ Traversal (traversalUrl):
   0x1044 "connect me"    (id, key, target id, the requester's addresses) -> 0x1244 to the target (requester id,
                          target id, the addresses): both then punch (0x1045/0x1145 directly between the games)
 The relay ("routerProvisioningUrl") was never asked for.
+
+Bounded: a message naming a known peer must carry its key (else it is ignored, so nobody can move another
+game's address or speak for it); peers are capped in all and per IP, unconfirmed ones (no answer with the key
+yet) expire sooner and make room first; we send at most REPLIES_PER_S datagrams a second to one IP, whatever
+a spoofed source asks for (REGISTER's answer is ~5x its request); forgotten peers are swept every SWEEP_S and
+found by address through an index.
 """
 from __future__ import annotations
 
@@ -45,7 +51,14 @@ DETECT, DETECT_OTHER_PORT, DETECT_OTHER_SERVER = 0x01, 0x02, 0x03
 REGISTER, REGISTERED, KEEPALIVE, CONNECT = 0x40, 0x41, 0x43, 0x44
 CONFIRM = 0x40                                                    # 0x1340: registration confirmed
 ID_LEN, KEY_LEN = 16, 8
-PEER_TTL_S = 120.0                                                # forgotten without keep-alives
+PEER_TTL_S = 120.0                  # forgotten without keep-alives (the game sends one every ~8 s)
+UNCONFIRMED_TTL_S = 30.0            # the same for a peer that has not answered with its key
+MAX_PEERS = 4096                    # in all and per IP (a game registers from one socket or two; a LAN party
+MAX_PEERS_PER_IP = 32               # shares an IP); when full the oldest unconfirmed peer makes room
+REPLY_BURST = 40.0                  # datagrams we send to one IP: a burst, then REPLIES_PER_S (the game's own:
+REPLIES_PER_S = 20.0                # a keep-alive every ~8 s per socket, ~2 connect requests a second joining)
+MAX_CONNECT_ADDRESSES = 128         # bytes of addresses a connect request may pass on (the game sends 24)
+SWEEP_S = 1.0                       # how often forgotten peers are swept
 
 # ports, from the base port (11000): detect 1 and its other port, detect 2 and its other port, traversal
 DETECT_PORTS = (0, 1, 2, 3)
@@ -83,6 +96,9 @@ class Peer:
     game_addr: Address | None = None                # its game socket, once seen
     seen: float = field(default_factory=time.monotonic)
     connects: dict[bytes, float] = field(default_factory=dict)  # target id -> when its request was last logged
+    issued: bool = False                            # we handed out its id (REGISTER) ...
+    confirmed: bool = False                         # ... and it answered with the key (a spoofed REGISTER never
+                                                    # sees the key); unconfirmed peers expire sooner
 
 
 class Storm:
@@ -92,6 +108,10 @@ class Storm:
         self.send = send or (lambda data, addr, port: None)
         self.clock = clock
         self.peers: dict[bytes, Peer] = {}
+        self.by_addr: dict[Address, bytes] = {}                         # registration socket -> peer id
+        self.per_ip: dict[str, int] = {}                                # peers per registration IP
+        self.budgets: dict[str, tuple[float, float]] = {}               # destination IP -> (left, when counted)
+        self._last_sweep = float("-inf")
         self._ids = itertools.count(1 + secrets.randbelow(1 << 30))    # unlike ids games kept over a restart
 
     def new_id(self) -> bytes:
@@ -99,72 +119,145 @@ class Storm:
 
     def received(self, port: int, data: bytes, addr: Address) -> None:
         """A datagram on one of our ports (port: offset from the base port)."""
+        now = self.clock()
+        self._sweep(now)
+        for out, to, to_port in self._handle(now, port, data, addr):
+            if self._take_budget(to[0], now):
+                self.send(out, to, to_port)
+
+    def _handle(self, now: float, port: int, data: bytes, addr: Address) -> list[tuple[bytes, Address, int]]:
         msg, framed = unframe(data)
         if len(msg) < 4 or msg[0] not in (REQUEST, ANSWER):
             log.debug("storm: %d bytes from %s on +%d ignored", len(data), addr, port)
-            return
+            return []
         kind, mtype, seq = struct.unpack(">BBH", msg[:4])
         body = msg[4:]
 
-        def reply(*parts: bytes, kind_: int = REPLY, type_: int = mtype) -> None:
+        def reply(*parts: bytes, kind_: int = REPLY, type_: int = mtype) -> list[tuple[bytes, Address, int]]:
             out = message(kind_, type_, seq, *parts)
-            self.send(HEADER + out if framed else out, addr, port)
+            return [(HEADER + out if framed else out, addr, port)]
 
         if port in DETECT_PORTS:
-            if kind == REQUEST and mtype == DETECT:
-                reply(address_item(addr))
-            return
+            return reply(address_item(addr)) if kind == REQUEST and mtype == DETECT else []
         if port != TRAVERSAL_PORT:
-            return
-        self._expire()
+            return []
         if kind == REQUEST and mtype == REGISTER:
-            peer = next((p for p in self.peers.values() if p.addr == addr), None)
+            peer = self.peers.get(self.by_addr.get(addr, b""))
             if peer is None:
-                peer = Peer(self.new_id(), b"\x02\x02\x00\x00" + secrets.token_bytes(4), addr)
-                self.peers[peer.id] = peer
-                log.info("storm: %s registered as peer %s", addr[0], peer.id[-4:].hex())
-            peer.seen = self.clock()
-            reply(peer.id, peer.key, address_item(addr), kind_=PUSH, type_=REGISTERED)   # the game acks (0x1141)
-            return
+                if not self._make_room(addr[0]):
+                    return []
+                peer = Peer(self.new_id(), b"\x02\x02\x00\x00" + secrets.token_bytes(4), addr, seen=now, issued=True)
+                self._insert(peer)
+                log.debug("storm: %s registers as peer %s", addr[0], peer.id[-4:].hex())
+            peer.seen = now
+            return reply(peer.id, peer.key, address_item(addr), kind_=PUSH, type_=REGISTERED)   # acked by 0x1141
         if len(body) < ID_LEN + KEY_LEN:
-            return
-        peer = self._peer(body[:ID_LEN], body[ID_LEN:ID_LEN + KEY_LEN], addr, framed)
+            return []
+        peer = self._peer(now, body[:ID_LEN], body[ID_LEN:ID_LEN + KEY_LEN], addr, framed)
+        if peer is None:
+            return []
         if kind == ANSWER and mtype == REGISTERED:
-            reply(peer.key, peer.id, type_=CONFIRM)
-        elif kind == REQUEST and mtype == KEEPALIVE:
-            reply(peer.id, peer.key, *((address_item(addr),) if framed else ()))
-        elif kind == REQUEST and mtype == CONNECT and len(body) >= 2 * ID_LEN + KEY_LEN:
+            return reply(peer.key, peer.id, type_=CONFIRM)
+        if kind == REQUEST and mtype == KEEPALIVE:
+            return reply(peer.id, peer.key, *((address_item(addr),) if framed else ()))
+        if kind == REQUEST and mtype == CONNECT and len(body) >= 2 * ID_LEN + KEY_LEN:
             target_id, addresses = body[ID_LEN + KEY_LEN:2 * ID_LEN + KEY_LEN], body[2 * ID_LEN + KEY_LEN:]
+            if len(addresses) > MAX_CONNECT_ADDRESSES:
+                log.debug("storm: connect request with %d bytes of addresses ignored", len(addresses))
+                return []
             target = self.peers.get(target_id)
             if target is None:
                 log.warning("storm: peer %s asks for unknown peer %s", peer.id[-4:].hex(), target_id[-4:].hex())
-                return
-            now = self.clock()
+                return []
             if now - peer.connects.get(target_id, -60.0) >= 30:    # not every retry (about two a second)
                 peer.connects[target_id] = now
                 log.info("storm: peer %s (%s) connects to peer %s (%s)", peer.id[-4:].hex(), addr[0],
                          target_id[-4:].hex(), target.addr[0])
-            self.send(message(PUSH, CONNECT, seq, peer.id, target_id, addresses), target.addr, TRAVERSAL_PORT)
-        else:
-            log.debug("storm: message %02x%02x from %s ignored", kind, mtype, addr)
+            return [(message(PUSH, CONNECT, seq, peer.id, target_id, addresses), target.addr, TRAVERSAL_PORT)]
+        log.debug("storm: message %02x%02x from %s ignored", kind, mtype, addr)
+        return []
 
-    def _peer(self, peer_id: bytes, key: bytes, addr: Address, framed: bool) -> Peer:
-        """The registered peer; one we don't know (e.g. the server restarted) is taken as it says."""
+    def _peer(self, now: float, peer_id: bytes, key: bytes, addr: Address, framed: bool) -> Peer | None:
+        """Note a message from a peer: a known one must give its key; one we don't know (e.g. the server
+        restarted) is taken as it says. None: ignore the message."""
         peer = self.peers.get(peer_id)
+        if peer is not None and peer.key != key:
+            log.debug("storm: %s names peer %s with a wrong key, ignored", addr, peer_id[-4:].hex())
+            return None
         if peer is None:
-            peer = self.peers[peer_id] = Peer(peer_id, key, addr)
+            if not self._make_room(addr[0]):
+                return None
+            peer = Peer(peer_id, key, addr, seen=now)
+            self._insert(peer)
             log.info("storm: %s continues as peer %s", addr[0], peer_id[-4:].hex())
+        peer.seen = now
+        if peer.issued and not peer.confirmed:
+            peer.confirmed = True
+            log.info("storm: %s registered as peer %s", addr[0], peer_id[-4:].hex())
         if framed:
             peer.game_addr = addr
         elif peer.addr != addr:
+            self._unindex(peer)
             peer.addr = addr
-        peer.seen = self.clock()
+            self._insert(peer)
         return peer
 
-    def _expire(self) -> None:
-        now = self.clock()
-        for pid in [pid for pid, p in self.peers.items() if now - p.seen > PEER_TTL_S]:
-            del self.peers[pid]
+    # ---- bookkeeping: the address index, caps, the send budget ---------------------------------------
+    def _insert(self, peer: Peer) -> None:
+        old = self.peers.get(peer.id)
+        if old is not None and old is not peer:
+            self._unindex(old)
+        self.peers[peer.id] = peer
+        self.by_addr[peer.addr] = peer.id
+        self.per_ip[peer.addr[0]] = self.per_ip.get(peer.addr[0], 0) + 1
+
+    def _unindex(self, peer: Peer) -> None:
+        if self.by_addr.get(peer.addr) == peer.id:
+            del self.by_addr[peer.addr]
+        n = self.per_ip.get(peer.addr[0], 0) - 1
+        if n > 0:
+            self.per_ip[peer.addr[0]] = n
+        else:
+            self.per_ip.pop(peer.addr[0], None)
+
+    def _remove(self, peer_id: bytes) -> None:
+        peer = self.peers.pop(peer_id, None)
+        if peer is not None:
+            self._unindex(peer)
+
+    def _make_room(self, ip: str) -> bool:
+        """Room for one more peer from `ip`: under the caps, or after forgetting the oldest unconfirmed peer
+        (of that IP when it is the IP that is full)."""
+        ip_full = self.per_ip.get(ip, 0) >= MAX_PEERS_PER_IP
+        if not ip_full and len(self.peers) < MAX_PEERS:
+            return True
+        candidates = [p for p in self.peers.values() if not p.confirmed and (not ip_full or p.addr[0] == ip)]
+        if not candidates:
+            log.warning("storm: no room for a peer from %s (%d peers, at most %d, %d per IP)", ip, len(self.peers),
+                        MAX_PEERS, MAX_PEERS_PER_IP)
+            return False
+        self._remove(min(candidates, key=lambda p: p.seen).id)
+        return True
+
+    def _sweep(self, now: float) -> None:
+        if now - self._last_sweep < SWEEP_S:
+            return
+        self._last_sweep = now
+        for p in [p for p in self.peers.values() if now - p.seen > (PEER_TTL_S if p.confirmed else UNCONFIRMED_TTL_S)]:
+            self._remove(p.id)
+        for ip in [ip for ip, (left, at) in self.budgets.items()        # a full budget needs no entry
+                   if left + max(0.0, now - at) * REPLIES_PER_S >= REPLY_BURST]:
+            del self.budgets[ip]
+
+    def _take_budget(self, ip: str, now: float) -> bool:
+        """One datagram to `ip`, if its budget allows."""
+        left, at = self.budgets.get(ip, (REPLY_BURST, now))
+        left = min(REPLY_BURST, left + max(0.0, now - at) * REPLIES_PER_S)
+        ok = left >= 1.0
+        self.budgets[ip] = (left - 1.0 if ok else left, now)
+        if not ok:
+            log.debug("storm: datagram to %s dropped (over %d/s)", ip, REPLIES_PER_S)
+        return ok
 
 
 class _Port(asyncio.DatagramProtocol):

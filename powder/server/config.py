@@ -26,7 +26,17 @@ class ServerConfig:
     country: str = "US"                 # what Ubisoft Connect is told about the player's location
     region: str = "NA"
     log_level: str = "INFO"
-    strict_tickets: bool = False        # True: reject unknown UbiServices/NEX tickets
+    strict_tickets: bool = False        # True: reject unknown UbiServices/NEX tickets (always so when public);
+                                        # False: one it lost (restart) is the latest session from its address
+    nex_check_signatures: str = "log"   # NEX packets after the SYN must carry the signature our SYN-ACK gave
+                                        # (a spoofed source never sees it). "log": never refuse, log the first
+                                        # mismatch per connection ("wrong signature") and an info when it
+                                        # matched; "enforce": ignore packets without it; "off": no check
+    name: str = "Powder"                # the server's name, shown by the launcher
+    motd: str = ""                      # a short text for players (rules, contact), shown by the launcher
+    public: bool = False                # an internet-facing server: sign-ins always need an account, tickets
+                                        # are strict, /_powder/status shows a caller only its own connections
+    admins: tuple[str, ...] = ()        # profile ids of the server's admins (admin tools; the Rust server's)
 
 
 @dataclass(frozen=True)
@@ -45,6 +55,8 @@ class PlayersConfig:
     default: str | None = None          # player used when a login cannot be told apart; unset = the
                                         # recorded account, else a locally generated one
     bind: dict[str, str] = field(default_factory=dict)   # client IP -> profileId
+    registration: str = "open"          # "open": anyone who reaches the server registers an account; "closed":
+                                        # only the host creates them (`admin account-create`)
 
 
 @dataclass(frozen=True)
@@ -94,14 +106,24 @@ class Config:
         base = path.resolve().parent
 
         srv = _build(ServerConfig, raw.get("server", {}))
+        if not isinstance(srv.admins, (list, tuple)):
+            raise ValueError("[server] admins must be a list of profile ids")
+        srv = dataclasses.replace(srv, admins=tuple(str(a).lower() for a in srv.admins))
         for name in ("data_dir", "gamedata_dir", "recordings_dir"):
             value = getattr(srv, name)
             if not value.is_absolute():
                 srv = dataclasses.replace(srv, **{name: (base / value).resolve()})
 
+        if srv.nex_check_signatures not in ("log", "enforce", "off"):
+            raise ValueError('[server] nex_check_signatures must be "log", "enforce" or "off", '
+                             f"not {srv.nex_check_signatures!r}")
+
         players_raw = dict(raw.get("players", {}))
         players = PlayersConfig(default=players_raw.get("default"),
-                                bind=dict(players_raw.get("bind", {})))
+                                bind=dict(players_raw.get("bind", {})),
+                                registration=players_raw.get("registration", "open"))
+        if players.registration not in ("open", "closed"):
+            raise ValueError(f'[players] registration must be "open" or "closed", not {players.registration!r}')
 
         plugins_raw = raw.get("plugins", {})
         plugins = PluginsConfig(enabled=tuple(plugins_raw.get("enabled", ("*",))),

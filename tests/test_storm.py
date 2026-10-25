@@ -89,6 +89,103 @@ def test_peers_without_keepalives_are_forgotten():
     assert [p.addr for p in s.peers.values()] == [GAME_B]
 
 
+def register_confirmed(s, sent, addr):
+    """REGISTER, then the game's 0x1141 with the key."""
+    peer_id, key = register(s, sent, addr)
+    n = len(sent)
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("11410002") + peer_id + key, addr)
+    assert len(sent) == n + 1 and s.peers[peer_id].confirmed
+    return peer_id, key
+
+
+def test_a_known_peer_needs_its_key():
+    s, sent = make()
+    a_id, a_key = register_confirmed(s, sent, GAME_A)
+    b_id, b_key = register(s, sent, GAME_B)
+    attacker = ("198.51.100.9", 4000)
+    wrong = a_key[:4] + bytes(4)
+    n = len(sent)
+    # a keep-alive in A's name: no answer, A's address stays (also from a game socket)
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("10430003") + a_id + wrong, attacker)
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("10430001") + a_id + wrong + storm.TRAILER, attacker)
+    # a connect request in A's name is not passed on to B
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("10440005") + a_id + wrong + b_id + storm.address_item(attacker),
+               attacker)
+    assert len(sent) == n
+    assert (s.peers[a_id].addr, s.peers[a_id].game_addr) == (GAME_A, None)
+    # with the key, A may move (its NAT gave it a new port): a REGISTER from there finds it
+    moved = ("192.0.2.10", 50000)
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("10430003") + a_id + a_key, moved)
+    assert len(sent) == n + 1 and s.peers[a_id].addr == moved
+    assert register(s, sent, moved)[0] == a_id
+    assert register(s, sent, GAME_A)[0] != a_id, "its old socket is no longer it"
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("11410002") + b_id + b_key, GAME_B)   # B's own key still works
+    assert sent[-1][0] == bytes.fromhex("13400002") + b_key + b_id
+
+
+def test_peers_are_capped_and_confirmed_ones_kept():
+    now = [0.0]
+    sent = []
+    s = storm.Storm(lambda data, addr, port: sent.append((data, addr, port)), clock=lambda: now[0])
+    a_id, _ = register_confirmed(s, sent, GAME_A)
+    # spoofed REGISTERs from A's IP, each from another port: the oldest unconfirmed make room, A stays
+    for port in range(200):
+        now[0] = port * 0.1
+        s.received(storm.TRAVERSAL_PORT, bytes.fromhex("1040000101010300"), ("192.0.2.10", 1000 + port))
+    assert s.per_ip["192.0.2.10"] == storm.MAX_PEERS_PER_IP and a_id in s.peers
+    assert len(s.by_addr) == len(s.peers)
+    # unconfirmed peers go after UNCONFIRMED_TTL_S, confirmed ones after PEER_TTL_S
+    now[0] = 20.0 + storm.UNCONFIRMED_TTL_S + 1
+    s.received(0, bytes.fromhex("10010000"), GAME_B)
+    assert list(s.peers) == [a_id] and (len(s.by_addr), len(s.per_ip)) == (1, 1)
+
+
+def test_peers_are_capped_in_all(monkeypatch):
+    monkeypatch.setattr(storm, "MAX_PEERS", 3)
+    s, sent = make()
+    a_id, _ = register_confirmed(s, sent, GAME_A)
+    b_id, _ = register_confirmed(s, sent, GAME_B)
+    register(s, sent, ("192.0.2.30", 1))
+    register(s, sent, ("192.0.2.31", 1))                                  # the unconfirmed one made room
+    assert len(s.peers) == 3 and {a_id, b_id} <= set(s.peers)
+    assert ("192.0.2.30", 1) not in s.by_addr
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("11410002") + s.by_addr[("192.0.2.31", 1)] +
+               s.peers[s.by_addr[("192.0.2.31", 1)]].key, ("192.0.2.31", 1))
+    n = len(sent)
+    s.received(storm.TRAVERSAL_PORT, bytes.fromhex("1040000101010300"), ("192.0.2.32", 1))
+    assert len(sent) == n and len(s.peers) == 3, "all confirmed: no answer"
+
+
+def test_what_we_send_to_one_ip_is_rate_limited():
+    now = [0.0]
+    sent = []
+    s = storm.Storm(lambda data, addr, port: sent.append((data, addr, port)), clock=lambda: now[0])
+    victim = ("203.0.113.5", 3074)
+
+    def count(n):
+        before = len(sent)
+        for _ in range(n):
+            s.received(0, bytes.fromhex("10010000"), victim)
+        return len(sent) - before
+    assert count(100) == storm.REPLY_BURST
+    now[0] = 1.0
+    assert count(100) == storm.REPLIES_PER_S
+    s.received(0, bytes.fromhex("10010000"), GAME_A)                      # another IP has its own budget
+    assert sent[-1][1] == GAME_A
+
+
+def test_a_connect_request_passes_on_a_bounded_address_list():
+    s, sent = make()
+    a_id, a_key = register(s, sent, GAME_A)
+    b_id, _ = register(s, sent, GAME_B)
+    req = lambda n: bytes.fromhex("10440005") + a_id + a_key + b_id + bytes([2]) * n
+    n = len(sent)
+    s.received(storm.TRAVERSAL_PORT, req(storm.MAX_CONNECT_ADDRESSES), GAME_A)
+    assert len(sent) == n + 1 and sent[-1][1] == GAME_B
+    s.received(storm.TRAVERSAL_PORT, req(storm.MAX_CONNECT_ADDRESSES + 1), GAME_A)
+    assert len(sent) == n + 1
+
+
 def test_game_socket_frames_as_recorded():
     assert storm.TRAILER.hex() == "08071b" + "00" * 22 + "80000000200000" and len(storm.TRAILER) == 32
     assert storm.HEADER.hex() == "00" * 22 + "8000000020" and len(storm.HEADER) == 27

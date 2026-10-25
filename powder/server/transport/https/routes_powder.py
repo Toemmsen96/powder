@@ -1,7 +1,7 @@
 """The server's own endpoints (not Ubisoft's), under /_powder/. Used by the launcher; the web admin will
-build on them. The status needs no sign-in and shows player names and the address of every connected game,
-which is fine for a server meant for a local network of friends; don't expose it to the internet. The
-account calls carry the account's email and password.
+build on them. The status needs no sign-in; it shows the addresses of connected games and Connect clients only
+to the server's own PC (loopback) and to each caller for its own address (others: names only; on a [server]
+public server not at all). The account calls carry the account's email and password.
 
   GET /_powder/status   who is connected: Ubisoft Connect (demux) clients and game (NEX) sessions, and
                         the caller's address as the server sees it ("you": a launcher finds its own PC)
@@ -12,6 +12,9 @@ account calls carry the account's email and password.
   GET /_powder/overlay/powder.js   the Powder part of Ubisoft Connect's in-game overlay
 """
 from __future__ import annotations
+
+import inspect
+import ipaddress
 
 from aiohttp import web
 
@@ -30,12 +33,37 @@ def _peer(nex) -> str:
     return f"{addr[0]}:{addr[1]}" if addr else ""
 
 
+def _ip(address: str | None):
+    """An address as an ipaddress object (IPv4-mapped IPv6 as the IPv4 address), else None."""
+    try:
+        ip = ipaddress.ip_address((address or "").strip("[]"))
+    except ValueError:
+        return None
+    return ip.ipv4_mapped or ip if ip.version == 6 else ip
+
+
+def _shown(request: web.Request, you, address: str | None, entry: dict) -> dict | None:
+    """Who sees which entries of the status: the server's own PC (loopback) everything; anyone else its own
+    entries (same address) as they are, the others' without their address, and on a public server not at all.
+    The launcher uses its own entries ("connect", "game" with the peer it is seen from) and the names in
+    "game"."""
+    if you is not None and (you.is_loopback or _ip(address) == you):
+        return entry
+    if request.app[SERVICES].config.server.public:
+        return None
+    return {k: v for k, v in entry.items() if k != "peer"}
+
+
 async def status(request: web.Request) -> web.Response:
     services = request.app[SERVICES]
-    connect = [{"player": c.player_name, "peer": c.peer, "services": sorted(set(c.channels.values()))}
+    you = _ip(client_ip(request))
+    connect = [_shown(request, you, getattr(c, "client_ip", None),
+                      {"player": c.player_name, "peer": c.peer, "services": sorted(set(c.channels.values()))})
                for c in services.connect_clients if c.profile_id]
-    game = [{"player": s.player.name, "nex": s.nex is not None, "peer": _peer(s.nex)}
+    game = [_shown(request, you, (getattr(s.nex, "addr", None) or (s.client_ip,))[0],
+                   {"player": s.player.name, "nex": s.nex is not None, "peer": _peer(s.nex)})
             for s in services.sessions.by_player.values() if s.nex is not None]
+    connect, game = [e for e in connect if e is not None], [e for e in game if e is not None]
     request[HOW] = "powder-status"
     return web.json_response({"server": "powder", "version": __version__, "you": client_ip(request),
                               "public_host": services.config.server.public_host,
@@ -77,19 +105,21 @@ async def _account_call(request: web.Request, change) -> web.Response:
         return web.json_response({"error": "bad request"}, status=400)
     email = str(body.get("email", ""))
     key = REGISTER_KEY if change is None else email      # registrations count like failures (hashing is slow)
-    if limiter.blocked(ip, key):
+    # counted before hashing (off the event loop: concurrent calls can't all pass); a registration always
+    # counts, a call whose password is right takes its count back
+    if not limiter.attempt(ip, key):
         return web.json_response({"error": "Too many attempts, try again in a few minutes."}, status=429)
     accounts = services.accounts
     try:
         if change is None:
-            limiter.failed(ip, REGISTER_KEY)
-            account = accounts.register(email, str(body.get("password", "")), str(body.get("name", "")))
+            account = await accounts.register_async(email, str(body.get("password", "")), str(body.get("name", "")),
+                                                    ip)
         else:
-            account = accounts.authenticate(email, str(body.get("password", "")))
+            account = await accounts.authenticate_async(email, str(body.get("password", "")))
             limiter.succeeded(ip, email)
-            account = change(accounts, account, body) or account
+            changed = change(accounts, account, body)
+            account = (await changed if inspect.isawaitable(changed) else changed) or account
     except AuthError:
-        limiter.failed(ip, email)
         return web.json_response({"error": "Wrong email or password."}, status=401)
     except AccountError as e:
         return web.json_response({"error": str(e)}, status=400)
@@ -111,7 +141,7 @@ async def account_email(request: web.Request) -> web.Response:
 
 async def account_password(request: web.Request) -> web.Response:
     return await _account_call(request, lambda accounts, account, body:
-                               accounts.change_password(account, str(body.get("new_password", ""))))
+                               accounts.change_password_async(account, str(body.get("new_password", ""))))
 
 
 async def account_name(request: web.Request) -> web.Response:
@@ -120,9 +150,11 @@ async def account_name(request: web.Request) -> web.Response:
 
 
 async def account_new(request: web.Request) -> web.Response:
-    """What registering would do here: take over an existing player (the first account on a server)."""
+    """What registering would do here: take over an existing player (the first account on a server, registered
+    from the server's own PC; services/accounts.py register_from)."""
     request[HOW] = "powder-account"
-    return web.json_response({"takes_over": request.app[SERVICES].accounts.claimable_player_name()})
+    return web.json_response({"takes_over": request.app[SERVICES].accounts.claimable_player_name_for(
+        client_ip(request))})
 
 
 def add_routes(app: web.Application) -> None:

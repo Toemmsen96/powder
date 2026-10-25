@@ -112,10 +112,41 @@ async def test_friends_trails_by_world(client, services, player):
     assert [e["obj"]["world"] for e in found] == ["WORLD_7a954c6bd0"]
 
 
+def as_player(services, pid: str) -> dict:
+    """The headers of a new session of this player."""
+    ticket = services.sessions.issue(services.accounts.player(pid), "127.0.0.1").ticket
+    return {**OLYMPUS, "Authorization": f"Ubi_v1 t={ticket}"}
+
+
 async def test_only_the_owner_hides_or_deletes(client, services):
-    services.accounts.register("host@example.com", "correct horse", "")        # takes over the requester
+    host = services.accounts.register("host@example.com", "correct horse", "").profile_id
     other = services.accounts.register("guest@example.com", "correct horse", "Guest")
     item = services.repos.ugc.create("00000000-0000-4000-8000-000000000001", 2, WORLD, other.profile_id, {}, [], {})
-    assert (await client.put(f"/ugc/v1/{item['ugc_id']}/hide", headers=OLYMPUS)).status == 204
-    assert (await client.delete(f"/ugc/v1/{item['ugc_id']}", headers=OLYMPUS)).status == 204
+    assert (await client.put(f"/ugc/v1/{item['ugc_id']}/hide", headers=as_player(services, host))).status == 204
+    assert (await client.delete(f"/ugc/v1/{item['ugc_id']}", headers=as_player(services, host))).status == 204
     assert services.repos.ugc.get(item["ugc_id"])["hidden"] is False          # not ours: untouched
+
+
+async def test_only_the_owner_writes_its_files(client, services):
+    """Once accounts exist: no default player without a ticket, and only the owner uploads an item's files
+    (everyone downloads them)."""
+    import base64
+    host = services.accounts.register("host@example.com", "correct horse", "").profile_id
+    other = services.accounts.register("guest@example.com", "correct horse", "Guest").profile_id
+    created = {"typeId": 2, "worldId": WORLD, "datas": base64.b64encode(b"MINE").decode()}
+    item = await (await client.post("/ugc/v1/", headers=as_player(services, other), json=created)).json()
+    assert item["profileId"] == other
+    data = item["links"]["urls"]["Data"].split(".com", 1)[1]
+    r = await client.put(data, headers=as_player(services, host), data=b"EVIL")
+    assert r.status == 403 and (await r.json())["message"] == "not your item"
+    assert (await client.put(data, headers=OLYMPUS, data=b"EVIL")).status == 401
+    assert await (await client.get(data, headers=OLYMPUS)).read() == b"MINE"      # downloads: open
+    assert (await client.put(data, headers=as_player(services, other), data=b"NEWER")).status == 200
+    assert await (await client.get(data, headers=OLYMPUS)).read() == b"NEWER"
+    # no ticket: no stand-in player for creating, listing, liking or reading an item
+    assert (await client.post("/ugc/v1/", headers=OLYMPUS, json=created)).status == 401
+    assert (await client.get("/ugc/v1/?type_id=2", headers=OLYMPUS)).status == 401
+    assert (await client.put(f"/ugc/v1/{item['id']}/like", headers=OLYMPUS)).status == 401
+    assert (await client.get(f"/ugc/v1/{item['id']}", headers=OLYMPUS)).status == 401
+    listed = await (await client.get("/ugc/v1/?type_id=2", headers=as_player(services, host))).json()
+    assert listed[0]["id"] == item["id"]

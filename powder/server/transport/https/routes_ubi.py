@@ -1,15 +1,29 @@
 """UbiServices endpoints with real logic (login, inventory, store, entities). Player-related endpoints
 that only need a plausible answer are in routes_profile.py; game-wide data comes from the game-data
-pack (app.py fallback)."""
+pack (app.py fallback).
+
+Who may act: a server without accounts trusts everyone (one local player, the default one, or [players.bind]):
+routes act for the session's player, else the default player, as before accounts existed. Once accounts are
+required (an account exists, or [server] public), a route that acts for a player needs a session (401
+otherwise, never the default player as a stand-in), writes go only to the session's own player, entities and
+UGC (403 otherwise), and reads of player data need a session too (any player: others' public data stays
+readable). Not affected: the sign-in, the internet check, the rendezvous configuration, game-wide data (pack,
+built-in replies, offers), the public /_powder/ routes and the links whose token is the credential (cloud-save
+slots, entity file uploads); file downloads (entity files, photos) stay open like the S3 links they stand in
+for. A refusal is raised (Refused) and answered by app.py's session_middleware.
+"""
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import json
 import logging
 import re
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
 
 from aiohttp import web
 
@@ -44,6 +58,70 @@ def auth_refused(request: web.Request, message: str) -> web.Response:
                          "refused", 401)
 
 
+# ---- who may act ----------------------------------------------------------------------------------
+class Refused(Exception):
+    """A request refused before it was answered (no session, someone else's data); carries the reply."""
+
+    def __init__(self, response: web.Response):
+        super().__init__(response.status)
+        self.response = response
+
+
+@dataclass(frozen=True)
+class Actor:
+    pid: str                    # the player the request acts for
+    guarded: bool               # accounts are required: only the player's own data
+
+
+PROFILE_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def url_profile_id(raw: str | None) -> str | None:
+    """A profile id from the URL, lower-cased, if it is shaped like one (a UUID): anything else never reaches
+    the database or a file path."""
+    pid = (raw or "").lower()
+    return pid if PROFILE_ID.match(pid) else None
+
+
+def accounts_required(request: web.Request) -> bool:
+    return request.app[SERVICES].accounts.required
+
+
+def no_session(request: web.Request) -> web.Response:
+    """A request without a session where one is needed: 401, shaped like UbiServices' refused sign-in."""
+    log.warning("%s %s from %s refused: no session (accounts are required)", request.method, request.path,
+                client_ip(request))
+    response = auth_refused(request, "Not signed in (no valid ticket)")
+    request[HOW] = "no-session"
+    return response
+
+
+def forbidden(request: web.Request, what: str) -> web.Response:
+    """Writing what belongs to another player (accounts required)."""
+    log.warning("%s %s by %s refused: %s", request.method, request.path, _owner(request) or "?", what)
+    return json_response(request, {"errorCode": 1, "message": what, "httpCode": 403}, "forbidden", 403)
+
+
+def acting(request: web.Request) -> Actor:
+    """Who acts: the session's player; without a session the default player (no accounts), else Refused (401)."""
+    guarded = accounts_required(request)
+    me = _owner(request)
+    if me:
+        return Actor(me.lower(), guarded)
+    if guarded:
+        raise Refused(no_session(request))
+    return Actor(request.app[SERVICES].default_player_id().lower(), guarded)
+
+
+def reader(request: web.Request) -> str | None:
+    """Reads of player data: anyone on a server without accounts, else a signed-in player (-> its profile id;
+    Refused without one)."""
+    me = _owner(request)
+    if me is None and accounts_required(request):
+        raise Refused(no_session(request))
+    return me
+
+
 # ---- login --------------------------------------------------------------------------------------
 async def create_session(request: web.Request) -> web.Response:
     """POST /v3/profiles/sessions. The game authenticates with `uplaypc_v1 t=<Connect ticket>` (or
@@ -63,14 +141,14 @@ async def create_session(request: web.Request) -> web.Response:
     # `Basic` with empty credentials when Ubisoft Connect has none)
     creds = basic_credentials(value) if scheme.lower() == "basic" else None
     email = creds[0] if creds else ""
-    if creds and services.login_failures.blocked(ip, email):
+    # counted before the password is hashed (off the event loop: concurrent guesses can't all pass), taken
+    # back if it works
+    if creds and not services.login_failures.attempt(ip, email):
         log.warning("login from %s refused: too many failed sign-ins, try again in a few minutes", ip)
         return auth_refused(request, "Too many failed sign-ins, try again in a few minutes")
     try:
-        session = services.accounts.login(LoginRequest(ip, scheme, value, dict(request.headers)))
+        session = await services.accounts.login_async(LoginRequest(ip, scheme, value, dict(request.headers)))
     except AuthError as e:
-        if creds:
-            services.login_failures.failed(ip, email)
         log.warning("login from %s refused: %s", ip, e)
         return auth_refused(request, "Invalid credentials")
     if creds:
@@ -116,6 +194,7 @@ def _known_player(request: web.Request) -> str | None:
 
 
 async def get_inventory(request: web.Request) -> web.StreamResponse:
+    reader(request)
     pid = _known_player(request)
     if pid is None:                       # someone this server has no record of: owns nothing
         return json_response(request, {"items": []}, "inventory(unknown player)")
@@ -123,12 +202,18 @@ async def get_inventory(request: web.Request) -> web.StreamResponse:
 
 
 async def post_inventory(request: web.Request) -> web.Response:
-    """Shop purchase or reward: {"spaceId", "offerId", "offerRevision"}."""
+    """Shop purchase or reward: {"spaceId", "offerId", "offerRevision"}. Only the acting player's own once
+    accounts are required; without accounts anyone's, but a player record is made only for the one acting."""
     services = request.app[SERVICES]
     pid = request.match_info["profile_id"].lower()
-    session = request.get(SESSION)
-    if session and session.profile_id != pid:
-        log.warning("inventory POST for %s by session of %s", pid, session.profile_id)
+    me = acting(request)
+    if me.pid != pid:
+        if me.guarded:
+            return forbidden(request, "not your inventory")
+        if services.repos.players.get(pid) is None:
+            return json_response(request, {"errorCode": 1, "message": f"profile {pid} not found", "httpCode": 404},
+                                 "unknown-player", 404)
+        log.warning("inventory POST for %s by %s", pid, me.pid)
     try:
         body = await request.json()
         services.accounts.player(pid)
@@ -162,26 +247,54 @@ def _int(q, name: str, default: int) -> int:
 
 ENTITY_FILE = re.compile(r"^[0-9a-f-]{36}$")
 STORAGE_LINK_S = 3600
+LINK_KEY = secrets.token_bytes(32)      # signs the entity files' upload links; new on every start (they last 1 h)
 
 
-def _storage(request: web.Request, entity: dict | None, write: bool = False) -> dict | None:
+def file_token(entity_id: str, expires: int) -> str:
+    """`<expiry>.<HMAC-SHA256 hex>`: lets the holder write one entity's file until the expiry (unix seconds),
+    like an S3 presigned link (the game may upload without its ticket)."""
+    mac = hmac.new(LINK_KEY, f"entity-file:{entity_id}:{expires}".encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{mac}"
+
+
+def file_token_ok(entity_id: str, token: str) -> bool:
+    try:
+        expires = int(token.partition(".")[0])
+    except ValueError:
+        return False
+    return expires >= time.time() and hmac.compare_digest(file_token(entity_id, expires), token)
+
+
+def _storage(request: web.Request, entity: dict | None, write: bool = False, signed: bool = False) -> dict | None:
     """An entity with a file (extendedStorage, e.g. a saved replay or a challenge ghost) gets links to it on
     this server, as Ubisoft's gave links to S3: putUrl / deleteUrl after a write (the game uploads there),
-    getUrl / headUrl on reads."""
+    getUrl / headUrl on reads. `signed`: the write links carry a token (accounts required; see entity_file)."""
     if not entity or not isinstance(entity.get("extendedStorage"), dict):
         return entity
     url = f"https://{request.host}/_powder/entity-files/{entity['entityId']}"
-    expires = datetime.datetime.fromtimestamp(time.time() + STORAGE_LINK_S, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    links = ({"putUrl": url, "deleteUrl": url} if write else {}) | {"headUrl": url, "getUrl": url}
+    expires = int(time.time()) + STORAGE_LINK_S
+    write_url = f"{url}?t={file_token(entity['entityId'], expires)}" if signed else url
+    links = ({"putUrl": write_url, "deleteUrl": write_url} if write else {}) | {"headUrl": url, "getUrl": url}
+    expiration = datetime.datetime.fromtimestamp(expires, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {**entity, "extendedStorage": {**entity["extendedStorage"], "provider": "s3", **links,
-                                          "expirationTime": expires}}
+                                          "expirationTime": expiration}}
 
 
 async def entity_file(request: web.Request) -> web.StreamResponse:
-    """The file behind an entity's links: PUT (upload), GET / HEAD (download), DELETE."""
+    """The file behind an entity's links: PUT (upload), GET / HEAD (download), DELETE. With accounts required, a
+    write needs the link's token or a session of the entity's owner (an empty 403 otherwise); downloads stay
+    open."""
     entity_id = request.match_info["entity_id"].lower()
-    if not ENTITY_FILE.match(entity_id) or request.app[SERVICES].entities.get(entity_id) is None:
+    entity = request.app[SERVICES].entities.get(entity_id) if ENTITY_FILE.match(entity_id) else None
+    if entity is None:
         return web.Response(status=404)
+    if request.method in ("PUT", "POST", "DELETE") and accounts_required(request):
+        owners = _owner(request) is not None and _owner(request) == entity.get("profileId")
+        if not owners and not file_token_ok(entity_id, request.query.get("t", "")):
+            log.warning("entity file %s: %s from %s refused (no valid link token, not the owner's session)",
+                        entity_id, request.method, client_ip(request))
+            request[HOW] = "forbidden"
+            return web.Response(status=403)
     path = request.app[DATA_DIR] / "entity-files" / entity_id
     if request.method in ("PUT", "POST"):
         data = await request.read()
@@ -201,6 +314,7 @@ async def entity_file(request: web.Request) -> web.StreamResponse:
 
 async def get_profile_entities(request: web.Request) -> web.StreamResponse:
     """GET /v2/profiles/{pid}/entities?type=&tags=&offset=&limit= (own player from the DB)."""
+    reader(request)
     entities = request.app[SERVICES].entities
     pid = request.match_info["profile_id"]
     q = request.query
@@ -211,6 +325,7 @@ async def get_profile_entities(request: web.Request) -> web.StreamResponse:
 async def get_entities_batch(request: web.Request) -> web.StreamResponse:
     """GET /v2/profiles/entities?profileIds=a,b&type=PROFILE (rider cards of friends and self), also
     with tags (the friends' trails: type=FAVORITE_CHALLENGE&tags=TRAIL,WORLD_<id>,SANDBOX_A)."""
+    reader(request)
     q = request.query
     ids = [p for p in q.get("profileIds", "").split(",") if p]
     items = request.app[SERVICES].entities.for_profiles(ids, q.get("type"), q.get("tags"),
@@ -224,6 +339,7 @@ def _owner(request: web.Request) -> str | None:
 
 
 async def get_entity(request: web.Request) -> web.StreamResponse:
+    reader(request)
     e = request.app[SERVICES].entities.get(request.match_info["entity_id"])
     if e is None:
         return json_response(request, {"errorCode": 1002, "message": "entity not found", "httpCode": 404},
@@ -231,27 +347,66 @@ async def get_entity(request: web.Request) -> web.StreamResponse:
     return json_response(request, _storage(request, e), "entity")
 
 
+def _text(entity, key: str) -> str | None:
+    value = entity.get(key) if isinstance(entity, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _check_entity_owner(request: web.Request, me: Actor, existing: dict | None, body) -> None:
+    """With accounts required: the entity (if it exists) must be the actor's, and a body naming an owner must
+    name the actor (EntityService.put would take it for a new entity)."""
+    if not me.guarded:
+        return
+    def others(owner: str | None) -> bool:
+        return owner is not None and owner.lower() != me.pid
+    if others(_text(existing, "profileId")):
+        raise Refused(forbidden(request, "not your entity"))
+    if existing is None and others(_text(body, "profileId")):
+        raise Refused(forbidden(request, "not your profile"))
+
+
+def _bad_request(request: web.Request, message: str) -> web.Response:
+    return json_response(request, {"errorCode": 1, "message": message, "httpCode": 400}, "bad-request", 400)
+
+
 async def put_entity(request: web.Request) -> web.Response:
+    me = acting(request)
+    entity_id = request.match_info["entity_id"]
     try:
         body = await request.json()
-        e = request.app[SERVICES].entities.put(request.match_info["entity_id"], body, _owner(request))
+        _check_entity_owner(request, me, request.app[SERVICES].entities.get(entity_id), body)
+        # no accounts: the session's player (none: the body must name the owner), as before
+        e = request.app[SERVICES].entities.put(entity_id, body, me.pid if me.guarded else _owner(request))
     except ValueError as err:
-        return json_response(request, {"errorCode": 1, "message": str(err), "httpCode": 400}, "bad-request", 400)
-    return json_response(request, _storage(request, e, write=True), f"entity-saved(rev {e['revision']})")
+        return _bad_request(request, str(err))
+    return json_response(request, _storage(request, e, write=True, signed=me.guarded),
+                         f"entity-saved(rev {e['revision']})")
 
 
 async def post_entity(request: web.Request) -> web.Response:
     """POST /v2/profiles/entities and /v2/profiles/{pid}/entities (e.g. a new player's rider card)."""
-    owner = (request.match_info.get("profile_id") or _owner(request)
-             or request.app[SERVICES].default_player_id()).lower()
+    me = acting(request)
+    in_path = request.match_info.get("profile_id")
+    if not in_path or in_path.lower() == me.pid:
+        owner = me.pid
+    elif me.guarded:
+        return forbidden(request, "not your profile")
+    else:
+        owner = url_profile_id(in_path)
+        if owner is None:
+            return _bad_request(request, "bad profile id")
     try:
-        e = request.app[SERVICES].entities.create(await request.json(), owner)
+        body = await request.json()
+        _check_entity_owner(request, me, None, body)
+        e = request.app[SERVICES].entities.create(body, owner)
     except ValueError as err:
-        return json_response(request, {"errorCode": 1, "message": str(err), "httpCode": 400}, "bad-request", 400)
-    return json_response(request, _storage(request, e, write=True), "entity-created")
+        return _bad_request(request, str(err))
+    return json_response(request, _storage(request, e, write=True, signed=me.guarded), "entity-created")
 
 
 async def delete_entity(request: web.Request) -> web.Response:
+    me = acting(request)
+    _check_entity_owner(request, me, request.app[SERVICES].entities.get(request.match_info["entity_id"]), None)
     deleted = request.app[SERVICES].entities.delete(request.match_info["entity_id"])
     if ENTITY_FILE.match(request.match_info["entity_id"].lower()):
         (request.app[DATA_DIR] / "entity-files" / request.match_info["entity_id"].lower()).unlink(missing_ok=True)
@@ -267,10 +422,15 @@ async def internet_check(request: web.Request) -> web.Response:
 
 
 def _cloud_owner(request: web.Request) -> str:
-    """Whose cloud save: the signed-in player (Connect's ticket), else the profile in the path, else the
-    default player (a server without accounts)."""
-    return (_owner(request) or request.match_info.get("profile_id")
-            or request.app[SERVICES].default_player_id()).lower()
+    """Whose cloud save: the signed-in player (Connect's ticket). Without a session: on a server without
+    accounts the profile in the path (if shaped like one), else the default player; once accounts are
+    required, Refused (401)."""
+    me = _owner(request)
+    if me:
+        return me.lower()
+    if accounts_required(request):
+        raise Refused(no_session(request))
+    return url_profile_id(request.match_info.get("profile_id")) or request.app[SERVICES].default_player_id().lower()
 
 
 async def get_entities_v1(request: web.Request) -> web.StreamResponse:
@@ -295,6 +455,10 @@ async def write_cloud_entity(request: web.Request) -> web.Response:
         return json_response(request, {"errorCode": 1, "message": "not a cloud save", "httpCode": 400},
                              "bad-request", 400)
     owner = _cloud_owner(request)
+    in_path = (request.match_info.get("profile_id") or "").lower()
+    if in_path and in_path != owner and accounts_required(request):
+        return forbidden(request, "not your profile")
+    body.pop("profileId", None)                   # the owner is the session's (or the path's), never the body's
     services = request.app[SERVICES]
     entity_id = request.match_info.get("entity_id")
     slots = [(s.get("filename"), s.get("size")) for s in (body.get("obj") or {}).get("slots", []) if isinstance(s, dict)]

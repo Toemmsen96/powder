@@ -12,6 +12,9 @@ Seen live: a photo is created with POST /ugc/v1/ {typeId 2, worldId, metadata (w
 time of day, camera settings, ...), tags, datas: the JPEG, Thumbnail: a small JPEG, both base64}; the two
 pictures are kept as the item's files (Data, Thumbnail), not in the item. The JPEGs themselves carry no
 metadata. Deleting is DELETE {id} followed by PUT {id}/hide. {id}/url comes from the game's code.
+
+Once accounts are required, every call but the file downloads needs a session (routes_ubi.py, "who may act"),
+and only an item's owner uploads its files.
 """
 from __future__ import annotations
 
@@ -25,8 +28,9 @@ import uuid
 
 from aiohttp import web
 
+from ...util import clip
 from .keys import DATA_DIR, HOW, SERVICES, SESSION
-from .routes_ubi import json_response
+from .routes_ubi import accounts_required, acting, forbidden, json_response, no_session
 
 log = logging.getLogger("powder.https")
 FILE_NAME = re.compile(r"^[0-9a-f-]{36}(_thumbnail)?$")
@@ -35,8 +39,9 @@ FILE_FIELDS = {"datas": "", "Thumbnail": "_thumbnail"}     # inline pictures of 
 
 
 def _me(request: web.Request) -> str:
-    session = request.get(SESSION)
-    return session.profile_id if session else request.app[SERVICES].default_player_id()
+    """Who is asking: the session's player; without one the default player while accounts are not required,
+    else Refused (401)."""
+    return acting(request).pid
 
 
 def _links(request: web.Request, ugc_id: str) -> dict:
@@ -64,6 +69,7 @@ def _int(value) -> int | None:
 
 
 async def ugc_list(request: web.Request) -> web.Response:
+    _me(request)
     q = request.query
     profiles = q.getall("profile_id", [])
     items = request.app[SERVICES].repos.ugc.find(_int(q.get("type_id")), _int(q.get("world_id")), profiles or None)
@@ -88,6 +94,7 @@ def _save_inline(request: web.Request, name: str, value) -> None:
 
 
 async def ugc_create(request: web.Request) -> web.Response:
+    me = _me(request)
     raw = await request.read()
     try:
         body = json.loads(raw) if raw else {}
@@ -96,28 +103,28 @@ async def ugc_create(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     pictures = {field: body.pop(field, None) for field in FILE_FIELDS}
-    log.info("ugc create from %s (%d B): %s", _me(request), len(raw), json.dumps(body)[:1500])
+    log.info("ugc create from %s (%d B): %s", me, len(raw), clip(json.dumps(body)))
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     type_id = _int(body.get("typeId", body.get("type_id"))) or 0
     world_id = _int(body.get("worldId", body.get("world_id", metadata.get("worldId"))))
     tags = body.get("tags") if isinstance(body.get("tags"), list) else []
     known = {"metadata", "typeId", "type_id", "worldId", "world_id", "tags", "id", "profileId"}
     extra = {k: v for k, v in body.items() if k not in known}
-    item = request.app[SERVICES].repos.ugc.create(str(uuid.uuid4()), type_id, world_id, _me(request), metadata,
-                                                    tags, extra)
+    item = request.app[SERVICES].repos.ugc.create(str(uuid.uuid4()), type_id, world_id, me, metadata, tags, extra)
     for field, suffix in FILE_FIELDS.items():
         _save_inline(request, item["ugc_id"] + suffix, pictures[field])
-    log.info("ugc %s created (type %d, world %s) by %s", item["ugc_id"], type_id, world_id, _me(request))
+    log.info("ugc %s created (type %d, world %s) by %s", item["ugc_id"], type_id, world_id, me)
     return json_response(request, _out(request, item), "ugc-created")
 
 
 async def ugc_item(request: web.Request) -> web.Response:
+    me = _me(request)
     repo, ugc_id = request.app[SERVICES].repos.ugc, request.match_info["ugc_id"]
     item = repo.get(ugc_id)
     if item is None:
         return web.json_response({"error": "not found"}, status=404)
     if request.method == "DELETE":
-        if item["profile_id"] == _me(request).lower():
+        if item["profile_id"] == me:
             repo.delete(ugc_id)
             for name in (ugc_id, f"{ugc_id}_thumbnail"):
                 (_files(request) / name).unlink(missing_ok=True)
@@ -128,16 +135,17 @@ async def ugc_item(request: web.Request) -> web.Response:
 
 
 async def ugc_action(request: web.Request) -> web.Response:
+    me = _me(request)
     repo, ugc_id, action = request.app[SERVICES].repos.ugc, request.match_info["ugc_id"], request.match_info["action"]
     item = repo.get(ugc_id)
     request[HOW] = f"ugc-{action}"
     if item is None:                    # e.g. the hide the game sends right after deleting
         return web.Response(status=204)
     if action == "like":
-        repo.like(ugc_id, _me(request), request.method != "DELETE")
+        repo.like(ugc_id, me, request.method != "DELETE")
     elif action == "download":
         repo.downloaded(ugc_id)
-    elif action == "hide" and item["profile_id"] == _me(request).lower():
+    elif action == "hide" and item["profile_id"] == me:
         repo.hide(ugc_id)
     elif action == "url":
         return json_response(request, _links(request, ugc_id), "ugc-url")
@@ -147,11 +155,19 @@ async def ugc_action(request: web.Request) -> web.Response:
 
 
 async def ugc_file(request: web.Request) -> web.StreamResponse:
-    """The files behind an item's links: the game uploads (PUT/POST) and downloads (GET) them here."""
+    """The files behind an item's links: the game uploads (PUT/POST) and downloads (GET) them here. Downloads are
+    open (the links are in every listing); once accounts are required, only the item's owner (its session)
+    uploads."""
     name = request.match_info["name"]
     item = request.app[SERVICES].repos.ugc.get(name.split("_")[0]) if FILE_NAME.match(name) else None
     if item is None:
         return web.Response(status=404)
+    if request.method in ("PUT", "POST") and accounts_required(request):
+        session = request.get(SESSION)
+        if session is None:
+            return no_session(request)
+        if session.profile_id != item["profile_id"]:
+            return forbidden(request, "not your item")
     path = _files(request) / name
     for field, suffix in FILE_FIELDS.items():                   # stored inside the item before files were
         if not (_files(request) / (item["ugc_id"] + suffix)).exists():

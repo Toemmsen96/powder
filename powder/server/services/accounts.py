@@ -5,26 +5,36 @@ with the email and password (`Basic`), later with the remember-me ticket we gave
 the database so it outlives a server restart). The game logs in with a ticket Ubisoft Connect made
 (`uplaypc_v1`); it is the player Connect signed in as on the same PC.
 
-Before the first account exists, a server works as it did before accounts: every credential is
-accepted and the AccountResolver ([players.bind], else the default player) decides who it is.
+Before the first account exists (and unless [server] public is set), a server works as it did before
+accounts: every credential is accepted and the AccountResolver ([players.bind], else the default player)
+decides who it is. Only a registration from the server's own PC (loopback) takes over the default player.
 
 Lenient mode (default, [server] strict_tickets = false): a ticket we do not know (e.g. the server
 was restarted while the game kept running) is not rejected; the request is attributed to the latest
 session from the same address (or, without accounts, via the AccountResolver) and a warning is
-logged. Strict mode refuses it.
+logged. Strict mode refuses it; a public server ([server] public) is always strict.
 
-Passwords are hashed with scrypt and never logged or stored in clear.
+The game's own login (`uplaypc_v1`, a ticket Ubisoft Connect made that we cannot read) is the player whose
+Connect signed in last from the same address. Nothing we serve ties that ticket to one Connect session, so
+players behind one NAT address who start their games at the same time can be taken for each other there.
+
+Passwords are hashed with scrypt and never logged or stored in clear. A hash takes tens of milliseconds and
+16 MiB: the HTTPS routes use the *_async methods, which hash on a few worker threads (MAX_CONCURRENT_HASHES)
+instead of blocking the event loop; more sign-ins wait their turn.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import logging
 import re
 import secrets
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from ..config import Config
@@ -39,6 +49,8 @@ MIN_PASSWORD = 8
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,15}$")         # like Ubisoft names: 3-15 letters, digits, . _ -
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+MAX_CONCURRENT_HASHES = 4                               # scrypt runs at once for the routes (16 MiB each)
+_HASHING = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_HASHES, thread_name_prefix="powder-hash")
 
 
 class AuthError(Exception):
@@ -71,6 +83,21 @@ def check_password(password: str, stored: str) -> bool:
 _DUMMY_HASH = hash_password(secrets.token_urlsafe(16))     # checked for unknown emails (see authenticate)
 
 
+async def off_loop(fn, *args):
+    """fn(*args) on one of the hashing threads (hashlib.scrypt releases the GIL), so the event loop goes on."""
+    return await asyncio.get_running_loop().run_in_executor(_HASHING, fn, *args)
+
+
+def may_take_over(client_ip: str) -> bool:
+    """Whether a registration from this address may take over the default player: only from the server's own
+    PC (127.0.0.0/8, ::1, IPv4-mapped loopback)."""
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return ip.is_loopback or bool(ip.version == 6 and ip.ipv4_mapped and ip.ipv4_mapped.is_loopback)
+
+
 def basic_credentials(value: str) -> tuple[str, str] | None:
     """`Basic` value -> (email, password), or None if it holds none (the game sends empty ones)."""
     try:
@@ -100,18 +127,55 @@ class AccountService:
 
     @property
     def required(self) -> bool:
-        """Accounts are required once the first one exists."""
-        return self.repos.accounts.count() > 0
+        """Accounts are required once the first one exists, and always on a public server."""
+        return self.config.server.public or self.repos.accounts.count() > 0
+
+    @property
+    def strict_tickets(self) -> bool:
+        """Unknown tickets are refused: [server] strict_tickets, and always on a public server (the lenient
+        fallback would make players behind one NAT address each other)."""
+        return self.config.server.strict_tickets or self.config.server.public
 
     # ---- accounts -----------------------------------------------------------------------------
     def register(self, email: str, password: str, name: str) -> AccountRow:
-        """A new account with its own player. The first account on a server takes over the existing
-        default player (and its progress) if no account owns it yet."""
-        email, name = email.strip(), name.strip()
+        """A player registering on the server's own PC (see register_from)."""
+        return self.register_from(email, password, name, "127.0.0.1")
+
+    def register_from(self, email: str, password: str, name: str, client_ip: str) -> AccountRow:
+        """A player registering from `client_ip`: refused while [players] registration = "closed". Only from
+        the server's own PC (loopback) may the first account take over the default player; from elsewhere it
+        gets a new player, so a stranger can't claim the host's (imported) progress on a fresh server."""
+        email = self._check_registration(email, password)
+        return self._new_account(email, hash_password(password), name, may_take_over(client_ip))
+
+    async def register_async(self, email: str, password: str, name: str, client_ip: str) -> AccountRow:
+        """register_from, hashing off the event loop."""
+        email = self._check_registration(email, password)
+        return self._new_account(email, await off_loop(hash_password, password), name, may_take_over(client_ip))
+
+    def create_account(self, email: str, password: str, name: str) -> AccountRow:
+        """The host's `admin account-create`: also while registrations are closed; the first account takes
+        over the default player, like one registered on the server's PC."""
+        email = email.strip()
         self._check_email(email)
         self._check_password(password)
+        return self._new_account(email, hash_password(password), name, True)
+
+    def _check_registration(self, email: str, password: str) -> str:
+        if self.config.players.registration == "closed":
+            raise AccountError("This server does not take registrations; ask its host for an account.")
+        email = email.strip()
+        self._check_email(email)
+        self._check_password(password)
+        return email
+
+    def _new_account(self, email: str, password_hash: str, name: str, take_over: bool) -> AccountRow:
+        """A new account with its own player. With `take_over`, the first account on a server takes over the
+        existing default player (and its progress) if no account owns it yet."""
+        name = name.strip()
         with self.repos.db.transaction():
-            profile_id = self._claimable_player()
+            self._check_email(email)                    # again: another registration may have come meanwhile
+            profile_id = self._claimable_player() if take_over else None
             if profile_id is None:
                 self._check_name(name)
                 profile_id = str(uuid.uuid4())
@@ -119,7 +183,7 @@ class AccountService:
             elif name and name != self.repos.players.get(profile_id).name:
                 self._check_name(name, profile_id)
                 self.repos.players.rename(profile_id, name)
-            account = self.repos.accounts.create(str(uuid.uuid4()), email, hash_password(password), profile_id)
+            account = self.repos.accounts.create(str(uuid.uuid4()), email, password_hash, profile_id)
         log.info("account %s registered for player %s (%s)", account.account_id,
                  self.repos.players.get(profile_id).name, profile_id)
         return account
@@ -128,6 +192,10 @@ class AccountService:
         """Name of the player a new account would take over (see register), else None."""
         pid = self._claimable_player()
         return self.repos.players.get(pid).name if pid else None
+
+    def claimable_player_name_for(self, client_ip: str) -> str | None:
+        """The same for a registration from `client_ip` (see register_from)."""
+        return self.claimable_player_name() if may_take_over(client_ip) else None
 
     def _claimable_player(self) -> str | None:
         if self.repos.accounts.count():
@@ -142,6 +210,15 @@ class AccountService:
             raise AuthError("wrong email or password")
         return account
 
+    async def authenticate_async(self, email: str, password: str) -> AccountRow:
+        """authenticate, hashing off the event loop."""
+        account = self.repos.accounts.by_email(email or "")
+        ok = await off_loop(check_password, password or "", account.password_hash if account else _DUMMY_HASH)
+        account = self.repos.accounts.get(account.account_id) if account else None    # as it is now
+        if not ok or not account:
+            raise AuthError("wrong email or password")
+        return account
+
     def change_email(self, account: AccountRow, new_email: str) -> AccountRow:
         new_email = new_email.strip()
         self._check_email(new_email, account.account_id)
@@ -153,7 +230,15 @@ class AccountService:
         """Ubisoft Connect's remember-me tickets stop working, so its next sign-in needs the new password; a
         game that is running now stays connected."""
         self._check_password(new_password)
-        self.repos.accounts.update(account.account_id, password_hash=hash_password(new_password))
+        return self._set_password(account, hash_password(new_password))
+
+    async def change_password_async(self, account: AccountRow, new_password: str) -> AccountRow:
+        """change_password, hashing off the event loop."""
+        self._check_password(new_password)
+        return self._set_password(account, await off_loop(hash_password, new_password))
+
+    def _set_password(self, account: AccountRow, password_hash: str) -> AccountRow:
+        self.repos.accounts.update(account.account_id, password_hash=password_hash)
         revoked = self.repos.remember_tickets.revoke_all(account.account_id)
         log.info("account %s: password changed, %d remember-me ticket(s) revoked", account.account_id, revoked)
         return self.repos.accounts.get(account.account_id)
@@ -206,9 +291,19 @@ class AccountService:
     # ---- login --------------------------------------------------------------------------------
     def login(self, req: LoginRequest) -> PlayerSession:
         """POST /v3/profiles/sessions -> a new session of ours, or AuthError."""
+        profile_id, how = self._identify(req)
+        return self._issue(req, profile_id, how)
+
+    async def login_async(self, req: LoginRequest) -> PlayerSession:
+        """login, checking an email and password (`Basic`) off the event loop."""
+        creds = basic_credentials(req.auth_value) if req.auth_scheme.lower() == "basic" else None
+        if creds and self.required:
+            return self._issue(req, (await self.authenticate_async(*creds)).profile_id, "email and password")
+        return self.login(req)
+
+    def _issue(self, req: LoginRequest, profile_id: str, how: str) -> PlayerSession:
         app_id = {k.lower(): v for k, v in req.headers.items()}.get("ubi-appid", "").lower()
         connect = app_id if app_id and app_id != APP_ID else ""        # Ubisoft Connect and its parts
-        profile_id, how = self._identify(req)
         session = self.sessions.issue(self.player(profile_id), req.client_ip, app_id=connect)
         log.info("login %s (%s) from %s%s: %s", session.player.name, profile_id, req.client_ip,
                  " [Ubisoft Connect]" if connect else "", how)
@@ -252,7 +347,7 @@ class AccountService:
     def session_for_ticket(self, ticket: str, client_ip: str) -> PlayerSession | None:
         """HTTPS `Ubi_v1 t=` ticket or NEX LoginWithToken token -> session (lenient fallback)."""
         s = self.sessions.by_token(ticket) if ticket else None
-        if s or self.config.server.strict_tickets:
+        if s or self.strict_tickets:
             return s
         if self.required:
             s = self.sessions.latest_from(client_ip)

@@ -24,8 +24,22 @@ from .services import ServiceContext, answer
 
 log = logging.getLogger("powder.demux")
 
-MAX_MESSAGE = 16 << 20
+# The largest upstream message accepted; a longer one closes the connection. Connect's own are small (the largest,
+# the sign-in with its ticket, is a few KB; cloud saves go over HTTPS links). Replies (owned games, product
+# configurations) go the other way and are not limited. StreamReader.readexactly buffers what arrives (nothing
+# is allocated from the length header), so a header with nothing behind it costs only what was sent.
+MAX_MESSAGE = 1 << 20
 PATCH_BASE_URL = "https://static3.cdn.ubi.com/orbit/releases/0/patches/"   # never fetched: no newer version
+
+
+async def read_message(reader: asyncio.StreamReader, peer: str) -> bytes | None:
+    """The next upstream message (unframed); None: its length is over MAX_MESSAGE (logged; the caller closes).
+    A message cut short raises IncompleteReadError."""
+    n = int.from_bytes(await reader.readexactly(4), "big")
+    if n > MAX_MESSAGE:
+        log.warning("%s: message of %d bytes (at most %d), closing", peer, n, MAX_MESSAGE)
+        return None
+    return await reader.readexactly(n)
 
 
 class DemuxConnection:
@@ -44,13 +58,8 @@ class DemuxConnection:
     # ---- io ---------------------------------------------------------------------------------------
     async def run(self) -> None:
         try:
-            while True:
-                head = await self.reader.readexactly(4)
-                n = int.from_bytes(head, "big")
-                if n > MAX_MESSAGE:
-                    log.warning("%s: message of %d bytes, closing", self.peer, n)
-                    return
-                await self.handle(await self.reader.readexactly(n))
+            while (msg := await read_message(self.reader, self.peer)) is not None:
+                await self.handle(msg)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:

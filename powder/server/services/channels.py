@@ -13,10 +13,15 @@ What it gets back, from Connect's own UI code (no recordings): a channel has id,
 memberships [{profileId, membershipType ACTIVE / PENDING, addedBy}], lastMessage, lastMessageTime,
 unreadCount; a message id, channelId, authorId, type, createTime (plus what Connect sent).
 
-In memory: channels last until the server stops (invites are only useful while both are playing).
+In memory: channels last until the server stops (invites are only useful while both are playing). Bounded, so
+nobody can fill the server's memory with them (as the Rust server): a channel has at most MAX_MEMBERS members
+(more are left out), keeps its newest MAX_MESSAGES messages up to MAX_MESSAGE_BYTES in all, a player has at most
+MAX_CHANNELS_PER_CREATOR channels they created and the server MAX_CHANNELS: creating one more forgets the oldest
+(logged). What one request may carry is limited by the HTTPS body limit for these paths (16 KiB).
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -26,12 +31,32 @@ from ..util import iso_now
 log = logging.getLogger("powder.channels")
 
 DM, GROUP = "DM", "GROUP"
+MAX_MEMBERS = 100                    # of one channel, its creator included (a DM has 2; Connect's groups are small)
+MAX_MESSAGES = 100                   # a channel keeps (newest first), and their JSON size in all
+MAX_MESSAGE_BYTES = 64 << 10
+MAX_CHANNELS_PER_CREATOR = 32        # channels one player created, and channels in all: one more forgets the
+MAX_CHANNELS = 512                   # oldest of them
+
+
+def json_size(value) -> int:
+    """Its size as compact JSON (as the Rust server counts it)."""
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
 
 
 @dataclass
 class Channel:
     data: dict                                          # the channel object as Connect gets it
-    messages: list[dict] = field(default_factory=list)
+    messages: list[dict] = field(default_factory=list)  # newest first
+    creator: str = ""
+    message_bytes: int = 0                              # the messages' JSON size in all
+
+    def add_message(self, message: dict) -> None:
+        """Newest first, dropping the oldest beyond MAX_MESSAGES / MAX_MESSAGE_BYTES (the new one stays)."""
+        self.message_bytes += json_size(message)
+        self.messages.insert(0, message)
+        while len(self.messages) > 1 and (len(self.messages) > MAX_MESSAGES
+                                          or self.message_bytes > MAX_MESSAGE_BYTES):
+            self.message_bytes = max(0, self.message_bytes - json_size(self.messages.pop()))
 
     @property
     def id(self) -> str:
@@ -56,6 +81,9 @@ class ChannelService:
         """POST /v1/spaces/{space}/channels: an existing DM with the same members is returned instead."""
         me = profile_id.lower()
         wanted = {me} | {p.lower() for p in body.get("members") or [] if isinstance(p, str)}
+        if len(wanted) > MAX_MEMBERS:
+            log.warning("channel from %s for %d members: only %d kept", me, len(wanted), MAX_MEMBERS)
+            wanted = {me} | set(sorted(wanted - {me})[:MAX_MEMBERS - 1])
         requested = body.get("channel") if isinstance(body.get("channel"), dict) else {}
         ctype = requested.get("type") or (DM if len(wanted) == 2 else GROUP)
         for c in self.channels.values():
@@ -66,7 +94,14 @@ class ChannelService:
                 "memberships": [{"profileId": p, "membershipType": "ACTIVE", "addedBy": me, "joinTime": now}
                                 for p in [me, *sorted(wanted - {me})]],
                 "createTime": now, "updateTime": now, "lastMessage": None, "lastMessageTime": now, "unreadCount": 0}
-        channel = Channel(data)
+        mine = [c for c in self.channels.values() if c.creator == me]
+        oldest = mine[0] if len(mine) >= MAX_CHANNELS_PER_CREATOR else \
+            next(iter(self.channels.values())) if len(self.channels) >= MAX_CHANNELS else None
+        if oldest is not None:
+            del self.channels[oldest.id]
+            log.info("channel %s forgotten (the oldest of %s): %s created another", oldest.id,
+                     "theirs" if len(mine) >= MAX_CHANNELS_PER_CREATOR else "all", me)
+        channel = Channel(data, creator=me)
         self.channels[channel.id] = channel
         log.info("channel %s (%s) created by %s for %s", channel.id, ctype, me, sorted(wanted - {me}))
         for p in wanted - {me}:
@@ -82,7 +117,7 @@ class ChannelService:
         now = iso_now()
         message = {**body, "id": str(uuid.uuid4()), "channelId": channel_id, "authorId": me,
                    "type": body.get("type") or "TEXT_MESSAGE", "createTime": now}
-        channel.messages.insert(0, message)
+        channel.add_message(message)
         channel.data.update(lastMessage=message, lastMessageTime=now)
         log.info("channel %s: %s message from %s", channel_id, message["type"], me)
         for p in channel.members:

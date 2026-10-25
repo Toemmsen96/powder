@@ -1,10 +1,13 @@
 """HTTPS server for every UbiServices/Olympus hostname (the hosts file points them all at us).
 
 Request pipeline (outermost first):
-  log_middleware      access log + keeps uploaded remotelog/events bodies (they explain client errors)
-  cors_middleware     CORS for Ubisoft Connect's web UI (preflights, Allow-Origin)
+  limits_middleware   reads the body within its path's limit (413), time (408) and the memory budget (limits.py)
+  log_middleware      access log + keeps uploaded remotelog/events bodies (they explain client errors; cut to
+                      256 KiB each, the newest 200)
+  cors_middleware     CORS for Ubisoft Connect's web UI (preflights, Allow-Origin); Ubisoft's origins only,
+                      other origins may only GET / HEAD (see connect_origin)
   plugin_middleware   plugins.before_http hooks may answer a request themselves
-  session_middleware  `Authorization: Ubi_v1 t=<ticket>` -> request[SESSION]
+  session_middleware  `Authorization: Ubi_v1 t=<ticket>` -> request[SESSION]; answers a route's Refused
   routes              routes_ubi.py (real logic), routes_profile.py (player-related, generated),
                       routes_powder.py (/_powder/), websocket.py
   fallback            game-data pack reply (configs) or `{}` + UNMATCHED warning
@@ -12,64 +15,180 @@ Routes match on the path only; the host matters only for the pack.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
 import re
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import StreamReader, web
 
 from ... import tls
 from ...builtin import http as builtin_http
 from ...constants import APP_ID
 from ...core.identity import parse_authorization
 from . import routes_profile, routes_powder, routes_ubi, routes_ugc
-from .keys import DATA_DIR, FALLBACK, HOW, NEX_PUBLIC_KEY, PLUGINS, SERVICES, SESSION
-from .routes_ubi import client_ip
+from . import limits as body_limits
+from .keys import BUDGETS, DATA_DIR, FALLBACK, HOW, LIMITS, NEX_PUBLIC_KEY, PLUGINS, SERVICES, SESSION
+from .routes_ubi import Refused, client_ip
 from .websocket import websocket
 
 log = logging.getLogger("powder.https")
 SAVED_UPLOADS = ("/remotelog", "/profiles/me/events")
+# Kept uploads (data/bodies/): each cut to this much (a remotelog or events batch is a few KB), and only the newest
+# so many (the oldest are deleted), so they cannot fill the disk.
+KEPT_BODY_MAX = 256 << 10
+KEPT_BODIES = 200
+SAVED_KINDS = ("remotelog", "events")
 
 
 def host_of(request: web.Request) -> str:
     return (request.host or "").split(":")[0].lower()
 
 
+def access_log(request: web.Request, how: str, status: int, size) -> None:
+    line = f"{request.method} {host_of(request)}{request.path_qs[:160]} -> {how} {status} ({size}B)"
+    if how == "UNMATCHED":
+        log.warning(line)
+    elif request.path.startswith("/_powder/"):        # the launcher polls these every few seconds
+        log.debug(line)
+    else:
+        log.info(line)
+
+
+async def refused(request: web.Request, status: int, message: str, how: str) -> web.Response:
+    """A request refused before the pipeline (its body): UbiServices' error shape, sent, and the connection closed
+    right after (its body was not read to the end; aiohttp would otherwise read on for up to 10 s)."""
+    body = json.dumps({"errorCode": 1, "message": message, "httpCode": status}).encode()
+    response = web.Response(status=status, body=body, headers={"Content-Type": routes_ubi.JSON})
+    response.force_close()
+    log.warning("%s %s%s from %s: %s", request.method, host_of(request), request.path, request.remote, message)
+    access_log(request, how, status, len(body))
+    await response.prepare(request)
+    await response.write_eof()
+    if request.protocol is not None:
+        request.protocol.force_close()                  # closes the transport once the reply is out
+    return response
+
+
+@web.middleware
+async def limits_middleware(request: web.Request, handler):
+    """The body, read in full before anything else, within its path's limit and time, counted against the
+    bodies' memory budget until the reply is made (handlers then get it from request.read() as before)."""
+    if not request.body_exists:
+        return await handler(request)
+    limits = request.app[LIMITS]
+    limit, kind = body_limits.body_rules(request.path)
+    timeout = limits.body_timeout(kind)
+    budget = request.app[BUDGETS][kind]
+    try:
+        async with asyncio.timeout(timeout):
+            body, held = await body_limits.read_body(request.content, request.content_length, limit, budget)
+    except body_limits.BodyTooLarge:
+        return await refused(request, 413, f"Request body too large (at most {limit} bytes).", "body-too-large")
+    except TimeoutError:
+        return await refused(request, 408, f"Request body not received within {int(timeout)} s.", "body-timeout")
+    replay(request, body)
+    try:
+        return await handler(request)
+    finally:
+        budget.release(held)
+
+
+def replay(request: web.Request, body: bytes) -> None:
+    """Make the body read by limits_middleware the request's again: request.read() / .json() return it,
+    request.content streams it and can_read_body says whether there is one, as if nothing had read it."""
+    stream = StreamReader(request.protocol, max(len(body), 1 << 16) + 1, loop=asyncio.get_running_loop())
+    if body:
+        stream.feed_data(body)
+    stream.feed_eof()
+    request._payload = stream                           # aiohttp's own attributes: there is no public setter
+    request._read_bytes = body
+
+
+def keep_upload(data_dir: Path, path: str, body: bytes) -> None:
+    """Keep an uploaded remotelog / events body in data/bodies/ (cut to KEPT_BODY_MAX), then only the newest
+    KEPT_BODIES of them."""
+    kind = "remotelog" if path.endswith("/remotelog") else "events"
+    bodies = data_dir / "bodies"
+    try:
+        bodies.mkdir(parents=True, exist_ok=True)
+        (bodies / datetime.datetime.now().strftime(f"{kind}-%Y%m%d-%H%M%S-%f.txt")).write_bytes(body[:KEPT_BODY_MAX])
+    except OSError as e:
+        log.warning("keeping a %s upload: %s", kind, e)
+    if len(body) > KEPT_BODY_MAX:
+        log.debug("kept %s upload cut to %d of %d bytes", kind, KEPT_BODY_MAX, len(body))
+    prune_kept(bodies, KEPT_BODIES)
+
+
+def prune_kept(bodies: Path, keep: int) -> None:
+    """Delete the oldest kept uploads beyond the newest `keep` (names sort by time after their kind)."""
+    try:
+        kept = sorted((p.name.split("-", 1)[1], p) for p in bodies.iterdir()
+                      if "-" in p.name and p.name.split("-", 1)[0] in SAVED_KINDS and p.name.endswith(".txt"))
+    except OSError:
+        return
+    for _, p in kept[:max(0, len(kept) - keep)]:
+        p.unlink(missing_ok=True)                       # another request may have deleted it already
+
+
 @web.middleware
 async def log_middleware(request: web.Request, handler):
     path = request.path
     if request.method == "POST" and path.endswith(SAVED_UPLOADS) and request.can_read_body:
-        body = await request.read()
-        kind = "remotelog" if path.endswith("/remotelog") else "events"
-        bodies = request.app[DATA_DIR] / "bodies"
-        bodies.mkdir(parents=True, exist_ok=True)
-        (bodies / datetime.datetime.now().strftime(f"{kind}-%Y%m%d-%H%M%S-%f.txt")).write_bytes(body)
+        keep_upload(request.app[DATA_DIR], path, await request.read())
     response = await handler(request)
-    how = request.get(HOW, "?")
     size = response.content_length if response.content_length is not None else "-"
-    line = f"{request.method} {host_of(request)}{request.path_qs[:160]} -> {how} {response.status} ({size}B)"
-    if how == "UNMATCHED":
-        log.warning(line)
-    elif path.startswith("/_powder/"):        # the launcher polls these every few seconds
-        log.debug(line)
-    else:
-        log.info(line)
+    access_log(request, request.get(HOW, "?"), response.status, size)
     return response
 
 
 CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
 CORS_EXPOSE = "X-Total-Count, Ubi-TransactionId"
+CONNECT_DOMAINS = ("ubisoft.com", "ubi.com")
+HOSTNAME = re.compile(r"[A-Za-z0-9.-]+")
+
+
+def connect_origin(origin: str) -> bool:
+    """Whether a request's Origin is Ubisoft Connect's embedded browser: its UI and overlay come from Ubisoft's
+    CDN (https://connect.cdn.ubisoft.com, https://<env>connect.cdn.ubisoft.com, ...), so https and a
+    ubisoft.com / ubi.com host (a port allowed). The game, the launcher and Connect's own client send no
+    Origin."""
+    if origin[:8].lower() != "https://":
+        return False
+    host, sep, port = origin[8:].rpartition(":")
+    if not sep or not all(c in "0123456789" for c in port):
+        host = origin[8:]
+    host = host.lower()
+    return bool(HOSTNAME.fullmatch(host)) and any(host == d or host.endswith("." + d) for d in CONNECT_DOMAINS)
+
+
+def same_origin(request: web.Request, origin: str) -> bool:
+    """A page this server served itself (e.g. a plugin's) calling it back: the browser sets Origin to the page's
+    own scheme + host, which no other site can claim."""
+    host = request.headers.get("Host", "")
+    return bool(host) and origin.lower() == f"https://{host}".lower()
 
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
     """Ubisoft Connect's UI is a web page (origin https://connect.cdn.ubisoft.com) calling UbiServices
-    from its embedded browser, which needs CORS: answer preflights and allow the origin, like Ubisoft."""
+    from its embedded browser, which needs CORS: answer preflights and allow the origin, like Ubisoft. Only
+    its origins get CORS headers (with credentials). Another origin's GET / HEAD is answered without them
+    (the browser hides the reply), and so is a page of this server's own; anything else from a foreign
+    origin is refused: the hosts file sends the player's browser here too, so a web page could otherwise post
+    to the server (e.g. register the first account on a server without accounts)."""
     origin = request.headers.get("Origin")
     if not origin:
         return await handler(request)
+    if not connect_origin(origin):
+        if request.method in ("GET", "HEAD") or same_origin(request, origin):
+            return await handler(request)
+        log.warning("%s %s from %s refused: origin %r is not Ubisoft Connect's", request.method, request.path,
+                    client_ip(request), origin)
+        return routes_ubi.json_response(request, {"errorCode": 1, "message": "origin not allowed", "httpCode": 403},
+                                        "cors-refused", 403)
     if request.method == "OPTIONS" and "Access-Control-Request-Method" in request.headers:
         request[HOW] = "cors-preflight"
         response = web.Response(status=200)
@@ -101,7 +220,10 @@ async def session_middleware(request: web.Request, handler):
     scheme, ticket = parse_authorization(request.headers.get("Authorization"))
     if scheme.lower() == "ubi_v1" and ticket:
         request[SESSION] = request.app[SERVICES].accounts.session_for_ticket(ticket, client_ip(request))
-    return await handler(request)
+    try:
+        return await handler(request)
+    except Refused as refused:                          # no session, or someone else's data (routes_ubi.py)
+        return refused.response
 
 
 async def fallback(request: web.Request) -> web.Response:
@@ -173,9 +295,15 @@ def with_storm(body: bytes, settings: dict | None) -> bytes:
     return json.dumps(data).encode()
 
 
-def build_app(services, plugins=None, *, nex_public_key: str = "") -> web.Application:
-    app = web.Application(middlewares=[log_middleware, cors_middleware, plugin_middleware, session_middleware],
-                          client_max_size=64 * 1024 * 1024)   # UGC files (photos, trails)
+def build_app(services, plugins=None, *, nex_public_key: str = "",
+              limits: body_limits.Limits | None = None) -> web.Application:
+    # limits_middleware reads every body first, by path (limits.py); this is only aiohttp's own ceiling
+    app = web.Application(middlewares=[limits_middleware, log_middleware, cors_middleware, plugin_middleware,
+                                       session_middleware], client_max_size=body_limits.MAX_UPLOAD + 1)
+    limits = limits or body_limits.Limits()
+    app[LIMITS] = limits
+    app[BUDGETS] = {body_limits.SMALL: body_limits.Budget(limits.small_budget),
+                    body_limits.UPLOAD: body_limits.Budget(limits.upload_budget)}
     app[SERVICES] = services
     app[PLUGINS] = plugins
     app[NEX_PUBLIC_KEY] = nex_public_key
@@ -186,19 +314,28 @@ def build_app(services, plugins=None, *, nex_public_key: str = "") -> web.Applic
     routes_ubi.add_routes(app)
     routes_ugc.add_routes(app)
     app.router.add_get("/v2/websocket", websocket)
+    app.router.add_get("/v2/websocket/server", websocket)     # Ubisoft Connect's ("websocket/server" in the SDK config)
     app.router.add_route("*", "/{tail:.*}", fallback)      # last: everything else
     return app
 
 
-async def start_crl(crl, host: str, port: int) -> web.AppRunner:
+async def start_crl(crl, host: str, port: int, limits: body_limits.Limits | None = None):
     """Plain HTTP: the local CA's revocation list (Windows checks it for Ubisoft Connect), reached as
-    http://public-ubiservices.ubi.com/powder-ca.crl. `crl` is a callable returning the DER bytes."""
+    http://public-ubiservices.ubi.com/powder-ca.crl. `crl` is a callable returning the DER bytes. With its own
+    connection limits; nothing there takes a body. -> (runner, listener)."""
+    from .. import tls_router
+    limits = limits or body_limits.Limits()
+
     async def serve(request: web.Request) -> web.Response:
         return web.Response(body=crl(), content_type="application/pkix-crl")
-    app = web.Application()
+    app = web.Application(client_max_size=body_limits.MAX_BODY)
     for path in (tls.CRL_PATH, *tls.LEGACY_CRL_PATHS):
         app.router.add_get(path, serve)
-    runner = web.AppRunner(app, access_log=None)
+    runner = web.AppRunner(app, access_log=None, keepalive_timeout=limits.header_read)
     await runner.setup()
-    await web.TCPSite(runner, host, port).start()
-    return runner
+    try:
+        listener = await tls_router.start_plain(runner, host, port, limits)
+    except BaseException:
+        await runner.cleanup()
+        raise
+    return runner, listener

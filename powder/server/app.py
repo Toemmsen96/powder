@@ -16,7 +16,7 @@ from .services import Services
 from .transport import storm, tls_router
 from .transport.demux import server as demux_server
 from .transport.https import app as https_app
-from .transport.https.keys import CA_PEM
+from .transport.https.keys import CA_PEM, LIMITS
 from .transport.nex import secure
 from .transport.nex import server as nex_server
 from .transport.nex.dispatch import RmcDispatcher
@@ -49,16 +49,17 @@ async def run(config: Config) -> None:
     app = https_app.build_app(services, plugins, nex_public_key=public_key)
     pki = tls.ensure_pki(config.data_dir / "tls")
     app[CA_PEM] = pki.ca_pem
-    runner = web.AppRunner(app, access_log=None)
+    limits = app[LIMITS]
+    runner = web.AppRunner(app, access_log=None, keepalive_timeout=limits.header_read)
     await runner.setup()
     # one TLS port for HTTPS and Ubisoft Connect's demux, routed by hostname
     listener = await tls_router.start(runner, demux_server.handler(services), cfg.bind, cfg.https_port,
-                                      pki.server_pem)
+                                      pki.server_pem, limits)
     log.info("HTTPS + Ubisoft Connect demux listening on %s:%d (local CA %s)", cfg.bind, cfg.https_port,
              pki.ca_thumbprint)
-    crl_runner = None
+    crl_runner = crl_listener = None
     try:
-        crl_runner = await https_app.start_crl(pki.crl, cfg.bind, cfg.crl_port)
+        crl_runner, crl_listener = await https_app.start_crl(pki.crl, cfg.bind, cfg.crl_port)
         log.info("CRL on http://%s:%d%s", cfg.bind, cfg.crl_port, tls.CRL_PATH)
     except OSError as e:
         log.warning("cannot serve the CRL on %s:%d (%s): Ubisoft Connect will reject our certificate",
@@ -85,6 +86,7 @@ async def run(config: Config) -> None:
         listener.close()
         await runner.cleanup()
         if crl_runner:
+            crl_listener.close()
             await crl_runner.cleanup()
         services.db.close()
         log.info("stopped")
