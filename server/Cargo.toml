@@ -24,6 +24,7 @@ log = { version = "0.4", features = ["std"] }
 mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
 parking_lot = "0.12"
 regex = "1"
+rpassword = "7"                   # admin account-password: no echo
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

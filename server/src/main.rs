@@ -74,6 +74,22 @@ enum AdminCommand {
         #[arg(value_enum, default_value = "status")]
         action: TrustAction,
     },
+    /// List players.
+    Players,
+    /// List accounts (email -> player).
+    Accounts,
+    /// Create an account (asks for its password); for servers with closed registration.
+    AccountCreate { email: String, name: String },
+    /// Change an account's email.
+    AccountEmail { email: String, new_email: String },
+    /// Set a new password (for a player who forgot theirs; asks for it).
+    AccountPassword { email: String },
+    /// Rename an account's player.
+    AccountRename { email: String, name: String },
+    /// Let an account own another existing player instead.
+    AccountLink { email: String, player: String },
+    /// Delete an account (the player and its progress stay).
+    AccountDelete { email: String },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -99,6 +115,7 @@ fn main() -> Result<()> {
             logging::setup(None, &config.server.log_level);
             match cmd {
                 AdminCommand::Trust { action } => trust(action, &config),
+                cmd => admin(cmd, config),
             }
         }
         Command::Gamedata { cmd } => {
@@ -106,6 +123,65 @@ fn main() -> Result<()> {
             gamedata(cmd, &config)
         }
     }
+}
+
+/// The player and account commands (the host's way out when someone forgets a password).
+fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
+    use powder_server::constants::CREDITS_ITEM;
+    use powder_server::core::sessions::SessionRegistry;
+    use powder_server::services::accounts::AccountService;
+    let config = Arc::new(config);
+    let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
+    db.migrate()?;
+    let repos = Arc::new(Repos::new(db));
+    let accounts = AccountService::new(config.clone(), repos.clone(), Arc::new(SessionRegistry::new()));
+    let account = |email: &str| -> Result<_> {
+        repos.account_by_email(email)?.ok_or_else(|| anyhow::anyhow!("no account with the email {email}"))
+    };
+    let new_password = || -> Result<String> {
+        let password = rpassword::prompt_password("new password: ")?;
+        if password != rpassword::prompt_password("again: ")? {
+            anyhow::bail!("the passwords differ");
+        }
+        Ok(password)
+    };
+    match cmd {
+        AdminCommand::Trust { .. } => unreachable!("handled by trust()"),
+        AdminCommand::Players => {
+            for p in repos.players()? {
+                println!("{}  {:24} credits {}  since {}", p.profile_id, p.name,
+                         repos.quantity(&p.profile_id, CREDITS_ITEM)?, p.created_at);
+            }
+            return Ok(());
+        }
+        AdminCommand::Accounts => {
+            for acc in repos.accounts()? {
+                let name = repos.player(&acc.profile_id)?.map(|p| p.name).unwrap_or_else(|| "?".into());
+                println!("{:32} {name:16} {}  since {}", acc.email, acc.profile_id, acc.created_at);
+            }
+            if !accounts.required()? {
+                println!("no accounts: every sign-in is accepted until the first player registers in the launcher");
+            }
+            return Ok(());
+        }
+        AdminCommand::AccountCreate { email, name } => {
+            let acc = accounts.create_account(&email, &new_password()?, &name)?;
+            println!("created {} -> player {}", acc.email, acc.profile_id);
+            return Ok(());
+        }
+        AdminCommand::AccountEmail { email, new_email } => {
+            accounts.change_email(&account(&email)?, &new_email)?;
+        }
+        AdminCommand::AccountPassword { email } => {
+            let acc = account(&email)?;
+            accounts.change_password(&acc, &new_password()?)?;
+        }
+        AdminCommand::AccountRename { email, name } => accounts.rename(&account(&email)?, &name)?,
+        AdminCommand::AccountLink { email, player } => accounts.link(&account(&email)?, &player)?,
+        AdminCommand::AccountDelete { email } => accounts.delete(&account(&email)?)?,
+    }
+    println!("done");
+    Ok(())
 }
 
 fn gamedata(cmd: GamedataCommand, config: &Config) -> Result<()> {
