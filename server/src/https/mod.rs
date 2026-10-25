@@ -6,17 +6,28 @@
 //!   access log      one line per request; uploaded remotelog/events bodies are kept (they explain client errors)
 //!   CORS            Ubisoft Connect's web UI calls UbiServices from its embedded browser: preflights, Allow-Origin
 //!   mods            `api.before_http` hooks may answer a request themselves
+//!   session         `Authorization: Ubi_v1 t=<ticket>` -> the player's session (handed to the routes)
+//!   routes          method + path pattern -> handler, in the Python server's registration order:
+//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
-//! The UbiServices routes themselves (sessions, profiles, UGC, /_powder/, the websocket) are not ported yet;
-//! until they are, everything they would answer falls through to the pack.
+//! Routes match on the path only (the host matters only for the pack); a route whose path matches but whose
+//! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
+//! Not ported yet: the profile, UGC, /_powder/ and websocket routes, and routes_ubi's inventory, store, entity
+//! and cloud-save routes; until they are, what they would answer falls through to the pack.
+
+pub mod routes_ubi;
 
 use crate::assets::Assets;
 use crate::builtin::http as builtin_http;
 use crate::config::Config;
 use crate::constants::{APP_ID, DEMUX_HOST};
+use crate::core::identity::parse_authorization;
+use crate::core::ratelimit::FailureLimiter;
+use crate::core::sessions::{PlayerSession, SessionRegistry};
 use crate::mods::ModHost;
+use crate::services::accounts::AccountService;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -29,6 +40,7 @@ use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -50,6 +62,18 @@ pub struct HttpState {
     pub config: Arc<Config>,
     pub assets: Arc<Assets>,
     pub mods: Option<Arc<Mutex<ModHost>>>,
+    /// Logins and tickets; its `sessions` registry is the one NEX shares.
+    pub accounts: Arc<AccountService>,
+    /// Failed email + password sign-ins per address.
+    pub login_failures: Arc<FailureLimiter>,
+    /// The key that signs the NEX handshake, as the rendezvous configuration publishes it.
+    pub nex_public_key: String,
+}
+
+impl HttpState {
+    pub fn sessions(&self) -> &Arc<SessionRegistry> {
+        &self.accounts.sessions
+    }
 }
 
 /// One request, read in full.
@@ -69,8 +93,13 @@ impl Req {
         self.path_qs.split('?').next().unwrap_or("")
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// The caller's address (Python's `client_ip`).
+    pub fn client_ip(&self) -> String {
+        self.peer.ip().to_string()
     }
 }
 
@@ -83,9 +112,102 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn new(status: u16, content_type: &str, body: Vec<u8>, how: &str) -> Reply {
+    pub fn new(status: u16, content_type: &str, body: Vec<u8>, how: &str) -> Reply {
         Reply { status, headers: vec![("Content-Type".into(), content_type.into())], body, how: how.into() }
     }
+
+    /// JSON as Python's `json.dumps` writes it (the routes' `json_response`).
+    pub fn json(data: &Value, how: &str, status: u16) -> Reply {
+        Reply::new(status, JSON, crate::util::dumps(data).into_bytes(), how)
+    }
+
+    /// What aiohttp answers when a handler fails.
+    pub fn internal_error(e: &dyn std::fmt::Display) -> Reply {
+        log::error!(target: "powder.https", "request failed: {e:#}");
+        Reply::new(500, "text/plain; charset=utf-8", b"500 Internal Server Error\n\nServer got itself in trouble".to_vec(),
+                   "error")
+    }
+}
+
+// ---- routes -------------------------------------------------------------------------------------------------
+/// What a route handler gets: the request, the path's `{name}` parts and the caller's session (if its ticket
+/// is one of ours, or the lenient fallback found one).
+pub struct Ctx<'a> {
+    pub state: &'a HttpState,
+    pub req: &'a Req,
+    pub params: HashMap<String, String>,
+    pub session: Option<Arc<PlayerSession>>,
+}
+
+impl Ctx<'_> {
+    /// A `{name}` part of the path ("" if the pattern has none).
+    pub fn param(&self, name: &str) -> &str {
+        self.params.get(name).map(String::as_str).unwrap_or("")
+    }
+}
+
+pub type Handler = fn(&Ctx) -> Reply;
+
+pub struct Route {
+    /// "GET" (also answers HEAD, as aiohttp's add_get), "POST", ... or "*".
+    method: &'static str,
+    pattern: Regex,
+    handler: Handler,
+}
+
+impl Route {
+    /// `pattern` in aiohttp's syntax: `{name}` matches one path segment, `{name:regex}` the regex.
+    pub fn new(method: &'static str, pattern: &str, handler: Handler) -> Route {
+        let mut re = String::from("^");
+        let mut rest = pattern;
+        while let Some(start) = rest.find('{') {
+            re.push_str(&regex::escape(&rest[..start]));
+            let end = start + rest[start..].find('}').expect("unclosed { in a route pattern");
+            let (name, part) = rest[start + 1..end].split_once(':').unwrap_or((&rest[start + 1..end], "[^{}/]+"));
+            re.push_str(&format!("(?P<{name}>{part})"));
+            rest = &rest[end + 1..];
+        }
+        re.push_str(&regex::escape(rest));
+        re.push('$');
+        Route { method, pattern: Regex::new(&re).expect("route pattern"), handler }
+    }
+
+    fn matches(&self, method: &str, path: &str) -> Option<HashMap<String, String>> {
+        let method_ok = self.method == "*" || self.method == method || (self.method == "GET" && method == "HEAD");
+        if !method_ok {
+            return None;
+        }
+        let caps = self.pattern.captures(path)?;
+        Some(self.pattern.capture_names().flatten()
+            .filter_map(|n| Some((n.to_string(), caps.name(n)?.as_str().to_string()))).collect())
+    }
+}
+
+/// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
+/// routes_ugc, the websocket; only routes_ubi's sign-in part is ported).
+static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(routes_ubi::routes);
+
+/// `Authorization: Ubi_v1 t=<ticket>` -> the session it belongs to (Python's session_middleware).
+pub fn session_of(state: &HttpState, req: &Req) -> anyhow::Result<Option<Arc<PlayerSession>>> {
+    let (scheme, ticket) = parse_authorization(req.header("Authorization"));
+    if scheme.eq_ignore_ascii_case("ubi_v1") && !ticket.is_empty() {
+        return state.accounts.session_for_ticket(&ticket, &req.client_ip());
+    }
+    Ok(None)
+}
+
+/// After the mods: the session, then the first matching route, else the fallback.
+fn routed(state: &HttpState, req: &Req, routes: &[Route]) -> Reply {
+    let session = match session_of(state, req) {
+        Ok(s) => s,
+        Err(e) => return Reply::internal_error(&e),
+    };
+    for route in routes {
+        if let Some(params) = route.matches(&req.method, req.path()) {
+            return (route.handler)(&Ctx { state, req, params, session });
+        }
+    }
+    fallback(state, req)
 }
 
 /// The whole pipeline for one request.
@@ -102,7 +224,7 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
             r.headers.push(("Access-Control-Allow-Headers".into(), asked.into()));
             r
         }
-        _ => from_mods(state, req).unwrap_or_else(|| fallback(state, req)),
+        _ => from_mods(state, req).unwrap_or_else(|| routed(state, req, &ROUTES)),
     };
     if let Some(origin) = origin {
         reply.headers.push(("Access-Control-Allow-Origin".into(), origin));
@@ -257,7 +379,9 @@ async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, req
         .map(|h| h.split(':').next().unwrap_or("").to_lowercase()).filter(|h| !h.is_empty()).unwrap_or(sni);
     let path_qs = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let req = Req { method: parts.method.to_string(), host, path_qs, headers: parts.headers, body, peer };
-    Ok(to_response(handle(&state, &req)))
+    // the pipeline blocks (SQLite, scrypt for password sign-ins, the mods' lock): off the async workers
+    let reply = tokio::task::spawn_blocking(move || handle(&state, &req)).await?;
+    Ok(to_response(reply))
 }
 
 /// Accept TLS connections on `addr` forever. HTTP ones go through [`handle`]; the demux is not ported yet, so
@@ -340,29 +464,57 @@ where
     }
 }
 
+/// Shared by the HTTPS tests: a state over an in-memory database, requests, reply headers.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
     use crate::assets::{HttpFixture, HttpFixtures};
+    use crate::db::Db;
+    use crate::repos::Repos;
 
-    fn state(fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {
+    pub fn state_with(config: Config, fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {
         let assets = Assets { http: HttpFixtures::new(fixtures), ..Default::default() };
-        HttpState { config: Arc::new(Config::default()), assets: Arc::new(assets),
-                    mods: mods.map(|m| Arc::new(Mutex::new(m))) }
+        let config = Arc::new(config);
+        let db = Arc::new(Db::memory().unwrap());
+        db.migrate().unwrap();
+        let accounts = AccountService::new(config.clone(), Arc::new(Repos::new(db)), Arc::new(SessionRegistry::new()));
+        HttpState { config, assets: Arc::new(assets), mods: mods.map(|m| Arc::new(Mutex::new(m))),
+                    accounts: Arc::new(accounts), login_failures: Arc::new(FailureLimiter::default()),
+                    nex_public_key: "TESTKEY".into() }
     }
 
-    fn req(method: &str, path_qs: &str, headers: &[(&str, &str)]) -> Req {
+    pub fn state(fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {
+        state_with(Config::default(), fixtures, mods)
+    }
+
+    pub fn req_from(peer: &str, method: &str, path_qs: &str, headers: &[(&str, &str)]) -> Req {
         let mut map = HeaderMap::new();
         for (k, v) in headers {
             map.insert(hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
         }
         Req { method: method.into(), host: "public-ubiservices.ubi.com".into(), path_qs: path_qs.into(),
-              headers: map, body: Bytes::new(), peer: "127.0.0.1:5000".parse().unwrap() }
+              headers: map, body: Bytes::new(), peer: format!("{peer}:5000").parse().unwrap() }
     }
 
-    fn header<'a>(r: &'a Reply, name: &str) -> Option<&'a str> {
+    pub fn req(method: &str, path_qs: &str, headers: &[(&str, &str)]) -> Req {
+        req_from("127.0.0.1", method, path_qs, headers)
+    }
+
+    pub fn header<'a>(r: &'a Reply, name: &str) -> Option<&'a str> {
         r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
+
+    /// The reply's body as JSON.
+    pub fn body(r: &Reply) -> Value {
+        serde_json::from_slice(&r.body).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&r.body)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::assets::HttpFixture;
 
     #[test]
     fn unmatched_is_empty_json() {
@@ -459,21 +611,21 @@ mod tests {
         assert_eq!(header(&r, "content-type"), Some(JSON));
     }
 
-    /// A real TLS connection: the local CA's server certificate, SNI, hyper, the pipeline.
-    #[tokio::test]
-    async fn end_to_end_over_tls() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
-
-        let dir = tempfile::tempdir().unwrap();
-        let pki = crate::tls::ensure_pki(dir.path()).unwrap();
+    /// A server on a free port with the local CA's certificate; -> its address and the CA (PEM).
+    async fn tls_server(state: HttpState, dir: &std::path::Path) -> (SocketAddr, Vec<u8>) {
+        let pki = crate::tls::ensure_pki(dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_on(listener, pki.server_config().unwrap(), Arc::new(state(vec![], None))));
+        tokio::spawn(serve_on(listener, pki.server_config().unwrap(), Arc::new(state)));
+        (addr, std::fs::read(&pki.ca_pem).unwrap())
+    }
 
+    /// One request over a real TLS connection (SNI public-ubiservices.ubi.com); -> the raw response.
+    async fn tls_request(addr: SocketAddr, ca: &[u8], request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
         let mut roots = RootCertStore::empty();
-        let ca = std::fs::read(&pki.ca_pem).unwrap();
-        for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+        for cert in rustls_pemfile::certs(&mut &ca[..]) {
             roots.add(cert.unwrap()).unwrap();
         }
         let client = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -483,13 +635,88 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = ServerName::try_from("public-ubiservices.ubi.com").unwrap();
         let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap();
-        tls.write_all(b"GET /v1/nothing HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\nConnection: close\r\n\r\n")
-            .await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
         let mut out = vec![];
         let _ = tls.read_to_end(&mut out).await; // a peer closing without close_notify is fine here
-        let text = String::from_utf8_lossy(&out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A real TLS connection: the local CA's server certificate, SNI, hyper, the pipeline.
+    #[tokio::test]
+    async fn end_to_end_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, ca) = tls_server(state(vec![], None), dir.path()).await;
+        let text = tls_request(addr, &ca, "GET /v1/nothing HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\n\
+                                           Connection: close\r\n\r\n").await;
         assert!(text.starts_with("HTTP/1.1 200"), "{text}");
         assert!(text.ends_with("\r\n\r\n{}"), "{text}");
+    }
+
+    /// Signing in over TLS with an account's email and password, then using the ticket we gave out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_in_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(vec![], None);
+        let account = st.accounts.register("rider@example.com", "correct horse", "Rider").unwrap();
+        let (addr, ca) = tls_server(st, dir.path()).await;
+        let post = |auth: String| format!("POST /v3/profiles/sessions HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\n\
+                                           Authorization: {auth}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+        let text = tls_request(addr, &ca, &post(format!("Basic {}", crate::util::b64(b"rider@example.com:correct horse")))).await;
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        let b: Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(b["profileId"], account.profile_id.as_str());
+        let ticket = b["ticket"].as_str().unwrap();
+        assert!(ticket.starts_with("powder."));
+        // a game session (no Connect one from this address): only the ticket itself can sign in again
+        let text = tls_request(addr, &ca, &post(format!("Ubi_v1 t={ticket}"))).await;
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        let again: Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(again["profileId"], account.profile_id.as_str());
+        assert_ne!(again["ticket"], b["ticket"]);
+        let text = tls_request(addr, &ca, &post("Ubi_v1 t=powder.made-up".into())).await;
+        assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+        let text = tls_request(addr, &ca, &post(format!("Basic {}", crate::util::b64(b"rider@example.com:wrong")))).await;
+        assert!(text.starts_with("HTTP/1.1 401") && text.contains(r#""errorCode": 1"#), "{text}");
+    }
+
+    #[test]
+    fn route_patterns() {
+        fn nothing(_: &Ctx) -> Reply {
+            Reply::new(200, JSON, vec![], "x")
+        }
+        let r = Route::new("GET", "/v1/spaces/{space}/sandboxes/{sandbox}/x.json", nothing);
+        let p = r.matches("GET", "/v1/spaces/a-b/sandboxes/S_1/x.json").unwrap();
+        assert_eq!((p["space"].as_str(), p["sandbox"].as_str()), ("a-b", "S_1"));
+        assert!(r.matches("HEAD", "/v1/spaces/a/sandboxes/b/x.json").is_some(), "GET routes answer HEAD");
+        assert!(r.matches("POST", "/v1/spaces/a/sandboxes/b/x.json").is_none());
+        assert!(r.matches("GET", "/v1/spaces/a/b/sandboxes/c/x.json").is_none(), "one segment per {{name}}");
+        assert!(r.matches("GET", "/v1/spaces/a/sandboxes/b/xxjson").is_none(), "literal parts are escaped");
+        let tail = Route::new("*", "/{prefix:.*}test_internet.txt", nothing);
+        assert_eq!(tail.matches("PUT", "/a/b/test_internet.txt").unwrap()["prefix"], "a/b/");
+    }
+
+    /// The session middleware: a `Ubi_v1` ticket of ours reaches the routes as its session; others don't.
+    #[test]
+    fn routes_get_the_session() {
+        fn whoami(c: &Ctx) -> Reply {
+            Reply::json(&json!({"who": c.session.as_ref().map(|s| s.profile_id().to_string())}), "whoami", 200)
+        }
+        let mut config = Config::default();
+        config.server.strict_tickets = true;
+        let st = state_with(config, vec![], None);
+        let routes = [Route::new("GET", "/whoami", whoami)];
+        let pid = st.accounts.default_profile_id().unwrap();
+        let s = st.sessions().issue(st.accounts.player(&pid).unwrap(), "10.0.0.2", "");
+        let ask = |auth: &str| body(&routed(&st, &req("GET", "/whoami", &[("Authorization", auth)]), &routes));
+        assert_eq!(ask(&format!("Ubi_v1 t={}", s.ticket))["who"], pid.as_str());
+        assert_eq!(ask(&format!("ubi_v1 t={}", s.ticket))["who"], pid.as_str(), "the scheme in any case");
+        assert!(ask(&format!("Basic {}", s.ticket))["who"].is_null());
+        assert!(ask("Ubi_v1 t=stale")["who"].is_null(), "strict tickets");
+        // lenient (the default), no accounts: an unknown ticket is the address's player
+        let st = state(vec![], None);
+        let r = routed(&st, &req("GET", "/whoami", &[("Authorization", "Ubi_v1 t=stale")]), &routes);
+        assert_eq!(body(&r)["who"], st.accounts.default_profile_id().unwrap().as_str());
+        assert_eq!(routed(&st, &req("GET", "/other", &[]), &routes).how, "UNMATCHED");
     }
 
     #[test]

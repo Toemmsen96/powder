@@ -1,16 +1,19 @@
 //! The `powder-server` binary. The online-services server is still being ported to Rust: `run` serves HTTPS
-//! (game-data pack + mods), the CA's revocation list, NEX (recorded replies + mods) and Storm, but not yet the
-//! UbiServices routes, the NEX handlers or the demux, so the game itself still needs the Python server.
+//! (sign-in, game-data pack + mods), the CA's revocation list, NEX (recorded replies + mods) and Storm, but not
+//! yet most UbiServices routes, the NEX handlers or the demux, so the game itself still needs the Python server.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use powder_server::assets::Assets;
 use powder_server::config::Config;
+use powder_server::core::ratelimit::FailureLimiter;
+use powder_server::core::sessions::SessionRegistry;
 use powder_server::db::Db;
 use powder_server::https::{self, HttpState};
 use powder_server::logging;
 use powder_server::mods::ModHost;
 use powder_server::repos::Repos;
+use powder_server::services::accounts::AccountService;
 use powder_server::tls;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -128,8 +131,6 @@ fn main() -> Result<()> {
 /// The player and account commands (the host's way out when someone forgets a password).
 fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
     use powder_server::constants::CREDITS_ITEM;
-    use powder_server::core::sessions::SessionRegistry;
-    use powder_server::services::accounts::AccountService;
     let config = Arc::new(config);
     let db = Arc::new(Db::open(&config.data_dir().join("powder.db"))?);
     db.migrate()?;
@@ -250,9 +251,14 @@ async fn run(config: Config) -> Result<()> {
     db.migrate()?;
     log::info!(target: "powder", "data: {} (schema v{})", config.data_dir().display(), db.version()?);
     let assets = Arc::new(if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() });
-    let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, Arc::new(Repos::new(db)))));
+    let repos = Arc::new(Repos::new(db));
+    let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, repos.clone())));
+    // one registry for both transports: HTTPS logins issue the tickets NEX's LoginWithToken looks up
+    let sessions = Arc::new(SessionRegistry::new());
+    let accounts = Arc::new(AccountService::new(config.clone(), repos.clone(), sessions.clone()));
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
-    log::warn!(target: "powder", "not ported yet: UbiServices routes, NEX handlers, demux (use the Python server to play)");
+    log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX handlers, demux \
+                                  (use the Python server to play)");
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))
@@ -260,6 +266,7 @@ async fn run(config: Config) -> Result<()> {
 
     // The NEX handshake is signed with this key; its public half goes into the rendezvous config.
     let signing_key = powder_server::nex::secure::load_or_create_signing_key(&config.data_dir().join("nex_signing_key.pem"))?;
+    let nex_public_key = powder_server::nex::secure::config_public_key(&signing_key);
     let dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
     powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port).await?;
     log::info!(target: "powder", "NEX listening on udp {}:{} (game reaches it at {})", s.bind, s.nex_port, s.public_host);
@@ -282,7 +289,8 @@ async fn run(config: Config) -> Result<()> {
         }
     });
     log::info!(target: "powder", "HTTPS on {}:{} (local CA {})", s.bind, s.https_port, pki.ca_thumbprint()?);
-    let state = Arc::new(HttpState { config: config.clone(), assets, mods: Some(mods) });
+    let state = Arc::new(HttpState { config: config.clone(), assets, mods: Some(mods), accounts,
+                                     login_failures: Arc::new(FailureLimiter::default()), nex_public_key });
     https::serve(addr(s.https_port)?, pki.server_config()?, state).await
 }
 
