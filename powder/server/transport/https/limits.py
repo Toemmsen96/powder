@@ -52,7 +52,8 @@ class Limits:
     max_per_ip: int = 128                       # from one address (one PC, or a household behind one NAT address)
     tls_handshake: float = 20.0                 # from accepting the TCP connection to the end of the handshake
     # To send a request's headers, and how long an idle keep-alive connection stays open: aiohttp's keep-alive
-    # timeout, which (aiohttp >= 3.10) also runs from the start of a connection and while headers trickle in.
+    # timeout, which in recent aiohttp (3.14, as locked) also runs from the start of a connection and while headers
+    # trickle in (older ones start it only after the first reply).
     header_read: float = 75.0
     body: float = 60.0                          # to send a small body once its headers are in (2 MiB at 64 KB/s)
     upload: float = 600.0                       # ... and an upload (64 MiB at about 1 Mbit/s)
