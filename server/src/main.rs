@@ -76,6 +76,12 @@ enum AdminCommand {
     Trust {
         #[arg(value_enum, default_value = "status")]
         action: TrustAction,
+        /// A Wine/Proton prefix (e.g. Lutris') whose own root store gets the CA instead of the system's.
+        #[arg(long)]
+        wine_prefix: Option<PathBuf>,
+        /// The wine binary the prefix runs with (Proton: <proton>/files/bin/wine).
+        #[arg(long, default_value = "wine")]
+        wine: String,
     },
     /// List players.
     Players,
@@ -117,7 +123,7 @@ fn main() -> Result<()> {
         Command::Admin { cmd } => {
             logging::setup(None, &config.server.log_level);
             match cmd {
-                AdminCommand::Trust { action } => trust(action, &config),
+                AdminCommand::Trust { action, wine_prefix, wine } => trust(action, wine_prefix, &wine, &config),
                 cmd => admin(cmd, config),
             }
         }
@@ -227,8 +233,20 @@ fn gamedata(cmd: GamedataCommand, config: &Config) -> Result<()> {
 }
 
 /// Ubisoft Connect checks certificates through the OS, so the local CA must be a trusted root.
-fn trust(action: TrustAction, config: &Config) -> Result<()> {
+fn trust(action: TrustAction, wine_prefix: Option<PathBuf>, wine: &str, config: &Config) -> Result<()> {
     let pki = tls::ensure_pki(&config.data_dir().join("tls"))?;
+    if let Some(prefix) = wine_prefix {
+        use powder_server::trust::wine as w;
+        match action {
+            TrustAction::Install => w::install(&pki.ca_pem, &prefix, wine)?,
+            TrustAction::Remove => w::remove(&pki.ca_pem, &prefix, wine)?,
+            TrustAction::Status => {}
+        }
+        let trusted = w::is_trusted(&pki.ca_pem, &prefix, wine)?;
+        println!("local CA {} in {}: {}", pki.ca_thumbprint()?, prefix.display(),
+                 if trusted { "TRUSTED (restart Ubisoft Connect)" } else { "not trusted" });
+        return Ok(());
+    }
     match action {
         TrustAction::Install => powder_server::trust::install(&pki.ca_pem)?,
         TrustAction::Remove => powder_server::trust::remove(&pki.ca_pem)?,

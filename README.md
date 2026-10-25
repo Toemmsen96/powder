@@ -422,8 +422,17 @@ powder-server gamedata verify                      # also build / zip / install
 | server mods (Lua) and client mods | |
 
 It reads the same `config.toml`, `data/` (database, keys, local CA) and game-data pack as the Python
-server, so you can switch between them. `admin trust` also works on Linux: Ubisoft Connect under Wine
-(Lutris, Proton) trusts the system's CA store, so the local CA goes there (`trust anchor`, as root).
+server, so you can switch between them. `admin trust` also works on Linux. A Wine/Proton prefix (Lutris)
+copies the system's root certificates when it is set up and checks against that copy, so add the local CA
+to the prefix itself, with the wine the prefix runs with (Ubisoft Connect closed, restart it afterwards):
+
+```
+powder-server admin trust install --wine-prefix ~/Games/ubisoft-connect \
+    --wine ~/.local/share/Steam/compatibilitytools.d/GE-Proton11-11-x86_64/files/bin/wine
+```
+
+Without `--wine-prefix` it goes into the system store (`trust anchor`, as root), which prefixes made later
+copy.
 
 ## Mods
 

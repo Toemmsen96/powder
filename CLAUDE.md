@@ -92,4 +92,7 @@ Never run `admin trust install/remove` yourself: it changes the system trust sto
 ## The user's setup
 
 Linux (Arch); Steep is installed through Lutris (Wine). Under Wine, Ubisoft Connect trusts the host's CA bundle
-(that is why `trust.rs` has a Linux path). The game itself can only be tested by the user.
+(that is why `trust.rs` has a Linux path), but an existing prefix only checks the copy of the roots it made
+when it was set up (registry `HKLM\Software\Microsoft\SystemCertificates\Root\Certificates`): use
+`admin trust install --wine-prefix <prefix> --wine <the prefix's wine>`. Symptom when missing: `tls ok`, then the
+client closes without a request (no access-log line). The game itself can only be tested by the user.

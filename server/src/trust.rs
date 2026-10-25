@@ -80,6 +80,69 @@ pub fn installed_cas() -> Vec<String> {
         .filter(|s| names.iter().any(|n| s.contains(&format!("CN={n}")))).collect()
 }
 
+/// A Wine prefix's own root store. Wine copies the host's CA bundle into the prefix's registry when the prefix is
+/// set up (HKLM\Software\Microsoft\SystemCertificates\Root\Certificates\<SHA-1>), and crypt32 checks against
+/// that copy: a CA added to the system later is not seen by an existing prefix (seen with GE-Proton under
+/// Lutris: the TLS handshake completes, then Ubisoft Connect drops the connection). So the CA goes into the
+/// prefix itself, through the prefix's own `wine reg`.
+pub mod wine {
+    use super::*;
+    use std::process::Command;
+
+    fn key(ca_pem: &Path) -> Result<String> {
+        Ok(format!(r"HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates\{}", thumbprint(ca_pem)?))
+    }
+
+    /// The registry value Wine (and Windows) store a certificate as: properties (id, 1, length, data); here the
+    /// SHA-1 hash (3) and the certificate (0x20), as in the entries Wine writes itself.
+    pub fn blob(ca_der: &[u8]) -> Vec<u8> {
+        let prop = |id: u32, data: &[u8]| -> Vec<u8> {
+            [&id.to_le_bytes()[..], &1u32.to_le_bytes(), &(data.len() as u32).to_le_bytes(), data].concat()
+        };
+        [prop(3, &Sha1::digest(ca_der)), prop(0x20, ca_der)].concat()
+    }
+
+    /// A .reg file adding the CA to the prefix's trusted roots.
+    pub fn reg_file(ca_pem: &Path) -> Result<String> {
+        let hex: Vec<String> = blob(&ca_der(ca_pem)?).iter().map(|b| format!("{b:02x}")).collect();
+        let lines: Vec<String> = hex.chunks(25).map(|c| c.join(",")).collect();
+        Ok(format!("Windows Registry Editor Version 5.00\r\n\r\n[{}]\r\n\"Blob\"=hex:{}\r\n", key(ca_pem)?,
+                   lines.join(",\\\r\n  ")))
+    }
+
+    fn reg(wine: &str, prefix: &Path, args: &[&str]) -> Result<std::process::Output> {
+        Command::new(wine).arg("reg").args(args).env("WINEPREFIX", prefix).env("WINEDEBUG", "-all").output()
+            .with_context(|| format!("running {wine} (use --wine with the Wine/Proton build the prefix runs with)"))
+    }
+
+    pub fn is_trusted(ca_pem: &Path, prefix: &Path, wine: &str) -> Result<bool> {
+        Ok(reg(wine, prefix, &["query", &key(ca_pem)?])?.status.success())
+    }
+
+    /// Restart the prefix's programs (Ubisoft Connect) afterwards: crypt32 reads the store when it starts.
+    pub fn install(ca_pem: &Path, prefix: &Path, wine: &str) -> Result<()> {
+        let file = std::env::temp_dir().join(format!("powder-ca-{}.reg", std::process::id()));
+        std::fs::write(&file, reg_file(ca_pem)?)?;
+        let out = reg(wine, prefix, &["import", &file.to_string_lossy()]);
+        let _ = std::fs::remove_file(&file);
+        let out = out?;
+        if !out.status.success() || !is_trusted(ca_pem, prefix, wine)? {
+            bail!("certificate not added to {} ({})", prefix.display(), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    pub fn remove(ca_pem: &Path, prefix: &Path, wine: &str) -> Result<()> {
+        if is_trusted(ca_pem, prefix, wine)? {
+            reg(wine, prefix, &["delete", &key(ca_pem)?, "/f"])?;
+            if is_trusted(ca_pem, prefix, wine)? {
+                bail!("certificate not removed from {}", prefix.display());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -199,6 +262,16 @@ mod tests {
             ("ABCDEF01".to_string(), "CN=Powder (Steep) local CA, O=Powder (Steep)".to_string()),
             ("1234".to_string(), "CN=Other".to_string()),
         ]);
+    }
+
+    #[test]
+    fn wine_blob_has_the_layout_wine_writes() {
+        let der = b"\x30\x03\x02\x01\x05";
+        let b = wine::blob(der);
+        assert_eq!(&b[..12], &[3, 0, 0, 0, 1, 0, 0, 0, 20, 0, 0, 0]);
+        assert_eq!(&b[12..32], Sha1::digest(der).as_slice());
+        assert_eq!(&b[32..44], &[0x20, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(&b[44..], der);
     }
 
     #[test]
