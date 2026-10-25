@@ -74,6 +74,37 @@ EOF
 }
 
 # the server to run, into the array SERVER_CMD (a repository path with spaces stays one argument)
+# Steep's folder in the prefix (POWDER_STEEP_DIR, else the newest steep.exe under drive_c): where the game
+# loads version.dll from, so where the TLS-helper proxy goes.
+steep_dir() {
+    if [ -n "${POWDER_STEEP_DIR:-}" ]; then printf '%s' "$POWDER_STEEP_DIR"; return; fi
+    find "$WINEPREFIX/drive_c" -iname steep.exe -printf '%h\n' 2>/dev/null | head -1
+}
+
+# The 32-byte certificate pin (SHA-256 of the server leaf's tbsCertificate) from server.pem, into $2. Needs a
+# Python with the cryptography package (the repo's .venv has it); returns non-zero if none is available.
+tls_pin() {
+    local py
+    for py in "$REPO/.venv/bin/python" python3; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        "$py" - "$1" "$2" 2>/dev/null <<'PYEOF' && return 0
+import sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+certs = x509.load_pem_x509_certificates(open(sys.argv[1], "rb").read())
+def is_ca(c):
+    try:
+        return c.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except x509.ExtensionNotFound:
+        return False
+leaf = next(c for c in certs if not is_ca(c))           # server.pem is key + leaf + CA
+d = hashes.Hash(hashes.SHA256()); d.update(leaf.tbs_certificate_bytes)
+open(sys.argv[2], "wb").write(d.finalize())
+PYEOF
+    done
+    return 1
+}
+
 server_command() {
     case $SERVER in
     python)
@@ -200,8 +231,39 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     rm -f "$reg"
     "$wineserver" -w
     say "local CA trusted in $WINEPREFIX for this session"
+
+    # ---- the game's own TLS (Linux): the version.dll proxy hook (native/version_proxy.c) ----------------
+    # Steep's statically-linked OpenSSL rejects our certificate (nothing on Linux injected the Windows TLS
+    # helper). It imports version.dll, so a version.dll beside the game loads into it before its code runs:
+    # that is our proxy, which forwards version.dll's functions to a copy of the real one (vers_powder.dll)
+    # and, inside the game, makes OpenSSL's certificate check accept our pinned certificate. Opt out with
+    # POWDER_NO_TLS_HELPER=1; point at the folder with POWDER_STEEP_DIR if it is not found.
+    helper=""
+    if [ "${POWDER_NO_TLS_HELPER:-}" != 1 ]; then
+        proxy="$REPO/native/bin/version.dll"
+        sysver="$WINEPREFIX/drive_c/windows/system32/version.dll"
+        sdir=$(steep_dir)
+        if [ ! -f "$proxy" ]; then
+            say "TLS helper not built (run native/build.sh): the game will show offline"
+        elif [ -z "$sdir" ] || [ ! -d "$sdir" ]; then
+            say "Steep's folder not found (set POWDER_STEEP_DIR): the game will show offline"
+        elif [ ! -f "$sysver" ]; then
+            say "no $sysver to forward version.dll to: skipping the TLS helper"
+        elif ! tls_pin "$(data_dir)/tls/server.pem" "$sdir/powder_tls.pin"; then
+            say "could not compute the certificate pin (needs Python with cryptography): skipping the TLS helper"
+        else
+            cp -f "$proxy" "$sdir/version.dll" && cp -f "$sysver" "$sdir/vers_powder.dll"
+            rm -f "$sdir/powder_tls.log"
+            export WINEDLLOVERRIDES="version=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+            helper="$sdir"
+            say "TLS helper in $sdir (its log: $sdir/powder_tls.log)"
+        fi
+    fi
+
     cleanup() {
         "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
+        [ -n "$helper" ] && rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/powder_tls.pin" \
+                                  "$helper/powder_tls.log"
         if winereg delete "$key" /f; then
             rm -f "$marker"
             say "local CA removed from $WINEPREFIX"

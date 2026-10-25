@@ -493,7 +493,8 @@ first, and don't run another Powder server on the same `config.toml`. By hand:
 `POWDER_SERVER=python|rust`, `POWDER_WINE`; the server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log`
 (without `XDG_RUNTIME_DIR`: `~/.cache/powder/powder-wrap.log`).
 
-Steep itself still needs the TLS helper the Windows launcher injects; under Linux that is not done yet,
+Steep itself needs its certificate check intercepted; on Windows the launcher injects the helper, on
+Linux powder-wrap deploys a version.dll proxy of it into the game (native/version_proxy.c, experimental),
 so for now the session gets Ubisoft Connect online, and the game reports its services unavailable.
 
 ## Mods

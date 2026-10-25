@@ -105,14 +105,20 @@ server's CA is checked (one self-signed, name-constrained CA within ubi.com/ubis
 programs only in elevated steps, hosts file kept byte for byte, narrower firewall rules.
 
 Open (decide with the user before doing):
-- native/: the TLS helper now pins the server's own leaf certificate (2026-10-25). hook_guard.c verifies the
-  chain's leaf against hook_guard.pin (SHA-256 of the pinned leaf's tbsCertificate, which OpenSSL 1.0.2n caches
-  at X509_CINF+0x50), the launcher writes the pin from the live server leaf fetched against the pinned CA, and
-  armer.c keeps the guard armed for the session instead of patching the check to always-accept. Fails closed
-  (no pin -> offline). NOT yet run against the real game: the leaf/offset logic was read from a memory dump of
-  steep.exe (build e8b14fe6..., ssl_verify_cert_chain at RVA 0x1D3E290) and compile-checked, not executed.
-  First live test: the server should come online; hook_guard.log shows "hook hit -> server cert pinned, accept".
-  If it says "rejected" or stays offline, the offsets or the pinned-leaf assumption are wrong.
+- native/: the TLS helper pins the server's own leaf certificate, and there is now a Linux build too
+  (2026-10-25). tls_hook.h is the shared core: it traps OpenSSL 1.0.2n's ssl_verify_cert_chain (RVA 0x1D3E290
+  in build e8b14fe6...) with a guarded page + VEH and accepts the chain only when the leaf's cached
+  tbsCertificate (X509_CINF+0x50) hashes to the pin. hook_guard.c + armer.c are the Windows helper (injected by
+  the launcher). version_proxy.c + version.def are the Linux helper: a version.dll the game loads (it imports
+  version.dll), forwarding to vers_powder.dll and arming the hook in-process; powder-wrap deploys it into
+  Steep's folder, writes powder_tls.pin from server.pem, and sets WINEDLLOVERRIDES=version=n,b. Build with
+  native/build.sh (mingw/zig). Fails closed (no pin -> offline), never patches bytes (VMProtect-safe).
+  The injection vector is proven under plain Wine (the proxy loads, DllMain runs, forwarders keep version info
+  working); the offsets are from a live steep.exe memory dump. NOT yet confirmed online against the running
+  game. First live test (POWDER_SERVER unchanged, just relaunch): powder_tls.log in Steep's folder should show
+  "armed" then "hook hit -> server cert pinned, accept" and the game comes online. Unknowns to watch: whether
+  in-process VirtualProtect(PAGE_GUARD) is allowed under Wine ("could not arm" if not), and whether VMProtect
+  under Wine lets the guard fault reach our VEH.
 - The launcher installs per user, so its elevated hosts step runs a user-writable powder-cli.exe; a
   per-machine install (`PrivilegesRequired=admin`) would close that (needs a Windows test).
 - New CAs could carry EKU serverAuth (today's are trusted by Windows for any purpose within their names),
