@@ -1,11 +1,12 @@
 //! NEX method handlers, one module per protocol, each with a `register` that adds its methods to the Dispatcher.
 //!
 //! A handler is `fn(&HandlerDeps, &mut Ctx, &mut Reader) -> Result<outputs, HandlerError>`; HandlerError::Fallthrough
-//! lets the recording answer. Ported so far: login, gamestorage, stats, profile (the Python server's matchmaking
-//! handlers wait for their service).
+//! lets the recording answer. Registered in the Python server's order: login, gamestorage, stats, matchmaking,
+//! profile. `run` must also call [`matchmaking::attach`] on the NEX server (disconnects, the matchmaking tick).
 
 pub mod gamestorage;
 pub mod login;
+pub mod matchmaking;
 pub mod profile;
 pub mod stats;
 
@@ -46,7 +47,7 @@ pub type HandlerFn = fn(&HandlerDeps, &mut Ctx, &mut Reader) -> Result;
 /// Add every ported handler to the dispatcher.
 pub fn register(d: &mut Dispatcher, deps: Arc<HandlerDeps>) {
     for (method, f) in login::HANDLERS.iter().chain(gamestorage::HANDLERS).chain(stats::HANDLERS)
-        .chain(profile::HANDLERS) {
+        .chain(matchmaking::HANDLERS).chain(profile::HANDLERS) {
         let deps = deps.clone();
         d.handle(method, Box::new(move |ctx, r| f(&deps, ctx, r)));
     }
