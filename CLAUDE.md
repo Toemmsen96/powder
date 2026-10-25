@@ -210,3 +210,13 @@ don't run commands against the user's real prefix or data: test on scratch copie
    blacklist mode, add/remove players, ban/kick - enforced in the accounts/sign-in + NEX/HTTPS auth paths,
    with admin CLI commands and an entry in the admin mod (web + the new overlay). Decide storage (config vs
    DB) and enforcement points with the user.
+7. Map / line builder mod (idea raised 2026-10-25). Feasibility (checked against routes_ugc.rs / routes_ubi.rs):
+   TIER 1 (feasible, mostly plumbed) - Steep creates custom lines/challenges, trails and challenge ghosts and
+   Powder already stores/serves them (UGC service + profile entities); a mod would curate/publish/browse/share
+   them (web + overlay UI). Next: a read-only RE pass to pin down the entity/UGC types + metadata Steep writes
+   for a custom challenge, then mod + endpoints. TIER 2 (modest RE) - an overlay "ghost line"/planning tool:
+   RE the player + camera world transform (the overlay's memory scanner is the groundwork), draw planned
+   waypoints/gates projected into the 3D view, save to Powder, show on others' overlays; visual only, no
+   collision. TIER 3 (shelved, not realistically feasible) - spawning real rideable ramps as new world
+   geometry: closed VMProtect'd proprietary engine, no SDK; scene/actor spawn + collision + physics RE is
+   research-grade and fragile. Recommendation: Tier 1, then Tier 2; skip Tier 3.
