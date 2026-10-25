@@ -11,7 +11,7 @@
 //!                   routes_powder.rs (/_powder/: status, accounts, CA, overlay part, client mods),
 //!                   routes_profile.rs (profile, friends, notifications, GraphQL, chat channels...),
 //!                   routes_ubi.rs (sign-in, NEX discovery, inventory + store, profile entities + their files,
-//!                   Connect's internet check and cloud saves), websocket.rs (the handshake)
+//!                   Connect's internet check and cloud saves), routes_ugc.rs (photos), websocket.rs (the handshake)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
@@ -22,6 +22,7 @@
 pub mod routes_powder;
 pub mod routes_profile;
 pub mod routes_ubi;
+pub mod routes_ugc;
 pub mod websocket;
 
 use crate::builtin::http as builtin_http;
@@ -185,8 +186,12 @@ impl Route {
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
 /// routes_ugc, the websocket).
 static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
-    routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes())
-        .chain(websocket::routes()).collect()
+    routes_powder::routes().into_iter()
+        .chain(routes_profile::routes())
+        .chain(routes_ubi::routes())
+        .chain(routes_ugc::routes())
+        .chain(websocket::routes())
+        .collect()
 });
 
 /// `Authorization: Ubi_v1 t=<ticket>` -> the session it belongs to (Python's session_middleware).
