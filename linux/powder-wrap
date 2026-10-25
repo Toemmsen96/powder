@@ -241,9 +241,10 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     helper=""
     if [ "${POWDER_NO_TLS_HELPER:-}" != 1 ]; then
         proxy="$REPO/native/bin/version.dll"
+        armer="$REPO/native/bin/armer.exe"
         sysver="$WINEPREFIX/drive_c/windows/system32/version.dll"
         sdir=$(steep_dir)
-        if [ ! -f "$proxy" ]; then
+        if [ ! -f "$proxy" ] || [ ! -f "$armer" ]; then
             say "TLS helper not built (run native/build.sh): the game will show offline"
         elif [ -z "$sdir" ] || [ ! -d "$sdir" ]; then
             say "Steep's folder not found (set POWDER_STEEP_DIR): the game will show offline"
@@ -252,7 +253,8 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         elif ! tls_pin "$(data_dir)/tls/server.pem" "$sdir/powder_tls.pin"; then
             say "could not compute the certificate pin (needs Python with cryptography): skipping the TLS helper"
         else
-            cp -f "$proxy" "$sdir/version.dll" && cp -f "$sysver" "$sdir/vers_powder.dll"
+            cp -f "$proxy" "$sdir/version.dll" && cp -f "$sysver" "$sdir/vers_powder.dll" \
+                && cp -f "$armer" "$sdir/armer.exe"
             rm -f "$sdir/powder_tls.log"
             # load our version.dll over the builtin. The env var may not survive Proton/umu to the game, so
             # set the override in the prefix registry too (that always applies); both are removed on cleanup.
@@ -267,7 +269,7 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
         # powder_tls.log is kept (it is the helper's diagnostic; the next session resets it)
         if [ -n "$helper" ]; then
-            rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/powder_tls.pin"
+            rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/armer.exe" "$helper/powder_tls.pin"
             winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
         fi
         if winereg delete "$key" /f; then

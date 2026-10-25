@@ -14,4 +14,5 @@ else
     echo "need x86_64-w64-mingw32-gcc (mingw-w64) or zig" >&2; exit 1
 fi
 cc -shared -O2 -o "$bin/version.dll" "$here/version_proxy.c" "$here/version.def" -lbcrypt
-echo "built: $bin/version.dll  (the Linux/Proton TLS helper; powder-wrap deploys it)"
+cc -O2 -o "$bin/armer.exe" "$here/armer.c"
+echo "built: $bin/version.dll + $bin/armer.exe  (the Linux/Proton TLS helper; powder-wrap deploys them)"

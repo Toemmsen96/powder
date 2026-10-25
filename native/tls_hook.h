@@ -136,7 +136,10 @@ static void tls_init_target(void) {
     g_page = g_target & ~((uintptr_t)g_pagesize - 1);
 }
 
-// Re-arm the guard on the function's page; -> whether VirtualProtect succeeded.
+// Re-arm the guard on the function's page; -> whether VirtualProtect succeeded. (In-process arming is blocked
+// by VMProtect after an initial window, so the guard is kept armed by armer.exe from outside; this is only the
+// first arm on Windows.)
+static int tls_arm(void) __attribute__((unused));
 static int tls_arm(void) {
     DWORD old;
     return VirtualProtect((void *)g_page, g_pagesize, PAGE_EXECUTE_READ | PAGE_GUARD, &old) != 0;
