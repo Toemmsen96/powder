@@ -9,6 +9,7 @@ pub mod constants;
 pub mod db;
 pub mod demux;
 pub mod gamedata;
+pub mod https;
 pub mod logging;
 pub mod mods;
 pub mod nex;
