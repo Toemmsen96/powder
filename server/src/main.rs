@@ -38,6 +38,27 @@ enum Command {
     Run,
     /// Load the configured mods and print what they registered, then exit (no server, no saved state).
     Mods,
+    /// Inspect and edit the server's data.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// The local CA as a trusted root (needed by Ubisoft Connect; on Linux, the system store Wine reads).
+    Trust {
+        #[arg(value_enum, default_value = "status")]
+        action: TrustAction,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TrustAction {
+    Status,
+    Install,
+    Remove,
 }
 
 fn main() -> Result<()> {
@@ -52,7 +73,30 @@ fn main() -> Result<()> {
             logging::setup(None, &config.server.log_level);
             check_mods(&config)
         }
+        Command::Admin { cmd } => {
+            logging::setup(None, &config.server.log_level);
+            match cmd {
+                AdminCommand::Trust { action } => trust(action, &config),
+            }
+        }
     }
+}
+
+/// Ubisoft Connect checks certificates through the OS, so the local CA must be a trusted root.
+fn trust(action: TrustAction, config: &Config) -> Result<()> {
+    let pki = tls::ensure_pki(&config.data_dir().join("tls"))?;
+    match action {
+        TrustAction::Install => powder_server::trust::install(&pki.ca_pem)?,
+        TrustAction::Remove => powder_server::trust::remove(&pki.ca_pem)?,
+        TrustAction::Status => {}
+    }
+    let trusted = powder_server::trust::is_trusted(&pki.ca_pem)?;
+    println!("local CA {}: {} ({})", pki.ca_thumbprint()?, if trusted { "TRUSTED" } else { "not trusted" },
+             pki.ca_pem.display());
+    for other in powder_server::trust::other_tool_roots() {
+        println!("note: a {other} CA is also trusted (capture tooling); remove it when no longer needed");
+    }
+    Ok(())
 }
 
 async fn run(config: Config) -> Result<()> {

@@ -15,4 +15,5 @@ pub mod mods;
 pub mod nex;
 pub mod repos;
 pub mod tls;
+pub mod trust;
 pub mod util;
