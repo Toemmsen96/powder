@@ -5,7 +5,7 @@
 //! hands complete RMC requests to the Dispatcher. Transport-free like storm.rs: `received` and `tick` are
 //! driven by [`start`]'s socket loop, or by tests.
 
-use super::connection::{Connection, SendFn};
+use super::connection::{Connection, Outbox, SendFn};
 use super::dispatch::{Ctx, Dispatcher};
 use super::prudp::{Packet, CONNECT, DATA, DISCONNECT, FLAG_ACK, FLAG_KEY_EXCHANGE, FLAG_NEED_ACK, PING, SYN};
 use super::{rmc, secure};
@@ -17,8 +17,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::Notify;
 
 pub const TICK_S: f64 = 0.25;
+
+/// Told the profile id of a logged-in game whose connection closed.
+pub type DisconnectFn = Box<dyn Fn(&str) + Send + Sync>;
 
 pub struct NexServer {
     pub conns: HashMap<SocketAddr, Connection>,
@@ -29,21 +33,40 @@ pub struct NexServer {
     send_fn: SendFn,
     /// Never reused.
     next_pid: u32,
+    /// Notified when a connection's outbox has requests to send (see [`start`]).
+    pub wake: Arc<Notify>,
+    /// Called with the player's profile id when a logged-in game's connection closes (e.g. to take it out of
+    /// its matchmaking sessions).
+    pub on_disconnect: Option<DisconnectFn>,
 }
 
 impl NexServer {
     pub fn new(dispatcher: Dispatcher, signing_key: SigningKey, public_host: &str, port: u16, send_fn: SendFn)
                -> NexServer {
         NexServer { conns: HashMap::new(), dispatcher, signing_key, public_host: public_host.into(), port, send_fn,
-                    next_pid: 0x1001 }
+                    next_pid: 0x1001, wake: Arc::new(Notify::new()), on_disconnect: None }
     }
 
     fn new_conn(&mut self, addr: SocketAddr, p: &Packet, now: f64) -> Connection {
         self.next_pid += 1;
-        Connection::new(addr, self.send_fn.clone(), self.next_pid - 1, p.source, p.dest, now)
+        let mut c = Connection::new(addr, self.send_fn.clone(), self.next_pid - 1, p.source, p.dest, now);
+        c.outbox = Arc::new(Outbox::new(self.wake.clone()));
+        c
     }
 
     pub fn received(&mut self, now: f64, data: &[u8], addr: SocketAddr) {
+        self.receive(now, data, addr);
+        self.flush(now);
+    }
+
+    /// Send what was queued on the connections' outboxes (server-initiated requests).
+    pub fn flush(&mut self, now: f64) {
+        for c in self.conns.values_mut() {
+            c.flush_outbox(now);
+        }
+    }
+
+    fn receive(&mut self, now: f64, data: &[u8], addr: SocketAddr) {
         let p = match Packet::decode(data) {
             Ok(p) => p,
             Err(e) => {
@@ -164,12 +187,22 @@ impl NexServer {
         let station_url = self.station_url(conn);
         let conn = self.conns.get_mut(&addr).expect("checked above");
         let out = self.dispatcher.dispatch(&mut Ctx { conn, station_url, now }, &msg);
+        conn.flush_outbox(now); // requests the handler made to its own game go first, as they would in Python
         conn.send_message(&out, now);
     }
 
     pub fn drop_conn(&mut self, addr: SocketAddr, why: &str) {
         if let Some(mut c) = self.conns.remove(&addr) {
             c.closed = true;
+            c.outbox.close();
+            // a later login of the same player shares the session's channels: clear the connection there, unless
+            // it was already replaced by a newer one
+            let channel: Arc<dyn crate::core::sessions::NexChannel> = c.outbox.clone();
+            if let Some(s) = c.session.take().filter(|s| s.channels.clear_nex_if(&channel)) {
+                if let Some(f) = &self.on_disconnect {
+                    f(s.profile_id());
+                }
+            }
             log::info!(target: "powder.nex", "{addr} connection closed ({why})");
         }
     }
@@ -180,6 +213,7 @@ impl NexServer {
         for addr in dead {
             self.drop_conn(addr, "timeout");
         }
+        self.flush(now);
     }
 }
 
@@ -210,6 +244,13 @@ pub async fn start(dispatcher: Dispatcher, signing_key: SigningKey, bind: &str, 
         loop {
             timer.tick().await;
             srv.lock().tick(started.elapsed().as_secs_f64());
+        }
+    });
+    let (srv, wake) = (server.clone(), server.lock().wake.clone());
+    tokio::spawn(async move {
+        loop {
+            wake.notified().await;
+            srv.lock().flush(started.elapsed().as_secs_f64());
         }
     });
     Ok(server)

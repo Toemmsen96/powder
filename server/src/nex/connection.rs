@@ -11,9 +11,13 @@
 
 use super::prudp::{Packet, DATA, FLAG_ACK, FLAG_NEED_ACK, FLAG_RELIABLE};
 use super::{rmc, secure};
+use crate::core::sessions::{NexChannel, PlayerSession};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Plaintext bytes per DATA fragment (the game sends ~730-780 B).
 pub const FRAGMENT_SIZE: usize = 700;
@@ -28,6 +32,46 @@ pub type SendFn = Arc<dyn Fn(&[u8], SocketAddr) + Send + Sync>;
 /// True if 16-bit sequence id `a` comes before `b` (wrap-safe).
 pub fn seq_before(a: u16, b: u16) -> bool {
     a.wrapping_sub(b) > 0x8000
+}
+
+type QueuedRequest = (String, String, Vec<u8>, u32);
+
+/// A connection's server-initiated requests, queued by anyone (a player's session holds it as its NexChannel) without
+/// taking the server's lock; the server sends them on its next pass (`Connection::flush_outbox`), which `wake`
+/// asks for at once.
+pub struct Outbox {
+    /// (protocol, method, params, call id)
+    queue: Mutex<Vec<QueuedRequest>>,
+    next_call_id: AtomicU32,
+    closed: AtomicBool,
+    wake: Arc<Notify>,
+}
+
+impl Outbox {
+    pub fn new(wake: Arc<Notify>) -> Outbox {
+        Outbox { queue: Mutex::default(), next_call_id: AtomicU32::new(0x10000), closed: AtomicBool::new(false), wake }
+    }
+
+    fn call_id(&self, call_id: Option<u32>) -> u32 {
+        call_id.unwrap_or_else(|| self.next_call_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The connection is gone: later requests are dropped.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.queue.lock().clear();
+    }
+}
+
+impl NexChannel for Outbox {
+    fn send_request(&self, protocol: &str, method: &str, params: &[u8], call_id: Option<u32>) -> u32 {
+        let call_id = self.call_id(call_id);
+        if !self.closed.load(Ordering::Relaxed) {
+            self.queue.lock().push((protocol.into(), method.into(), params.to_vec(), call_id));
+            self.wake.notify_one();
+        }
+        call_id
+    }
 }
 
 pub struct Connection {
@@ -56,7 +100,10 @@ pub struct Connection {
     pub closed: bool,
     /// The player, after LoginWithToken.
     pub profile_id: Option<String>,
-    next_call_id: u32,
+    /// Their session, after LoginWithToken.
+    pub session: Option<Arc<PlayerSession>>,
+    /// Server-initiated requests from outside the server (the session's NexChannel).
+    pub outbox: Arc<Outbox>,
 }
 
 impl Connection {
@@ -72,7 +119,8 @@ impl Connection {
             client_sig: [0; 4],
             key: None, connect_ack: None, expected_seq: 0,
             pending: HashMap::new(), fragments: vec![], next_seq: 1, unacked: HashMap::new(),
-            last_seen: now, closed: false, profile_id: None, next_call_id: 0x10000,
+            last_seen: now, closed: false, profile_id: None, session: None,
+            outbox: Arc::new(Outbox::new(Arc::new(Notify::new()))),
         }
     }
 
@@ -152,12 +200,17 @@ impl Connection {
     /// Server-initiated RMC request (e.g. NotificationProtocol::ProcessNotificationEvent_V1, which the real
     /// server sends with call id 0). Returns the call id used.
     pub fn send_request(&mut self, protocol: &str, method: &str, params: &[u8], call_id: Option<u32>, now: f64) -> u32 {
-        let call_id = call_id.unwrap_or_else(|| {
-            self.next_call_id += 1;
-            self.next_call_id - 1
-        });
+        let call_id = self.outbox.call_id(call_id);
         self.send_message(&rmc::build_request(protocol, call_id, method, params), now);
         call_id
+    }
+
+    /// Send the requests queued on the outbox.
+    pub fn flush_outbox(&mut self, now: f64) {
+        let queued = std::mem::take(&mut *self.outbox.queue.lock());
+        for (protocol, method, params, call_id) in queued {
+            self.send_request(&protocol, &method, &params, Some(call_id), now);
+        }
     }
 
     /// Retransmit overdue packets. Returns false when the connection should be dropped.

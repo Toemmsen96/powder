@@ -3,6 +3,7 @@
 
 pub mod connection;
 pub mod dispatch;
+pub mod handlers;
 pub mod prudp;
 pub mod rmc;
 pub mod secure;

@@ -68,6 +68,16 @@ impl Channels {
     pub fn nex(&self) -> Option<Arc<dyn NexChannel>> {
         self.nex.lock().clone()
     }
+
+    /// Forget the NEX connection if it is this one (a later login may have replaced it); -> whether it was.
+    pub fn clear_nex_if(&self, channel: &Arc<dyn NexChannel>) -> bool {
+        let mut nex = self.nex.lock();
+        let ours = nex.as_ref().is_some_and(|n| std::ptr::addr_eq(Arc::as_ptr(n), Arc::as_ptr(channel)));
+        if ours {
+            *nex = None;
+        }
+        ours
+    }
 }
 
 pub struct PlayerSession {
