@@ -3,11 +3,17 @@
 //! The game accepts any certificate (in-process hook), but Ubisoft Connect checks certificates through
 //! Windows, so it needs a chain to a root it trusts plus revocation information:
 //!
-//! - **local CA** (`ca.pem` + `ca-key.pem`): restricted by NameConstraints to the Ubisoft domains and
-//!   loopback, so trusting it (`powder-server admin trust install`) cannot let it vouch for any other site,
-//!   even if its key leaked.
-//! - **server certificate** (`server.pem` = key + certificate + CA): all Ubisoft hostnames we answer,
-//!   with a CRL distribution point on this machine.
+//! - **local CA** (`ca.pem` + `ca-key.pem`): restricted by NameConstraints to the hostnames the server is
+//!   reached at (`redirect_hosts()`, and their subdomains) and loopback, so trusting it (`powder-server admin
+//!   trust install`) cannot let it vouch for any other site, even if its key leaked: not for the rest of
+//!   Ubisoft's sites either (accounts, store). CAs made before 2026-10-25 (and the Python server's) permit all
+//!   of ubi.com and ubisoft.com ([`PERMITTED_DOMAINS`]); they are kept as they are (players trust them), and a
+//!   new CA is made only by deleting `data/tls/` (then trusted again on each PC).
+//! - **server certificate** (`server.pem` = key + certificate + CA): the Ubisoft hostnames we answer that its
+//!   CA permits (`cert_names()`; under a narrow CA without the `*.ubi.com`-style wildcards), with a CRL
+//!   distribution point on this machine.
+//! - The private keys (`ca-key.pem`, `server.pem`) are written readable by their owner only (0600 on Unix), and
+//!   an existing key file readable by others is made so when it is loaded.
 //! - **CRL**: empty, signed by the CA, served over plain HTTP (`crl_url()`); Windows refuses a certificate
 //!   whose revocation status it cannot check.
 //!
@@ -15,7 +21,7 @@
 //! SHA-256), names and key identifiers match what the Python server wrote, so an existing `data/tls/` (and
 //! the CA users already trust) keeps working.
 
-use crate::constants::{cert_names, CRL_HOST};
+use crate::constants::{cert_names, redirect_hosts, CRL_HOST};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rcgen::{
@@ -33,7 +39,8 @@ use x509_parser::extensions::{DistributionPointName, GeneralName, ParsedExtensio
 use x509_parser::prelude::{parse_x509_certificate, X509Certificate};
 use x509_parser::time::ASN1Time;
 
-pub const PERMITTED_DOMAINS: &[&str] = &["ubi.com", "ubisoft.com"]; // NameConstraints: these and subdomains
+/// NameConstraints of the CAs made before 2026-10-25: these and their subdomains. New CAs: [`ca_permitted`].
+pub const PERMITTED_DOMAINS: &[&str] = &["ubi.com", "ubisoft.com"];
 pub const CRL_PATH: &str = "/powder-ca.crl";
 pub const LEGACY_CRL_PATHS: &[&str] = &["/steep-ca.crl"]; // still served (before the rename to Powder)
 pub const CA_NAME: &str = "Powder (Steep) local CA"; // what users see in Windows' certificate manager
@@ -44,6 +51,12 @@ const CA_LIFETIME_DAYS: i64 = 3650;
 const SERVER_LIFETIME_DAYS: i64 = 825;
 const CRL_LIFETIME_DAYS: i64 = 7;
 const SERVER_RENEW_DAYS: i64 = 30; // a server certificate this close to expiry is replaced
+
+/// What a new CA's NameConstraints permit (each name and its subdomains): the hostnames that resolve to the
+/// server, i.e. `cert_names()` without its wildcards (`*.ubi.com` would permit all of ubi.com again).
+pub fn ca_permitted() -> Vec<&'static str> {
+    redirect_hosts()
+}
 
 /// Plain HTTP on port 80 of the server: a redirected hostname, so it works wherever the server runs.
 pub fn crl_url() -> String {
@@ -130,8 +143,9 @@ fn new_key() -> Result<KeyPair> {
     KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generating an EC P-256 key")
 }
 
-/// A new CA: self-signed, path length 0, only certificate and CRL signing, NameConstraints.
-fn make_ca() -> Result<(Certificate, KeyPair)> {
+/// A new CA: self-signed, path length 0, only certificate and CRL signing, NameConstraints: these DNS names
+/// (and their subdomains) and 127.0.0.0/8.
+fn make_ca(permitted: &[&str]) -> Result<(Certificate, KeyPair)> {
     let key = new_key()?;
     let now = Utc::now();
     let mut p = CertificateParams::default();
@@ -142,7 +156,7 @@ fn make_ca() -> Result<(Certificate, KeyPair)> {
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     p.name_constraints = Some(NameConstraints {
-        permitted_subtrees: PERMITTED_DOMAINS.iter().map(|d| GeneralSubtree::DnsName(d.to_string()))
+        permitted_subtrees: permitted.iter().map(|d| GeneralSubtree::DnsName(d.to_string()))
             .chain([GeneralSubtree::IpAddress(CidrSubnet::V4([127, 0, 0, 0], [255, 0, 0, 0]))])
             .collect(),
         excluded_subtrees: Vec::new(),
@@ -152,17 +166,42 @@ fn make_ca() -> Result<(Certificate, KeyPair)> {
     Ok((cert, key))
 }
 
-/// A new server certificate for every name in `cert_names()` and 127.0.0.1, signed by the CA.
-fn make_server(ca: &Certificate, ca_key: &KeyPair) -> Result<(Certificate, KeyPair)> {
+/// The DNS names a CA's NameConstraints permit (each with its subdomains); None: no DNS constraint (all).
+fn permitted_dns(ca: &X509Certificate) -> Option<Vec<String>> {
+    let constraints = ca.name_constraints().ok()??;
+    let subtrees = constraints.value.permitted_subtrees.as_ref()?;
+    let dns: Vec<String> = subtrees.iter().filter_map(|s| match s.base {
+        GeneralName::DNSName(d) => Some(d.trim_start_matches('.').to_lowercase()),
+        _ => None,
+    }).collect();
+    (!dns.is_empty()).then_some(dns)
+}
+
+/// Whether `name` (a wildcard like `*.ubi.com` too) is inside one of these subtrees (RFC 5280: the name or a
+/// subdomain of it).
+fn within(name: &str, permitted: &[String]) -> bool {
+    let name = name.to_lowercase();
+    permitted.iter().any(|p| name == *p || name.ends_with(&format!(".{p}")))
+}
+
+/// The names of `cert_names()` that a server certificate from this CA may carry. A certificate with a name its
+/// CA does not permit fails as a whole (Windows, OpenSSL, rustls), so the others are left out.
+fn server_names(ca_der: &[u8]) -> Vec<&'static str> {
+    let permitted = parse_x509_certificate(ca_der).ok().and_then(|(_, ca)| permitted_dns(&ca));
+    cert_names().into_iter().filter(|n| permitted.as_ref().is_none_or(|p| within(n, p))).collect()
+}
+
+/// A new server certificate for these names (the first is its subject) and 127.0.0.1, signed by the CA.
+fn make_server(ca: &Certificate, ca_key: &KeyPair, names: &[&str]) -> Result<(Certificate, KeyPair)> {
     let key = new_key()?;
     let now = Utc::now();
     let mut p = CertificateParams::default();
-    p.distinguished_name = name(cert_names()[0]);
+    p.distinguished_name = name(names.first().context("no hostnames for the server certificate")?);
     p.serial_number = Some(random_serial());
     p.not_before = asn1_time(now - Duration::days(1))?.to_datetime();
     p.not_after = asn1_time(now + Duration::days(SERVER_LIFETIME_DAYS))?.to_datetime();
     let mut sans = Vec::new();
-    for h in cert_names() {
+    for &h in names {
         sans.push(SanType::DnsName(h.try_into().with_context(|| format!("hostname {h}"))?));
     }
     sans.push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
@@ -216,7 +255,7 @@ fn server_ok(server_pem: &Path, ca_der: &[u8]) -> bool {
         && cert.verify_signature(Some(ca.public_key())).is_ok()
         && cert.subject().as_raw() != cert.issuer().as_raw()
         && cert.validity().not_after.timestamp() > renew_at.timestamp()
-        && dns_names(&cert).is_some_and(|names| cert_names().iter().all(|h| names.contains(h)))
+        && dns_names(&cert).is_some_and(|names| server_names(ca_der).iter().all(|h| names.contains(h)))
         && crl_points(&cert).is_some_and(|points| points == [crl_url()])
 }
 
@@ -248,19 +287,29 @@ pub fn ensure_pki(tls_dir: &Path) -> Result<Pki> {
     let (ca_pem, ca_key_pem, server_pem) =
         (tls_dir.join("ca.pem"), tls_dir.join("ca-key.pem"), tls_dir.join("server.pem"));
     let (ca_der, ca, ca_key) = if ca_pem.exists() && ca_key_pem.exists() {
-        load_ca(&ca_pem, &ca_key_pem)?
+        make_private(&ca_key_pem)?;
+        let loaded = load_ca(&ca_pem, &ca_key_pem)?;
+        if parse_x509_certificate(&loaded.0).ok().and_then(|(_, c)| permitted_dns(&c))
+            .is_some_and(|p| within("any.ubi.com", &p)) {
+            log::info!(target: "powder.tls", "the local CA permits all of ubi.com (made before 2026-10-25); a new one \
+                                              would permit only the server's names (delete data/tls/, trust it again)");
+        }
+        loaded
     } else {
-        let (ca, ca_key) = make_ca()?;
-        write(&ca_key_pem, ca_key.serialize_pem().as_bytes())?;
+        let (ca, ca_key) = make_ca(&ca_permitted())?;
+        write_private(&ca_key_pem, ca_key.serialize_pem().as_bytes())?;
         write(&ca_pem, ca.pem().as_bytes())?;
         log::info!(target: "powder", "generated local CA {} (install it for Ubisoft Connect: powder-server admin \
                                       trust install)", ca_pem.display());
         (ca.der().to_vec(), ca, ca_key)
     };
+    if server_pem.exists() {
+        make_private(&server_pem)?;
+    }
     if !server_ok(&server_pem, &ca_der) {
-        let (cert, key) = make_server(&ca, &ca_key)?;
+        let (cert, key) = make_server(&ca, &ca_key, &server_names(&ca_der))?;
         let ca_text = pem_cert(&ca_der);
-        write(&server_pem, format!("{}{}{}", key.serialize_pem(), cert.pem(), ca_text).as_bytes())?;
+        write_private(&server_pem, format!("{}{}{}", key.serialize_pem(), cert.pem(), ca_text).as_bytes())?;
         log::info!(target: "powder", "generated server certificate {}", server_pem.display());
     }
     Ok(Pki { dir: tls_dir.to_path_buf(), ca_pem, ca_key_pem, server_pem, ca_der, ca, ca_key })
@@ -281,6 +330,43 @@ fn pem_cert(der: &[u8]) -> String {
 
 fn write(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::write(path, data).with_context(|| format!("writing {}", path.display()))
+}
+
+/// A file holding a private key: readable by its owner only (0600 on Unix, also when it existed with another
+/// mode, set before the new key is written). Elsewhere a plain write (the data folder's own permissions apply).
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("making {} private", path.display()))?;
+        file.write_all(data).with_context(|| format!("writing {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    write(path, data)
+}
+
+/// An existing key file readable by others (written before keys were private): made owner-only (Unix).
+fn make_private(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.permissions().mode();
+        if mode & 0o077 != 0 {
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => log::info!(target: "powder.tls", "{} was readable by others (mode {:o}): now 0600",
+                                     path.display(), mode & 0o777),
+                Err(e) => log::warn!(target: "powder.tls", "{} is readable by others (mode {:o}) and could not be \
+                                                            made private: {e}", path.display(), mode & 0o777),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -319,7 +405,7 @@ mod tests {
         ca.verify_signature(None).unwrap();
         assert_eq!(server.issuer(), ca.subject());
         let names = dns_names(&server).unwrap();
-        assert!(cert_names().iter().all(|h| names.contains(h)));
+        assert_eq!(names, redirect_hosts(), "a new CA's server certificate: the redirected names only");
         assert!(names.contains(&crate::constants::DEMUX_HOST));
         assert!(crate::constants::redirect_hosts().iter().all(|h| names.contains(h)));
         assert_eq!(crl_points(&server).unwrap(), [crl_url()]);
@@ -350,8 +436,8 @@ mod tests {
         let pki = ensure_pki(dir.path()).unwrap();
         let ca_before = std::fs::read(&pki.ca_pem).unwrap();
         // a server.pem from another CA: replaced
-        let (other_ca, other_key) = make_ca().unwrap();
-        let (cert, key) = make_server(&other_ca, &other_key).unwrap();
+        let (other_ca, other_key) = make_ca(&ca_permitted()).unwrap();
+        let (cert, key) = make_server(&other_ca, &other_key, &server_names(other_ca.der())).unwrap();
         std::fs::write(&pki.server_pem, format!("{}{}", key.serialize_pem(), cert.pem())).unwrap();
         assert!(!server_ok(&pki.server_pem, &pki.ca_der));
         let pki = ensure_pki(dir.path()).unwrap();
@@ -378,5 +464,104 @@ mod tests {
         assert!(crl.crl_number().is_some());
         assert!(crl.next_update().unwrap().timestamp() > Utc::now().timestamp());
         crl.verify_signature(ca.public_key()).unwrap();
+    }
+
+    /// A TLS handshake (rustls on both sides, which checks NameConstraints like Windows and OpenSSL) for `sni`,
+    /// the server presenting `chain_pem` (key + certificates), the client trusting only `ca_der`.
+    async fn handshake(chain_pem: &str, ca_der: &[u8], sni: &str) -> Result<(), String> {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        let pem = chain_pem.as_bytes();
+        let certs = rustls_pemfile::certs(&mut &pem[..]).collect::<Result<Vec<_>, _>>().unwrap();
+        let key = rustls_pemfile::private_key(&mut &pem[..]).unwrap().unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()
+            .unwrap().with_no_client_auth().with_single_cert(certs, key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(ca_der.to_vec())).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions()
+            .unwrap().with_root_certificates(roots).with_no_client_auth();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let accept = tokio::spawn(async move { acceptor.accept(server_io).await });
+        let name = ServerName::try_from(sni.to_string()).unwrap();
+        let result = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, client_io).await;
+        let _ = accept.await;
+        result.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn chain(cert: &Certificate, key: &KeyPair, ca_der: &[u8]) -> String {
+        format!("{}{}{}", key.serialize_pem(), cert.pem(), pem_cert(ca_der))
+    }
+
+    /// A new CA permits only the server's names: its server certificate works for each, and a certificate for any
+    /// other Ubisoft site signed with its key (as by someone who read ca-key.pem) is refused by clients.
+    #[tokio::test]
+    async fn a_new_ca_vouches_only_for_the_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = ensure_pki(dir.path()).unwrap();
+        let (_, ca) = parse_x509_certificate(&pki.ca_der).unwrap();
+        assert_eq!(permitted_dns(&ca).unwrap(), ca_permitted());
+        let subtrees = ca.name_constraints().unwrap().unwrap().value.permitted_subtrees.clone().unwrap();
+        let loopback = [127, 0, 0, 0, 255, 0, 0, 0];
+        assert!(subtrees.iter().any(|s| matches!(s.base, GeneralName::IPAddress(ip) if ip == loopback)));
+        let server = std::fs::read_to_string(&pki.server_pem).unwrap();
+        for host in redirect_hosts() {
+            handshake(&server, &pki.ca_der, host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        for other in ["account.ubisoft.com", "store.ubi.com", "connect.ubisoft.com"] {
+            let (cert, key) = make_server(&pki.ca, &pki.ca_key, &[other]).unwrap();
+            let refused = handshake(&chain(&cert, &key, &pki.ca_der), &pki.ca_der, other).await.unwrap_err();
+            assert!(refused.contains("NameConstraintViolation"), "{other}: {refused}");
+        }
+    }
+
+    /// A CA made before (all of ubi.com and ubisoft.com) is kept as it is; its server certificate is (re)issued with
+    /// every name, wildcards included, and still chains to it; its key files become private.
+    #[tokio::test]
+    async fn a_legacy_ca_keeps_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, ca_key) = make_ca(PERMITTED_DOMAINS).unwrap();
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(dir.path().join("ca-key.pem"), ca_key.serialize_pem()).unwrap();
+        let before = std::fs::read(dir.path().join("ca.pem")).unwrap();
+        let pki = ensure_pki(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&pki.ca_pem).unwrap(), before);
+        let chain_der = certs(&pki.server_pem);
+        assert_eq!(chain_der[1], ca.der().to_vec());
+        let (_, server) = parse_x509_certificate(&chain_der[0]).unwrap();
+        assert_eq!(dns_names(&server).unwrap(), cert_names());
+        let server = std::fs::read_to_string(&pki.server_pem).unwrap();
+        for host in ["public-ubiservices.ubi.com", "dmx.upc.ubisoft.com", "other.ubi.com"] {
+            handshake(&server, &pki.ca_der, host).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        assert!(server_ok(&pki.server_pem, &pki.ca_der));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!((mode(&pki.ca_key_pem), mode(&pki.server_pem)), (0o600, 0o600));
+        }
+    }
+
+    /// Key files are written owner-only, and an existing one readable by others is made so on load.
+    #[cfg(unix)]
+    #[test]
+    fn key_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pki = ensure_pki(dir.path()).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&pki.ca_key_pem), mode(&pki.server_pem)), (0o600, 0o600));
+        for p in [&pki.ca_key_pem, &pki.server_pem, &pki.ca_pem] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let server_before = std::fs::read(&pki.server_pem).unwrap();
+        let pki = ensure_pki(dir.path()).unwrap();
+        assert_eq!((mode(&pki.ca_key_pem), mode(&pki.server_pem), mode(&pki.ca_pem)), (0o600, 0o600, 0o644));
+        assert_eq!(std::fs::read(&pki.server_pem).unwrap(), server_before, "kept, only its mode changed");
+        // a re-issued server.pem over an existing 0644 file is private before the new key is in it
+        std::fs::set_permissions(&pki.server_pem, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&pki.server_pem, b"new").unwrap();
+        assert_eq!(mode(&pki.server_pem), 0o600);
     }
 }
