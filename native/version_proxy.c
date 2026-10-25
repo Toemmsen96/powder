@@ -29,7 +29,7 @@ static wchar_t g_dir[MAX_PATH];        // this DLL's directory (with trailing ba
 static void launch_armer(void) {
     wchar_t exe[MAX_PATH], cmd[MAX_PATH * 2];
     _snwprintf(exe, MAX_PATH, L"%sarmer.exe", g_dir);
-    _snwprintf(cmd, MAX_PATH * 2, L"\"%s\" --pid %lu --target 0x%llx --patchfn 0x%llx --delayms 10000 --log \"%s\"",
+    _snwprintf(cmd, MAX_PATH * 2, L"\"%s\" --pid %lu --target 0x%llx --patchfn 0x%llx --delayms 6000 --log \"%s\"",
                exe, GetCurrentProcessId(), (unsigned long long)g_target,
                (unsigned long long)(uintptr_t)(void *)tls_replacement, g_log);
     STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);

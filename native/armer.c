@@ -22,8 +22,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define TARGET_RVA 0x1D3E290ULL
+
+static const char *g_logpath = NULL;
+
+// Append a line to the shared log (same file the DLL writes), so its result is visible beside the DLL's.
+static void armer_log(const char *fmt, ...) {
+    if (!g_logpath) return;
+    FILE *f = fopen(g_logpath, "a");
+    if (!f) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    char msg[400];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+    fprintf(f, "%02d:%02d:%02d.%03d armer[pid %lu]: %s\r\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+            GetCurrentProcessId(), msg);
+    fclose(f);
+}
 
 static int log_has(const char *path, const char *needle) {
     FILE *f = fopen(path, "rb");
@@ -67,6 +83,8 @@ static int patch(HANDLE proc, uintptr_t target, uintptr_t patchfn, const char *l
     int good = ok && wr == sizeof(jmp) && memcmp(back, jmp, sizeof(jmp)) == 0;
     (void)log_path;
     printf("armer: patch %s (%zu bytes)\n", good ? "ok" : "FAILED", wr);
+    armer_log("patched ssl_verify_cert_chain at %p -> our check: %s (%zu bytes written)", addr,
+              good ? "ok" : "FAILED", wr);
     return good;
 }
 
@@ -76,7 +94,7 @@ int main(int argc, char **argv) {
     uintptr_t page = 0, target = 0, patchfn = 0;
     for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--pid")) pid = (DWORD)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--log")) log = argv[++i];
+        else if (!strcmp(argv[i], "--log")) { log = argv[++i]; g_logpath = log; }
         else if (!strcmp(argv[i], "--page")) page = (uintptr_t)strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--target")) target = (uintptr_t)strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--patchfn")) patchfn = (uintptr_t)strtoull(argv[++i], NULL, 0);
@@ -95,6 +113,8 @@ int main(int argc, char **argv) {
         if (!target) { printf("armer: --patchfn needs --target\n"); return 1; }
         for (DWORD w = 0; w < delayms; w += 100) { if (!alive(proc)) return 2; Sleep(100); }  // integrity window
         if (!alive(proc)) return 2;
+        armer_log("patching after %lu ms delay (pid %lu, target 0x%llx)", delayms, pid,
+                  (unsigned long long)target);
         int ok = patch(proc, target, patchfn, log);
         fflush(stdout);
         return ok ? 0 : 1;
