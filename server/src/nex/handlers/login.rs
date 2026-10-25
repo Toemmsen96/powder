@@ -97,17 +97,20 @@ mod tests {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         addr: SocketAddr,
         key: [u8; 16],
+        /// The SYN-ACK's connection signature, which the game's packets carry.
+        sig: [u8; 4],
         seq: u16,
         now: f64,
     }
 
     impl Game {
         fn connect(srv: NexServer, sent: Arc<Mutex<Vec<Vec<u8>>>>, addr: &str) -> Game {
-            let mut g = Game { srv, sent, addr: addr.parse().unwrap(), key: [0; 16], seq: 2, now: 0.0 };
+            let mut g = Game { srv, sent, addr: addr.parse().unwrap(), key: [0; 16], sig: [0; 4], seq: 2, now: 0.0 };
             g.srv.received(0.0, &Packet { kind: SYN, flags: FLAG_NEED_ACK, ..Default::default() }.encode(), g.addr);
+            g.sig = Packet::decode(g.sent.lock().last().unwrap()).unwrap().connection_signature;
             let (blob, eph) = secure::client_key();
             let connect = Packet { kind: CONNECT, flags: FLAG_NEED_ACK | FLAG_RELIABLE | FLAG_KEY_EXCHANGE,
-                                   sequence_id: 1, connection_signature: [1, 2, 3, 4], key_blob: blob,
+                                   sequence_id: 1, signature: g.sig, connection_signature: [1, 2, 3, 4], key_blob: blob,
                                    ..Default::default() };
             g.srv.received(0.1, &connect.encode(), g.addr);
             let ack = Packet::decode(g.sent.lock().last().unwrap()).unwrap();
@@ -124,6 +127,7 @@ mod tests {
                 let p = Packet { kind: DATA, flags: FLAG_RELIABLE | FLAG_NEED_ACK, sequence_id: self.seq,
                                  fragment_id: if i == chunks.len() - 1 { 0 } else { i as u8 + 1 },
                                  payload: secure::encrypt_payload(&self.key, self.seq, chunk, false),
+                                 signature: self.sig,
                                  ..Default::default() };
                 self.now += 0.01;
                 self.srv.received(self.now, &p.encode(), self.addr);
@@ -136,7 +140,7 @@ mod tests {
             let packets: Vec<Packet> = self.sent.lock().drain(..).map(|d| Packet::decode(&d).unwrap()).collect();
             let (mut out, mut parts) = (vec![], vec![]);
             for p in packets.into_iter().filter(|p| p.kind == DATA && !p.has(FLAG_ACK)) {
-                let ack = Packet { kind: DATA, flags: FLAG_ACK, sequence_id: p.sequence_id,
+                let ack = Packet { kind: DATA, flags: FLAG_ACK, sequence_id: p.sequence_id, signature: self.sig,
                                    fragment_id: p.fragment_id, ..Default::default() };
                 self.srv.received(self.now, &ack.encode(), self.addr);
                 parts.extend(secure::decrypt_payload(&self.key, &p.payload, Some(p.sequence_id)).unwrap());

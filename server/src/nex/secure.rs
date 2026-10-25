@@ -29,6 +29,10 @@ pub const ECS1: &[u8; 4] = b"ECS1"; // BCRYPT_ECDSA_PUBLIC_P256_MAGIC
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
+/// Most a compressed payload may inflate to: one packet's plaintext (the game's fragments are under 1 KB, a
+/// datagram is at most 64 KB).
+pub const MAX_INFLATED: usize = 64 * 1024;
+
 pub fn to_blob(public: &PublicKey, magic: &[u8; 4]) -> Vec<u8> {
     let point = public.to_encoded_point(false);
     let mut blob = magic.to_vec();
@@ -46,9 +50,11 @@ pub fn from_blob(blob: &[u8]) -> Result<PublicKey> {
     Option::from(PublicKey::from_encoded_point(&point)).ok_or_else(|| anyhow!("public key not on the curve"))
 }
 
-/// The server's ECDSA key (PRIVATE: never publish it), created on first run. Same PKCS#8 PEM file as before.
+/// The server's ECDSA key (PRIVATE: never publish it), created on first run. Same PKCS#8 PEM file as before. On
+/// Unix the file is the owner's only (0600; an existing file's mode is tightened when loaded).
 pub fn load_or_create_signing_key(path: &Path) -> Result<SigningKey> {
     if path.exists() {
+        private_mode(path)?;
         let pem = std::fs::read_to_string(path)?;
         let secret = SecretKey::from_pkcs8_pem(&pem).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         return Ok(SigningKey::from(secret));
@@ -58,8 +64,31 @@ pub fn load_or_create_signing_key(path: &Path) -> Result<SigningKey> {
         std::fs::create_dir_all(parent)?;
     }
     let pem = secret.to_pkcs8_pem(LineEnding::LF).map_err(|e| anyhow!("{e}"))?;
-    std::fs::write(path, pem.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    file.open(path).and_then(|mut f| f.write_all(pem.as_bytes()))
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(SigningKey::from(secret))
+}
+
+/// Make a private file readable by its owner only (Unix; elsewhere the folder's ACL decides).
+fn private_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("making {} private", path.display()))?;
+            log::info!(target: "powder.nex", "{}: was readable by others (mode {:o}), now 0600", path.display(),
+                       mode & 0o777);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Value for `public_key` in /rendezvous/configuration.
@@ -130,8 +159,12 @@ pub fn decrypt_payload(key: &[u8; 16], data: &[u8], seq: Option<u16>) -> Result<
     let inner = if *ratio == 0 {
         body.to_vec()
     } else {
+        // bounded: a few KB of zlib could otherwise inflate to many MB
         let mut out = vec![];
-        flate2::read::ZlibDecoder::new(body).read_to_end(&mut out)?;
+        flate2::read::ZlibDecoder::new(body).take(MAX_INFLATED as u64 + 1).read_to_end(&mut out)?;
+        if out.len() > MAX_INFLATED {
+            bail!("compressed payload inflates past {MAX_INFLATED} bytes");
+        }
         out
     };
     if inner.len() < 2 {
@@ -167,11 +200,32 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_inflating_past_the_limit_is_refused() {
+        let key = [7u8; 16];
+        let fits = vec![b'x'; MAX_INFLATED - 2];
+        assert_eq!(decrypt_payload(&key, &encrypt_payload(&key, 1, &fits, true), Some(1)).unwrap(), fits);
+        let bomb = encrypt_payload(&key, 1, &vec![0u8; 16 * 1024 * 1024], true);
+        assert!(bomb.len() < 64 * 1024, "16 MB of zeros compress to {} bytes", bomb.len());
+        let err = decrypt_payload(&key, &bomb, Some(1)).unwrap_err().to_string();
+        assert!(err.contains("inflates past"), "{err}");
+    }
+
+    #[test]
     fn signing_key_file_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("k.pem");
         let a = load_or_create_signing_key(&path).unwrap();
         let b = load_or_create_signing_key(&path).unwrap();
         assert_eq!(config_public_key(&a), config_public_key(&b));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            // a key file from before (default permissions) is made private when loaded
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let c = load_or_create_signing_key(&path).unwrap();
+            assert_eq!((mode(&path), config_public_key(&c)), (0o600, config_public_key(&a)));
+        }
     }
 }
