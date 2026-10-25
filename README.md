@@ -217,12 +217,15 @@ Without a choice, `server_mode` and `server_address` in `launcher.toml` decide. 
 5. **Certificate**: gets the server's CA and, if Windows doesn't trust it yet, installs it for your user.
 6. **Account**: registers your account on the server, or signs in to one you already have there (the
    launcher remembers the email, never the password).
-7. **Ubisoft Connect**: restarts it if it is not signed in to the server as this PC's player, then waits
+7. **Client mods**: lists the client mods the server offers and downloads the ones you approved (see
+   [Client mods](#client-mods) below). Off unless you turn it on; it never stops Play.
+8. **Ubisoft Connect**: restarts it if it is not signed in to the server as this PC's player, then waits
    for its login: sign in with the account's email and password.
-8. **Steep**: starts it through Steam or Ubisoft Connect, attaches the TLS helper to the game and waits
-   until it is online. Both versions start a short-lived starter process first; the helper attaches only
-   to the real game from the chosen install. While the launcher stays open, the server keeps running, so
-   Ubisoft Connect stays signed in and the next Play goes straight to the game.
+9. **Steep**: starts it through Steam or Ubisoft Connect, attaches the TLS helper to the game (then the
+   approved client mods) and waits until it is online. Both versions start a short-lived starter process
+   first; the helper attaches only to the real game from the chosen install. While the launcher stays
+   open, the server keeps running, so Ubisoft Connect stays signed in and the next Play goes straight to
+   the game.
 
 The game-data pack is set up apart from Play, in the **Game data** row under the buttons: **Choose
 pack…** installs a `.zip` into the local server's `gamedata/`. Then a checkbox switches it on and off
@@ -238,6 +241,38 @@ game's certificate check without changing code bytes at first, `armer.exe` keeps
 patches the check once the game's integrity check is over. It only fits the `Steep.exe` builds listed in
 `powder/launcher/game.py` (the Steam and the Ubisoft Connect download of the final update: the same
 compiled game, packaged differently). Game files are never modified on disk.
+
+### Client mods
+
+A server can offer client mods: DLLs loaded into your game next to the TLS helper (how a host adds them:
+[Mods](#mods)). They are code that runs on your PC with your rights, so the launcher uses none unless you
+say so, in `launcher.toml`:
+
+```toml
+[client_mods]
+enabled = true                 # default false: nothing is downloaded or loaded
+allow = ["fov", "hud"]         # exact mod names; no wildcard
+```
+
+- With client mods off, the **Client mods** step still shows what the server offers (and the log lists
+  it), but downloads nothing.
+- The first time an allowed mod is used from a server, the launcher **pins** it: each file's path and
+  SHA-256 and the DLLs it loads, in order, remembered per server in `data/launcher/settings.json`
+  (`client_mod_pins`). Only the version text may change later.
+- If the host changes a pinned mod, Play stops at the step and says what changed: **Approve new version**
+  pins the new files, **Play without it** plays this time without that mod (and asks again next time).
+  To withdraw an approval, take the mod out of `allow` (its files are deleted at the next Play); to
+  forget a pin, delete its entry under `client_mod_pins`.
+- Files go only to `data/launcher/client-mods/<server>_<port>/<mod>/`. Paths that are absolute, contain
+  `..`, a drive letter, a backslash, a colon or a Windows device name are refused, as is any file whose
+  size or SHA-256 differs from the server's list (checked after the download and again right before
+  loading). Files no longer listed are deleted; game files are never touched.
+- The DLLs are loaded after the TLS helper is attached and its armer started, mod by mod in the server's
+  order. A mod that fails to load is logged and skipped; the game goes on, and the Steep step says which
+  mods loaded.
+
+Approving a mod means trusting that server's host with your PC, as much as running a program they sent
+you. The pin only makes sure they can't swap it later without you noticing.
 
 ### Restoring your PC
 
@@ -256,7 +291,8 @@ Installed, Powder's folder is `%LOCALAPPDATA%\Powder`; from source, the current 
 `config.toml` and `launcher.toml` (optional settings), `gamedata/` (the game-data pack), `plugins/`, and
 `data/`, which holds everything the server generates on first run: `powder.db` (players), `logs/server.log`,
 `bodies/` (logs the game uploads), `tls/` (local CA and server certificate), `nex_signing_key.pem`, and
-`launcher/` (launcher log, hosts-file backups, the server's CA as downloaded by the launcher).
+`launcher/` (launcher log, hosts-file backups, the server's CA as downloaded by the launcher, approved
+client mods in `client-mods/`).
 
 ## Ports
 
@@ -403,7 +439,8 @@ has a server part, a client part, or both:
 - **Client part**: files in `mods/<name>/client/` and a `mod.toml` (`version`, `description`,
   `[client] inject = ["x.dll"]`). The server lists them at `/_powder/mods`; the launcher downloads them
   and loads the DLLs into the game. **A player's launcher only loads client mods that player approved**,
-  pinned to their file hashes: a server cannot push code to its players.
+  pinned to their file hashes: a server cannot push code to its players (the player's side:
+  [Client mods](#client-mods)).
 
 ```lua
 -- mods/welcome.lua

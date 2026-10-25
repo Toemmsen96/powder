@@ -2,7 +2,8 @@
 something when needed; when it needs the user (hosts entries, certificate, restarting Connect) it shows
 the choices and waits for one. The UI only renders steps and forwards button clicks.
 
-Play:            game files -> firewall -> server -> DNS -> certificate -> account -> Ubisoft Connect -> game
+Play:            game files -> firewall -> server -> DNS -> certificate -> account -> client mods ->
+                 Ubisoft Connect -> game
 Restore system:  Steep closed -> server stopped -> Connect quit -> hosts entries removed -> CA removed ->
                  firewall rules removed -> check
 
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 import queue
+import ssl
 import threading
 import time
 import webbrowser
@@ -29,7 +31,8 @@ from powder.server.gamedata import pack
 
 from .. import paths
 from ..version import __version__, compatible
-from . import account, attach, certs, connect, dns, elevate, firewall, footprint, game, locate, network, ports, server
+from . import (account, attach, certs, connect, dns, elevate, firewall, footprint, game, locate, mods, network,
+               ports, server)
 from .config import LauncherConfig
 
 log = logging.getLogger("powder.launcher")
@@ -74,7 +77,7 @@ class ServerSetup:
 def play_steps() -> list[Step]:
     return [Step("files", "Game files"), Step("firewall", "Firewall"), Step("server", "Server"),
             Step("dns", "DNS / hosts"), Step("cert", "Certificate"), Step("account", "Account"),
-            Step("connect", "Ubisoft Connect"), Step("game", "Steep")]
+            Step("mods", "Client mods"), Step("connect", "Ubisoft Connect"), Step("game", "Steep")]
 
 
 @dataclass
@@ -125,6 +128,7 @@ class Session:
         self.installs: list[locate.Install] = self.detect()   # which Steep versions are installed
         self.chosen: locate.Install | None = None              # the one the user pressed Play for
         self.install: locate.Install | None = None             # the one being played (after check_files)
+        self.mod_plan: list[tuple[mods.ClientMod, Path]] = []  # client mods to load (check_mods), in order
 
     def detect(self) -> list[locate.Install]:
         self.installs = locate.find_installs(self.cfg.steam_app_id, self.cfg.steep_exe)
@@ -176,7 +180,8 @@ class Session:
         # the firewall comes before the server: a server listening for the network without a rule for its
         # program would make Windows ask, unannounced
         self._launch(play_steps(), (self.check_files, self.check_firewall, self.check_server, self.check_dns,
-                                    self.check_cert, self.check_account, self.check_connect, self.run_game))
+                                    self.check_cert, self.check_account, self.check_mods, self.check_connect,
+                                    self.run_game))
 
     def restore(self) -> None:
         """Restore system: undo what the launcher set up (see footprint.py)."""
@@ -543,6 +548,111 @@ class Session:
             self.set("account", OK, f"{acc.name} ({acc.email})")
             return True
 
+    # ---- client mods (opt-in, pinned per server; see mods.py) -------------------------------------------
+    def mods_dir(self) -> Path:
+        """Where this server's client mods are downloaded to (one folder per mod)."""
+        return self.data_dir / "client-mods" / self._account_key().replace(":", "_")
+
+    def mod_pins(self) -> dict:
+        """The approved files of each client mod of this server (settings.json)."""
+        return dict((self._prefs().get("client_mod_pins") or {}).get(self._account_key()) or {})
+
+    def _save_mod_pins(self, pins: dict) -> None:
+        every = dict(self._prefs().get("client_mod_pins") or {})
+        every[self._account_key()] = pins
+        self._save_prefs(client_mod_pins=every)
+
+    def check_mods(self) -> bool:
+        """Which client mods the server offers and which are used: only with client_mods.enabled, only the
+        ones in client_mods.allow, and only as pinned on first use (a change asks first). Never stops Play."""
+        self.mod_plan = []
+        self.set("mods", RUNNING, "asking the server which client mods it offers")
+        try:
+            http = mods.Http(self.cfg.server_address, self.cfg.server_https_port, self.ca_path)
+            index = mods.fetch_index(http.get)
+        except (mods.ModError, OSError, ssl.SSLError) as e:
+            log.warning("client mods: no list from the server: %s", e)
+            self.set("mods", OK, f"the server's list of client mods could not be read ({e}); playing without them")
+            return True
+        if index is None:
+            self.set("mods", OK, "this server offers no client mods")
+            return True
+        offered, problems = index
+        for problem in problems:
+            log.warning("client mod refused: %s", problem)
+        pins = self.mod_pins()
+        verdict = mods.decide(offered, self.cfg.client_mods_enabled, self.cfg.client_mods_allow, pins)
+        log.info("client mods offered: %s", ", ".join(f"{m.name} {m.version} ({verdict[m.name]})" for m in offered)
+                 or "none")
+        shown: list[str] = []
+        for m in offered:
+            state = verdict[m.name]
+            if state == mods.CHANGED:
+                choice = self.ask("mods", f"The client mod \"{m.name}\" ({m.version}) is not what you approved on "
+                                  f"this server: {mods.changes(pins[m.name], m)}. A client mod is code that runs "
+                                  "inside the game with your rights: approve the new version only if you trust "
+                                  "the server's host with that.", ["Approve new version", "Play without it"])
+                if choice != "Approve new version":
+                    log.warning("client mod %s: changed since approved, not used", m.name)
+                    shown.append(f"{m.name}: changed since you approved it, not used")
+                    continue
+                state = mods.NEW
+            if state == mods.NEW:
+                pins[m.name] = m.pin()
+                self._save_mod_pins(pins)
+                log.info("client mod %s %s approved for this server: %s", m.name, m.version, m.pin())
+            if state in (mods.NEW, mods.ACTIVE):
+                self.set("mods", RUNNING, f"downloading {m.name}")
+                try:
+                    got = mods.sync(m, self.mods_dir() / m.name, http.get)
+                except (mods.ModError, OSError) as e:
+                    log.warning("client mod %s: not used: %s", m.name, e)
+                    shown.append(f"{m.name}: not used ({e})")
+                    continue
+                log.info("client mod %s %s: %s", m.name, m.version,
+                         f"downloaded {', '.join(got)}" if got else "up to date")
+                self.mod_plan.append((m, self.mods_dir() / m.name))
+                shown.append(f"{m.name} {m.version}: active")
+            elif state == mods.NOT_ALLOWED:
+                shown.append(f"{m.name}: offered, not in client_mods.allow")
+        mods.remove_unused(self.mods_dir(), {m.name for m, _ in self.mod_plan})
+        if problems:
+            shown.append(f"{len(problems)} refused (see the log)")
+        if not self.cfg.client_mods_enabled and offered:
+            text = (f"the server offers {', '.join(m.name for m in offered)}; client mods are off "
+                    "([client_mods] in launcher.toml)")
+        else:
+            text = "; ".join(shown) or "this server offers no client mods"
+        self.set("mods", OK, text)
+        return True
+
+    def inject_mods(self, pid: int, load=None) -> tuple[list[str], list[str]]:
+        """Load the approved client mods' DLLs into the game, in order, after the TLS helper. A mod that
+        fails is logged and skipped (the rest of its DLLs too); the game goes on. (loaded, failed) names."""
+        load = load or attach.load_dll
+        loaded, failed = [], []
+        for mod, root in self.mod_plan:
+            try:
+                dlls = mods.dlls(mod, root)
+            except mods.ModError as e:
+                log.warning("client mod %s: not loaded: %s", mod.name, e)
+                failed.append(mod.name)
+                continue
+            for dll in dlls:
+                try:
+                    ok = load(pid, dll)
+                except Exception as e:                  # noqa: BLE001 - a mod must not stop the game
+                    log.warning("client mod %s: loading %s failed: %s", mod.name, dll, e)
+                    ok = False
+                if not ok:
+                    log.warning("client mod %s: %s did not load; its other DLLs are skipped", mod.name, dll.name)
+                    failed.append(mod.name)
+                    break
+                log.info("client mod %s: loaded %s", mod.name, dll)
+            else:
+                loaded.append(mod.name)
+        return loaded, failed
+
     def check_dns(self) -> bool:
         addr = self.cfg.server_address
         while True:
@@ -705,7 +815,13 @@ class Session:
                 break
             self.wait(0.1)
         self.armer = attach.start_armer(pid, log=log.info)
-        self.set("game", RUNNING, "press any key at the title screen; waiting for the game to go online")
+        mods_note = ""
+        if self.mod_plan:
+            self.set("game", RUNNING, "loading the client mods")
+            loaded, failed = self.inject_mods(pid)
+            mods_note = (f" (client mods: {', '.join(loaded) or 'none'} loaded" +
+                         (f", {', '.join(failed)} failed - see the log)" if failed else ")"))
+        self.set("game", RUNNING, "press any key at the title screen; waiting for the game to go online" + mods_note)
         online = False
         while True:
             procs = attach.game_processes()
@@ -716,7 +832,7 @@ class Session:
             st = server.status(self.cfg)
             if not online and server.mine(st, "game", self.own_addresses(st)):
                 online = True
-                self.set("game", OK, "online on the server - have fun")
+                self.set("game", OK, "online on the server - have fun" + mods_note)
             self.wait(1 if time.monotonic() - started < 30 else 2)
         observer.poll()
         self.end_game()

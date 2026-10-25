@@ -18,6 +18,10 @@ class LauncherConfig:
     connect_exe: str = ""
     steam_app_id: int = 460920
     remove_hosts_on_exit: bool = False    # take the hosts entries out again when the launcher closes
+    # [client_mods]: code a server offers to load into the game. Off unless the player turns it on and
+    # names each mod (see mods.py for the trust model)
+    client_mods_enabled: bool = False
+    client_mods_allow: tuple[str, ...] = ()
     path: Path | None = None
 
     @classmethod
@@ -25,11 +29,21 @@ class LauncherConfig:
         if path is None or not path.exists():
             return cls(path=path)
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
-        fields = {f for f in cls.__dataclass_fields__ if f != "path"}
+        mods = raw.pop("client_mods", {})
+        fields = {f for f in cls.__dataclass_fields__ if f != "path" and not f.startswith("client_mods_")}
         unknown = set(raw) - fields
+        if not isinstance(mods, dict):
+            raise ValueError("launcher.toml: client_mods must be a table ([client_mods])")
+        unknown |= {f"client_mods.{k}" for k in set(mods) - {"enabled", "allow"}}
         if unknown:
             raise ValueError(f"unknown launcher.toml keys: {', '.join(sorted(unknown))}")
-        return cls(path=path, **{k: v for k, v in raw.items() if k in fields})
+        enabled, allow = mods.get("enabled", False), mods.get("allow", [])
+        if not isinstance(enabled, bool):
+            raise ValueError("launcher.toml: client_mods.enabled must be true or false")
+        if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+            raise ValueError("launcher.toml: client_mods.allow must be a list of mod names")
+        return cls(path=path, client_mods_enabled=enabled, client_mods_allow=tuple(allow),
+                   **{k: v for k, v in raw.items() if k in fields})
 
     def server_config_path(self) -> Path:
         if self.server_config:

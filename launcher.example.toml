@@ -14,3 +14,10 @@ server_https_port = 443
 # connect_exe = 'C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe'
 
 remove_hosts_on_exit = false     # take the hosts entries the launcher added out again when it closes
+
+# Client mods: DLLs a server offers to load into the game (see README, "Client mods"). They run on this PC
+# with your rights, so they are off by default and only the mods named here are used. Each is pinned to
+# its file hashes per server on first use; if the host changes it, Play asks before using the new version.
+[client_mods]
+enabled = false
+allow = []                       # e.g. ["fov", "hud"]: exact mod names, no wildcard
