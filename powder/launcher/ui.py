@@ -260,7 +260,7 @@ class LauncherWindow:
             self.render_account()
 
         if what == "register":
-            self.in_background(lambda: account.takes_over(self.session.cfg, self.session.ca_path), ask)
+            self.in_background(lambda: account.takes_over(self.session.cfg, self.session.account_ca()), ask)
         else:
             ask(None, None)
 

@@ -441,7 +441,7 @@ class Session:
         cas = [t for t in self.launcher_cas() if t != thumb] + ([thumb] if installed else [])
         self._save_prefs(trusted_cas=cas)
 
-    def _account_ca(self) -> Path:
+    def account_ca(self) -> Path:
         ca = self.trusted_ca()
         if ca is None:
             raise account.AccountError("The server's certificate is not set up yet: press Play first.")
@@ -450,7 +450,7 @@ class Session:
     def account_action(self, what: str, **kw) -> account.Account:
         """register / sign_in / change_email / change_password / rename (for the account row and step); raises
         account.AccountError with a text for the player. The result is remembered (not the password)."""
-        acc = getattr(account, what)(self.cfg, self._account_ca(), **kw)
+        acc = getattr(account, what)(self.cfg, self.account_ca(), **kw)
         self._remember_account(acc)
         log.info("account: %s done (%s)", what, acc.name)
         return acc
@@ -611,7 +611,7 @@ class Session:
             self.set("account", OK, f"{acc.name} ({acc.email})")
             return True
         try:
-            takes = account.takes_over(self.cfg, self._account_ca())
+            takes = account.takes_over(self.cfg, self.account_ca())
         except account.AccountError:
             takes = None
         intro = ("Every player on this server has their own account (email and password), also used to sign in to "
@@ -968,6 +968,8 @@ class Session:
         for thumb, _ in cas:
             if thumb not in {t for t, _ in left}:
                 self._remember_installed(thumb, installed=False)
+                if thumb == self.installed_ca:
+                    self.installed_ca = None
         self.set("cert", FAILED if left else OK, f"{len(left)} server certificate(s) still trusted" if left else
                  f"removed {len(cas)} server certificate(s)")
         return True

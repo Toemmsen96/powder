@@ -103,7 +103,8 @@ def check_ca(pem: bytes) -> x509.Certificate:
     if not dns or not ips:
         raise CaError("its NameConstraints leave DNS names or IP addresses unconstrained")
     if bad := [d for d in dns if not _dns_ok(d)]:
-        raise CaError(f"it may vouch for names outside ubi.com and ubisoft.com ({', '.join(bad[:3])[:200]})")
+        raise CaError(f"it may vouch for names outside ubi.com and ubisoft.com "
+                      f"({', '.join(repr(d)[:60] for d in bad[:3])})")
     if bad := [n for n in ips if not (isinstance(n, ipaddress.IPv4Network) and n.subnet_of(ALLOWED_NET))]:
         raise CaError(f"it may vouch for addresses outside 127.0.0.0/8 ({', '.join(map(str, bad[:3]))})")
     return cert
