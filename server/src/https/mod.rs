@@ -10,16 +10,14 @@
 //!   routes          method + path pattern -> handler, in the Python server's registration order:
 //!                   routes_powder.rs (/_powder/: status, accounts, CA, overlay part, client mods),
 //!                   routes_profile.rs (profile, friends, notifications, GraphQL, chat channels...),
-//!                   routes_ubi.rs (sign-in, NEX discovery, Connect's internet check), websocket.rs (the handshake)
+//!                   routes_ubi.rs (sign-in, NEX discovery, inventory + store, profile entities + their files,
+//!                   Connect's internet check and cloud saves), websocket.rs (the handshake)
 //!   fallback        the game-data pack's recorded reply, else the server's built-in one (builtin/), else `{}` +
 //!                   an UNMATCHED warning (Connect's cached UI settings: 304 to keep its copy, 503 without one)
 //!
 //! Routes match on the path only (the host matters only for the pack); a route whose path matches but whose
 //! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
 //! A websocket handshake the route accepted (101) is answered by hyper, then the connection is websocket.rs's.
-//!
-//! Not ported yet: the UGC routes and routes_ubi's inventory, store, entity and cloud-save routes; until they
-//! are, what they would answer falls through to the pack.
 
 pub mod routes_powder;
 pub mod routes_profile;
@@ -185,7 +183,7 @@ impl Route {
 }
 
 /// Every route, in the Python server's registration order (routes_powder, routes_profile, routes_ubi,
-/// routes_ugc, the websocket; ported so far: routes_powder, routes_profile, routes_ubi's sign-in part, the websocket).
+/// routes_ugc, the websocket).
 static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
     routes_powder::routes().into_iter().chain(routes_profile::routes()).chain(routes_ubi::routes())
         .chain(websocket::routes()).collect()

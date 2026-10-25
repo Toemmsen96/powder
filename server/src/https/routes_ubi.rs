@@ -1,23 +1,107 @@
-//! UbiServices endpoints with real logic, from the Python server's routes_ubi.py. Ported so far: the sign-in
-//! (POST /v3/profiles/sessions), the NEX discovery (rendezvous configuration) and Ubisoft Connect's internet
-//! check. Not yet: inventory, store offers, profile entities (+ their files) and Connect's cloud saves; those
-//! fall through to the pack.
+//! UbiServices endpoints with real logic, from the Python server's routes_ubi.py: the sign-in
+//! (POST /v3/profiles/sessions), the NEX discovery (rendezvous configuration), inventory and store offers
+//! (services/economy.rs), profile entities and the files behind them (services/entities.rs), and Ubisoft
+//! Connect's internet check and cloud saves (services/cloudsaves.rs: the same instance the demux hands its
+//! links out from). Player-related endpoints that only need a plausible answer are routes_profile's; game-wide
+//! data comes from the pack (the fallback).
 
-use super::{Ctx, Reply, Route};
+use super::{Ctx, Reply, Req, Route};
+use crate::builtin::http::Query;
 use crate::constants::{APP_ID, CONNECT_SPACE_ID, SPACE_ID};
 use crate::core::identity::{parse_authorization, LoginRequest};
 use crate::core::sessions::ubi_shaped_ticket;
 use crate::services::accounts::{basic_credentials, Error as AccountError};
+use crate::services::cloudsaves::{self, CloudSaveError};
+use crate::services::entities::Entity;
 use crate::util::{iso_in, iso_now, token_hex, token_urlsafe};
+use anyhow::Context as _;
+use regex::Regex;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 
 /// In routes_ubi.py's registration order.
 pub fn routes() -> Vec<Route> {
     vec![
+        Route::new("GET", "/v1/profiles/{profile_id}/entities", get_entities_v1),
+        Route::new("POST", "/v1/profiles/{profile_id}/entities", write_cloud_entity),
+        Route::new("PUT", "/v1/profiles/entities/{entity_id}", write_cloud_entity),
+        Route::new("PUT", "/v1/profiles/entitites/{entity_id}", write_cloud_entity), // sic: what Connect sends
+        Route::new("GET", "/_powder/cloudsaves/legacy-list/{product}", cloud_save_legacy_list),
+        Route::new("*", "/_powder/cloudsaves/{product}/{slot}", cloud_save_file),
         Route::new("GET", "/{prefix:.*}test_internet.txt", internet_check),
         Route::new("POST", "/v3/profiles/sessions", create_session),
         Route::new("GET", "/v1/spaces/{space}/sandboxes/{sandbox}/rendezvous/configuration", rendezvous_configuration),
+        Route::new("GET", "/v1/profiles/{profile_id}/inventory", get_inventory),
+        Route::new("POST", "/v1/profiles/{profile_id}/inventory", post_inventory),
+        Route::new("GET", "/v1/spaces/{space}/offers", get_offers),
+        Route::new("GET", "/v2/profiles/entities", get_entities_batch),
+        Route::new("POST", "/v2/profiles/entities", post_entity),
+        Route::new("GET", "/v2/profiles/entities/{entity_id}", get_entity),
+        Route::new("PUT", "/v2/profiles/entities/{entity_id}", put_entity),
+        Route::new("DELETE", "/v2/profiles/entities/{entity_id}", delete_entity),
+        Route::new("GET", "/v2/profiles/{profile_id}/entities", get_profile_entities),
+        Route::new("POST", "/v2/profiles/{profile_id}/entities", post_entity),
+        Route::new("*", "/_powder/entity-files/{entity_id}", entity_file),
     ]
+}
+
+// ---- shared with routes_ugc ---------------------------------------------------------------------------------
+/// The Host header as sent, port included (aiohttp's `request.host`): where the links we hand out point.
+pub(super) fn host(req: &Req) -> &str {
+    req.header("Host").filter(|h| !h.is_empty()).unwrap_or(&req.host)
+}
+
+/// The decoded query parameters (aiohttp's `request.query`).
+pub(super) fn query(req: &Req) -> Query {
+    Query::parse(req.path_qs.split_once('?').map(|(_, q)| q).unwrap_or(""))
+}
+
+/// A reply without a body or Content-Type, as aiohttp's bare `web.Response(status=...)`. Python's routes leave
+/// some of them without a `how`: the access log shows "?".
+pub(super) fn empty(status: u16, how: &str) -> Reply {
+    Reply { status, headers: vec![], body: vec![], how: how.into() }
+}
+
+/// A file as aiohttp's `FileResponse` (with Content-Type application/octet-stream) sends it; hyper leaves the
+/// body out for HEAD.
+pub(super) fn file_reply(path: &std::path::Path, how: &str) -> Reply {
+    match std::fs::read(path).with_context(|| format!("reading {}", path.display())) {
+        Ok(data) => Reply::new(200, "application/octet-stream", data, how),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+/// The signed-in player (the session's), if any.
+pub(super) fn owner(c: &Ctx) -> Option<String> {
+    c.session.as_ref().map(|s| s.profile_id().to_string())
+}
+
+/// `items[offset:offset + limit]`, as Python slices (negative numbers count from the end).
+pub(super) fn py_slice<T>(items: Vec<T>, offset: i64, limit: i64) -> Vec<T> {
+    let n = items.len() as i64;
+    let at = |i: i64| if i < 0 { (n + i).max(0) } else { i.min(n) };
+    let (start, stop) = (at(offset), at(offset.saturating_add(limit)));
+    items.into_iter().skip(start as usize).take((stop - start).max(0) as usize).collect()
+}
+
+/// A UbiServices-style error.
+fn error(code: i64, message: &str, status: u16, how: &str) -> Reply {
+    Reply::json(&json!({"errorCode": code, "message": message, "httpCode": status}), how, status)
+}
+
+/// The request body as a JSON object. Not JSON: `bad(message)` (aiohttp's `request.json()` raises a ValueError
+/// the Python routes catch); JSON but not an object: a 500 (where the Python routes fail).
+fn json_object(c: &Ctx, bad: impl Fn(&str) -> Reply) -> Result<Entity, Reply> {
+    match serde_json::from_slice::<Value>(&c.req.body) {
+        Ok(Value::Object(m)) => Ok(m),
+        Ok(_) => Err(Reply::internal_error(&format!("{} {}: the body is not a JSON object", c.req.method,
+                                                    c.req.path()))),
+        Err(e) => Err(bad(&e.to_string())),
+    }
+}
+
+fn default_player(c: &Ctx) -> anyhow::Result<String> {
+    c.state.accounts.default_profile_id()
 }
 
 /// A refused sign-in, shaped like UbiServices' (Ubisoft Connect then asks for email and password).
@@ -113,11 +197,384 @@ fn rendezvous_configuration(c: &Ctx) -> Reply {
     }), "rendezvous", 200)
 }
 
+// ---- inventory & store --------------------------------------------------------------------------------------
+fn get_inventory(c: &Ctx) -> Reply {
+    let pid = c.param("profile_id").to_lowercase();
+    match c.state.repos.player(&pid) {
+        // someone this server has no record of: owns nothing
+        Ok(None) => Reply::json(&json!({"items": []}), "inventory(unknown player)", 200),
+        Ok(Some(_)) => match c.state.economy.inventory_reply(&pid) {
+            Ok(body) => Reply::json(&body, "inventory", 200),
+            Err(e) => Reply::internal_error(&e),
+        },
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+/// Shop purchase or reward: {"spaceId", "offerId", "offerRevision"}. Mods hear it as "purchase" {profile_id,
+/// offer_id, changes [{item_id, delta, before, after}]}.
+fn post_inventory(c: &Ctx) -> Reply {
+    let st = c.state;
+    let pid = c.param("profile_id").to_lowercase();
+    if let Some(me) = owner(c).filter(|me| *me != pid) {
+        log::warn!(target: "powder.https", "inventory POST for {pid} by session of {me}");
+    }
+    let bad = |msg: &str| error(1, &format!("bad request: {msg}"), 400, "bad-request");
+    let body = match json_object(c, bad) {
+        Ok(b) => b,
+        Err(reply) => return reply,
+    };
+    if let Err(e) = st.accounts.player(&pid) {
+        return Reply::internal_error(&e);
+    }
+    let Some(offer) = body.get("offerId") else { return bad("'offerId'") }; // Python's KeyError
+    let offer_id = offer.as_str().map(str::to_string).unwrap_or_else(|| offer.to_string());
+    let revision = body.get("offerRevision").and_then(Value::as_i64);
+    let (reply, changes) = match st.economy.apply_offer(&pid, &offer_id, revision) {
+        Ok(Ok(done)) => done,
+        Ok(Err(e)) => {
+            log::warn!(target: "powder.https", "inventory POST {pid} refused: {}", e.message);
+            return Reply::json(&e.body(), "economy-error", e.status);
+        }
+        Err(e) => return Reply::internal_error(&e),
+    };
+    if let Some(mods) = &st.mods {
+        let changes: Vec<Value> = changes.iter()
+            .map(|ch| json!({"item_id": ch.item_id, "delta": ch.delta, "before": ch.before, "after": ch.after}))
+            .collect();
+        mods.lock().emit("purchase", &json!({"profile_id": pid, "offer_id": offer_id, "changes": changes}));
+    }
+    Reply::json(&reply, "economy", 200)
+}
+
+/// Store catalogue, filtered like the real service (assets.rs' OfferCatalog::query).
+fn get_offers(c: &Ctx) -> Reply {
+    let q = query(c.req);
+    let number = |name: &str, default: i64| q.get(name).map_or(Ok(default), |v| v.trim().parse::<i64>());
+    let (offset, limit) = match (number("offset", 0), number("limit", 100)) {
+        (Ok(o), Ok(l)) => (o, l),
+        (Err(e), _) | (_, Err(e)) => return Reply::internal_error(&format!("offers: offset/limit: {e}")),
+    };
+    let all = c.state.assets.catalog.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX);
+    let offers = py_slice(all, offset, limit);
+    let how = format!("catalog({})", offers.len());
+    Reply::json(&json!({"offers": offers}), &how, 200)
+}
+
+// ---- profile entities (rider card, favorites) ---------------------------------------------------------------
+static ENTITY_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f-]{36}$").unwrap());
+const STORAGE_LINK_S: i64 = 3600;
+
+/// An `offset` / `limit` parameter; one that is not a number is the default.
+fn int_param(q: &Query, name: &str, default: i64) -> i64 {
+    q.get(name).map_or(default, |v| v.trim().parse().unwrap_or(default))
+}
+
+/// A `type` filter ("" filters nothing, as in Python).
+fn kind(q: &Query) -> Option<&str> {
+    q.get("type").filter(|t| !t.is_empty())
+}
+
+/// An entity with a file (extendedStorage, e.g. a saved replay or a challenge ghost) gets links to it on this
+/// server, as Ubisoft's gave links to S3: putUrl / deleteUrl after a write (the game uploads there), getUrl /
+/// headUrl on reads.
+fn storage(req: &Req, mut entity: Entity, write: bool) -> Entity {
+    let Some(Value::Object(ext)) = entity.get("extendedStorage") else { return entity };
+    let id = entity.get("entityId").and_then(Value::as_str).unwrap_or_default();
+    let url = json!(format!("https://{}/_powder/entity-files/{id}", host(req)));
+    let expires = (chrono::Utc::now() + chrono::Duration::seconds(STORAGE_LINK_S)).format("%Y-%m-%dT%H:%M:%SZ");
+    let mut ext = ext.clone();
+    ext.insert("provider".into(), json!("s3"));
+    if write {
+        ext.insert("putUrl".into(), url.clone());
+        ext.insert("deleteUrl".into(), url.clone());
+    }
+    ext.insert("headUrl".into(), url.clone());
+    ext.insert("getUrl".into(), url);
+    ext.insert("expirationTime".into(), json!(expires.to_string()));
+    entity.insert("extendedStorage".into(), Value::Object(ext));
+    entity
+}
+
+fn entities_reply(req: &Req, items: Vec<Entity>) -> Reply {
+    let how = format!("entities({})", items.len());
+    let items: Vec<Value> = items.into_iter().map(|e| Value::Object(storage(req, e, false))).collect();
+    Reply::json(&json!({"entities": items}), &how, 200)
+}
+
+/// The file behind an entity's links: PUT (upload), GET / HEAD (download), DELETE.
+fn entity_file(c: &Ctx) -> Reply {
+    let id = c.param("entity_id").to_lowercase();
+    if !ENTITY_FILE.is_match(&id) {
+        return empty(404, "?");
+    }
+    match c.state.entities.get(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return empty(404, "?"),
+        Err(e) => return Reply::internal_error(&e),
+    }
+    let path = c.state.config.data_dir().join("entity-files").join(&id);
+    match c.req.method.as_str() {
+        "PUT" | "POST" => {
+            let written = path.parent().map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::write(&path, &c.req.body));
+            if let Err(e) = written.with_context(|| format!("writing {}", path.display())) {
+                return Reply::internal_error(&e);
+            }
+            log::info!(target: "powder.https", "entity file {id} uploaded ({} B)", c.req.body.len());
+            empty(200, "?")
+        }
+        "DELETE" => {
+            remove_file(&path);
+            empty(204, "?")
+        }
+        method => {
+            if !path.exists() {
+                return empty(404, "?");
+            }
+            if method == "GET" {
+                // the access log skips /_powder/ paths
+                let by = owner(c).unwrap_or_else(|| "?".into());
+                log::info!(target: "powder.https", "entity file {id} downloaded by {by}");
+            }
+            file_reply(&path, "?")
+        }
+    }
+}
+
+/// Deletes a file if it is there (Python's `unlink(missing_ok=True)`); other failures are logged.
+pub(super) fn remove_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log::warn!(target: "powder.https", "deleting {}: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// GET /v2/profiles/{pid}/entities?type=&tags=&offset=&limit= (own player from the DB).
+fn get_profile_entities(c: &Ctx) -> Reply {
+    let q = query(c.req);
+    match c.state.entities.for_profile(c.param("profile_id"), kind(&q), q.get("tags"), 0, usize::MAX) {
+        Ok(items) => entities_reply(c.req, py_slice(items, int_param(&q, "offset", 0), int_param(&q, "limit", 100))),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+/// GET /v2/profiles/entities?profileIds=a,b&type=PROFILE (rider cards of friends and self), also with tags (the
+/// friends' trails: type=FAVORITE_CHALLENGE&tags=TRAIL,WORLD_<id>,SANDBOX_A).
+fn get_entities_batch(c: &Ctx) -> Reply {
+    let q = query(c.req);
+    let ids: Vec<String> = q.get("profileIds").unwrap_or("").split(',').filter(|p| !p.is_empty())
+        .map(str::to_string).collect();
+    match c.state.entities.for_profiles(&ids, kind(&q), q.get("tags"), 0, usize::MAX) {
+        Ok(items) => entities_reply(c.req, py_slice(items, int_param(&q, "offset", 0), int_param(&q, "limit", 100))),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+fn get_entity(c: &Ctx) -> Reply {
+    match c.state.entities.get(c.param("entity_id")) {
+        Ok(Some(e)) => Reply::json(&Value::Object(storage(c.req, e, false)), "entity", 200),
+        Ok(None) => error(1002, "entity not found", 404, "entity-missing"),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+/// An entity written (PUT, POST): its links to upload a file to.
+fn entity_written(c: &Ctx, written: anyhow::Result<Entity>, how: impl Fn(&Entity) -> String) -> Reply {
+    match written {
+        Ok(e) => Reply::json(&Value::Object(storage(c.req, e.clone(), true)), &how(&e), 200),
+        // EntityService::put's refusal (Python's ValueError); anything else failed
+        Err(e) if e.to_string() == "entity without an owner" => error(1, &e.to_string(), 400, "bad-request"),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+fn put_entity(c: &Ctx) -> Reply {
+    let body = match json_object(c, |msg| error(1, msg, 400, "bad-request")) {
+        Ok(b) => b,
+        Err(reply) => return reply,
+    };
+    let me = owner(c);
+    let written = c.state.entities.put(c.param("entity_id"), &body, me.as_deref());
+    entity_written(c, written, |e| format!("entity-saved(rev {})", e.get("revision").unwrap_or(&Value::Null)))
+}
+
+/// POST /v2/profiles/entities and /v2/profiles/{pid}/entities (e.g. a new player's rider card).
+fn post_entity(c: &Ctx) -> Reply {
+    let owner = match Some(c.param("profile_id")).filter(|p| !p.is_empty()).map(str::to_string).or_else(|| owner(c)) {
+        Some(o) => o,
+        None => match default_player(c) {
+            Ok(p) => p,
+            Err(e) => return Reply::internal_error(&e),
+        },
+    }.to_lowercase();
+    let body = match json_object(c, |msg| error(1, msg, 400, "bad-request")) {
+        Ok(b) => b,
+        Err(reply) => return reply,
+    };
+    entity_written(c, c.state.entities.create(&body, &owner), |_| "entity-created".into())
+}
+
+fn delete_entity(c: &Ctx) -> Reply {
+    let id = c.param("entity_id");
+    let deleted = match c.state.entities.delete(id) {
+        Ok(d) => d,
+        Err(e) => return Reply::internal_error(&e),
+    };
+    if ENTITY_FILE.is_match(&id.to_lowercase()) {
+        remove_file(&c.state.config.data_dir().join("entity-files").join(id.to_lowercase()));
+    }
+    Reply::json(&json!({}), if deleted { "entity-deleted" } else { "entity-absent" }, 200)
+}
+
 // ---- Ubisoft Connect ----------------------------------------------------------------------------------------
 /// static3.cdn.ubi.com/.../test_internet.txt: Ubisoft Connect shows "no internet connection" unless this answers
 /// like the real CDN.
 fn internet_check(_: &Ctx) -> Reply {
     Reply::new(200, "text/plain; charset=utf-8", b"I AM ALIVE!".to_vec(), "internet-check")
+}
+
+/// Whose cloud save: the signed-in player (Connect's ticket), else the profile in the path, else the default
+/// player (a server without accounts).
+fn cloud_owner(c: &Ctx) -> anyhow::Result<String> {
+    let pid = owner(c).or_else(|| Some(c.param("profile_id").to_string()).filter(|p| !p.is_empty()));
+    Ok(match pid {
+        Some(p) => p,
+        None => default_player(c)?,
+    }.to_lowercase())
+}
+
+/// GET /v1/profiles/{pid}/entities?name=upcCloudSaveUplayId_<product>: Ubisoft Connect's cloud-save entity
+/// (services/cloudsaves.rs), only when its files are all stored; other names: none.
+fn get_entities_v1(c: &Ctx) -> Reply {
+    let product = query(c.req).get("name").and_then(cloudsaves::product_of);
+    let owner = match cloud_owner(c) {
+        Ok(o) => o,
+        Err(e) => return Reply::internal_error(&e),
+    };
+    let Some(product) = product.filter(|_| owner == c.param("profile_id").to_lowercase()) else {
+        return Reply::json(&json!({"entities": []}), "entities-v1", 200);
+    };
+    match c.state.cloudsaves.offered(&owner, product) {
+        Ok(Some(e)) => Reply::json(&json!({"entities": [e]}), "cloud-save", 200),
+        Ok(None) => Reply::json(&json!({"entities": []}), "no-cloud-save", 200),
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+/// A value as Python's repr() shows it (for the log).
+fn py_repr(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "None".into(),
+        Some(Value::String(s)) => format!("'{s}'"),
+        Some(Value::Bool(b)) => if *b { "True" } else { "False" }.into(),
+        Some(other) => crate::util::dumps(other),
+    }
+}
+
+/// PUT /v1/profiles/entities/{entity_id} (Connect at game exit, before uploading the files) and
+/// POST /v1/profiles/{pid}/entities (creating it; not recorded, so logged in full).
+fn write_cloud_entity(c: &Ctx) -> Reply {
+    let body = match serde_json::from_slice::<Value>(&c.req.body) {
+        Ok(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    let product = body.as_ref().and_then(|b| b.get("name")).and_then(Value::as_str).and_then(cloudsaves::product_of);
+    let (Some(mut body), Some(product)) = (body, product) else {
+        return error(1, "not a cloud save", 400, "bad-request");
+    };
+    match cloud_entity(c, &mut body, product) {
+        Ok(reply) => reply,
+        Err(e) => Reply::internal_error(&e),
+    }
+}
+
+fn cloud_entity(c: &Ctx, body: &mut Entity, product: u64) -> anyhow::Result<Reply> {
+    let st = c.state;
+    let owner = cloud_owner(c)?;
+    let slots = body.get("obj").and_then(|o| o.get("slots")).and_then(Value::as_array).into_iter().flatten()
+        .filter_map(Value::as_object)
+        .map(|s| format!("({}, {})", py_repr(s.get("filename")), py_repr(s.get("size"))))
+        .collect::<Vec<_>>().join(", ");
+    // one save for shared products
+    body.insert("name".into(), json!(cloudsaves::entity_name(cloudsaves::shared(product))));
+    let entity_id = match c.params.get("entity_id") {
+        None => {
+            log::info!(target: "powder.https", "cloud save entity created by {owner}: product {product}, \
+                       slots [{slots}]");
+            match st.cloudsaves.entity(&owner, product)? {
+                Some(existing) => existing.get("entityId").and_then(Value::as_str).unwrap_or_default().to_string(),
+                None => uuid::Uuid::new_v4().to_string(),
+            }
+        }
+        Some(id) => {
+            if let Some(existing) = st.entities.get(id)? {
+                if existing.get("profileId").and_then(Value::as_str) != Some(owner.as_str()) {
+                    return Ok(error(1, "not your entity", 403, "forbidden"));
+                }
+                let revision = body.get("revision").filter(|r| !r.is_null());
+                if revision.is_some_and(|r| Some(r) != existing.get("revision")) {
+                    log::warn!(target: "powder.https", "cloud save of {owner}: revision {} written over {}",
+                               py_repr(revision), py_repr(existing.get("revision")));
+                }
+            }
+            log::info!(target: "powder.https", "cloud save of {owner} updated: product {product}, slots [{slots}]");
+            id.clone()
+        }
+    };
+    body.insert("type".into(), json!(cloudsaves::TYPE));
+    let mut e = st.entities.put(&entity_id, body, Some(&owner))?;
+    let how = format!("cloud-save-written(rev {})", e.get("revision").unwrap_or(&Value::Null));
+    e.insert("name".into(), json!(cloudsaves::entity_name(product)));
+    Ok(Reply::json(&Value::Object(e), &how, 200))
+}
+
+const EMPTY_S3_LISTING: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
+    xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>savegames</Name><Prefix></Prefix><KeyCount>0</KeyCount>\
+    <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>";
+
+/// The listing Connect makes when migrating from Ubisoft's old cloud saves (an S3 bucket listing): empty.
+fn cloud_save_legacy_list(_: &Ctx) -> Reply {
+    Reply::new(200, "application/xml; charset=utf-8", EMPTY_S3_LISTING.as_bytes().to_vec(), "cloud-save-legacy-list")
+}
+
+/// The links Connect gets from the demux cloudsave_service: PUT uploads a slot, GET / HEAD download it, DELETE.
+fn cloud_save_file(c: &Ctx) -> Reply {
+    let (product, slot) = (c.param("product"), c.param("slot"));
+    let Ok(number) = product.trim().parse::<i64>() else {
+        return Reply::internal_error(&format!("cloud save file: product {product:?} is not a number"));
+    };
+    match cloud_file(c, number, slot) {
+        Ok(reply) => reply,
+        Err(e) => match e.downcast_ref::<CloudSaveError>() {
+            Some(CloudSaveError(msg)) => {
+                log::warn!(target: "powder.https", "cloud save file {product}/{slot}: {msg}");
+                empty(if msg.contains("link") { 403 } else if msg.contains("damaged") { 400 } else { 404 }, "?")
+            }
+            None => Reply::internal_error(&e),
+        },
+    }
+}
+
+fn cloud_file(c: &Ctx, product: i64, slot: &str) -> anyhow::Result<Reply> {
+    let saves = &c.state.cloudsaves;
+    let method = c.req.method.as_str();
+    let product = u64::try_from(product).map_err(|_| CloudSaveError("unknown or expired link".into()))?;
+    let link = saves.resolve(query(c.req).get("t").unwrap_or(""), product, slot, Some(method))?;
+    match method {
+        "DELETE" => {
+            saves.remove(&link)?;
+            Ok(empty(204, "cloud-save-delete"))
+        }
+        "PUT" => {
+            saves.store(&link, &c.req.body, c.req.header("Content-MD5"))?;
+            Ok(empty(200, "cloud-save-upload"))
+        }
+        // HEAD: hyper sends the Content-Length without the body
+        _ => Ok(Reply::new(200, "application/octet-stream", saves.read(&link)?, "cloud-save-download")),
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +798,427 @@ mod tests {
         let b = body(&game_login(&st));
         let saved = repos.kv_get("mod:m", "last").unwrap().unwrap();
         assert_eq!(saved, Value::String(format!("{}/false", b["nameOnPlatform"].as_str().unwrap())));
+    }
+
+    // ---- inventory, store, entities, cloud saves (tests/test_https.py, test_progression.py, test_cloudsaves.py,
+    // test_ugc.py's entities with files) ----------------------------------------------------------------------
+    use crate::assets::{Assets, OfferCatalog};
+    use crate::constants::{CREDITS_ITEM, SPACE_ID};
+    use crate::services::cloudsaves::CloudSaveService;
+    use crate::services::Services;
+    use bytes::Bytes;
+    use md5::{Digest, Md5};
+    use serde_json::json;
+
+    const SKI_A: &str = "0a000000-0000-4000-8000-00000000000a";
+    const SKI_B: &str = "0b000000-0000-4000-8000-00000000000b";
+    const SKI_A_ITEM: &str = "1a000000-0000-4000-8000-00000000001a";
+    const SKI_A_PRICE: i64 = 12_000;
+    const CREDITS: i64 = 50_000;
+    const FRIEND: &str = "f0000000-0000-4000-8000-0000000000f0";
+
+    fn offers() -> Vec<Value> {
+        vec![
+            json!({"offerId": SKI_A, "type": "shop", "revision": 6, "nameId": "Ski A", "tags": ["SKI", "BASIC"],
+                   "items": [{"itemId": SKI_A_ITEM.to_uppercase(), "quantity": 1},
+                             {"itemId": CREDITS_ITEM, "quantity": -SKI_A_PRICE}]}),
+            json!({"offerId": SKI_B, "type": "shop", "revision": 2, "tags": ["SKI", "DELUXE"],
+                   "items": [{"itemId": "1b000000-0000-4000-8000-00000000001b", "quantity": 1}]}),
+        ]
+    }
+
+    /// A state over a data folder (files: entity files, cloud saves) with a catalogue and the default player,
+    /// who has CREDITS credits.
+    fn files_state(dir: &std::path::Path, mods: Option<crate::mods::ModHost>) -> (HttpState, String) {
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_path_buf();
+        let db = Arc::new(crate::db::Db::memory().unwrap());
+        db.migrate().unwrap();
+        let assets = Assets { catalog: OfferCatalog::new(offers()), ..Default::default() };
+        let services = Services::new(Arc::new(config), Arc::new(assets), Arc::new(crate::repos::Repos::new(db)),
+                                     mods.map(|m| Arc::new(parking_lot::Mutex::new(m))));
+        let st = HttpState { services: Arc::new(services), nex_public_key: "TESTKEY".into(), demux: None };
+        let pid = st.accounts.default_profile_id().unwrap();
+        st.accounts.player(&pid).unwrap();
+        st.economy.grant(&pid, CREDITS_ITEM, CREDITS, "seed").unwrap().unwrap();
+        (st, pid)
+    }
+
+    fn send(st: &HttpState, method: &str, path: &str, headers: &[(&str, &str)], data: &[u8]) -> super::Reply {
+        let mut r = req(method, path, headers);
+        r.body = Bytes::copy_from_slice(data);
+        handle(st, &r)
+    }
+
+    fn send_json(st: &HttpState, method: &str, path: &str, headers: &[(&str, &str)], data: &Value) -> super::Reply {
+        send(st, method, path, headers, serde_json::to_string(data).unwrap().as_bytes())
+    }
+
+    /// The path of one of our links (https://<host>/<path>).
+    fn path_of(url: &str) -> String {
+        url.split_once(".com").unwrap().1.to_string()
+    }
+
+    fn md5_b64(data: &[u8]) -> String {
+        b64(&Md5::digest(data))
+    }
+
+    #[test]
+    fn purchase_round_trip_and_the_mod_hears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mods = tmp.path().join("mods");
+        std::fs::create_dir(&mods).unwrap();
+        std::fs::write(mods.join("m.lua"), r#"return function(api)
+            api.on("purchase", function(ev)
+                local c = ev.changes[2]
+                api.save("last", ev.offer_id .. " " .. c.item_id .. " " .. c.before .. "->" .. c.after)
+            end)
+        end"#).unwrap();
+        let db = Arc::new(crate::db::Db::memory().unwrap());
+        db.migrate().unwrap();
+        let repos = Arc::new(crate::repos::Repos::new(db));
+        let mut config = Config::default();
+        config.mods.dir = mods;
+        let (st, pid) = files_state(tmp.path(), Some(crate::mods::ModHost::load(&config, repos.clone())));
+        let ticket = body(&game_login(&st))["ticket"].as_str().unwrap().to_string();
+        let auth = format!("Ubi_v1 t={ticket}");
+        let auth = [("Authorization", auth.as_str())];
+        let inv = format!("/v1/profiles/{pid}/inventory");
+        let credits = || {
+            let r = handle(&st, &req("GET", &format!("{inv}?spaceId={SPACE_ID}"), &auth));
+            assert_eq!(r.how, "inventory");
+            let b = body(&r);
+            b["items"].as_array().unwrap().iter().find(|i| i["itemId"] == CREDITS_ITEM).unwrap()["quantity"].as_i64()
+        };
+        assert_eq!(credits(), Some(CREDITS));
+        let r = send_json(&st, "POST", &inv, &auth, &json!({"spaceId": SPACE_ID, "offerId": SKI_A, "offerRevision": 6}));
+        assert_eq!((r.status, r.how.as_str()), (200, "economy"));
+        let reply = body(&r);
+        assert!(reply["transactionId"].as_str().is_some_and(|t| !t.is_empty()));
+        let keys: Vec<&str> = reply.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["primaryStoreItemQuantity", "primaryStoreItemIsConsumable", "items", "additionalDetails",
+                          "transactionId"]);
+        assert_eq!(credits(), Some(CREDITS - SKI_A_PRICE));
+        let heard = repos.kv_get("mod:m", "last").unwrap().unwrap();
+        assert_eq!(heard, json!(format!("{SKI_A} {CREDITS_ITEM} {CREDITS}->{}", CREDITS - SKI_A_PRICE)));
+
+        let r = send_json(&st, "POST", &inv, &auth, &json!({"spaceId": SPACE_ID, "offerId": "nope"}));
+        assert_eq!((r.status, r.how.as_str()), (404, "economy-error"));
+        assert_eq!(String::from_utf8(r.body).unwrap(),
+                   r#"{"errorCode": 1001, "message": "offer nope not found", "httpCode": 404}"#);
+        let r = send_json(&st, "POST", &inv, &auth, &json!({"spaceId": SPACE_ID}));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (400, Some("bad request: 'offerId'")));
+        assert_eq!(send(&st, "POST", &inv, &auth, b"not json").status, 400);
+        // someone this server has no record of owns nothing
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{FRIEND}/inventory"), &[]));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("inventory(unknown player)", &br#"{"items": []}"#[..]));
+    }
+
+    #[test]
+    fn offers_from_the_pack_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _) = files_state(tmp.path(), None);
+        let ids = |path: &str| {
+            let r = handle(&st, &req("GET", path, &[]));
+            body(&r)["offers"].as_array().unwrap().iter().map(|o| o["offerId"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&format!("/v1/spaces/{SPACE_ID}/offers?tags=SKI&offset=0&limit=100")), [SKI_A, SKI_B]);
+        assert_eq!(ids(&format!("/v1/spaces/{SPACE_ID}/offers?tags=SKI,DELUXE&offset=0&limit=5")), [SKI_B]);
+        assert_eq!(ids(&format!("/v1/spaces/{SPACE_ID}/offers?tags=SKI%2CBASIC")), [SKI_A]);
+        assert_eq!(ids(&format!("/v1/spaces/{SPACE_ID}/offers?offset=1&limit=1")), [SKI_B]);
+        assert_eq!(ids(&format!("/v1/spaces/{SPACE_ID}/offers?offset=-1")), [SKI_B], "Python's slices");
+        let r = handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?type=shop"), &[]));
+        assert_eq!(r.how, "catalog(2)");
+        assert_eq!(handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?limit=x"), &[])).status, 500);
+    }
+
+    #[test]
+    fn entities_over_https() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, pid) = files_state(tmp.path(), None);
+        let ticket = body(&game_login(&st))["ticket"].as_str().unwrap().to_string();
+        let auth = format!("Ubi_v1 t={ticket}");
+        let auth = [("Authorization", auth.as_str())];
+        // own rider card: a new one created by the game, then changed and read back
+        let r = send_json(&st, "POST", &format!("/v2/profiles/{pid}/entities"), &auth,
+                          &json!({"type": "PROFILE", "obj": {"RIDER_CARD": {"title": 1}}}));
+        assert_eq!(r.how, "entity-created");
+        let card = body(&r);
+        assert_eq!((card["profileId"].as_str(), card["revision"].as_i64()), (Some(pid.as_str()), Some(1)));
+        let card_id = card["entityId"].as_str().unwrap();
+        let own = body(&handle(&st, &req("GET", &format!("/v2/profiles/{pid}/entities?type=PROFILE"), &auth)));
+        assert_eq!(own["entities"][0]["entityId"], card_id);
+        let r = send_json(&st, "PUT", &format!("/v2/profiles/entities/{card_id}"), &auth,
+                          &json!({"type": "PROFILE", "obj": {"RIDER_CARD": {"title": 99}}}));
+        assert_eq!(r.how, "entity-saved(rev 2)");
+        let saved = body(&r);
+        assert_eq!((saved["obj"]["RIDER_CARD"]["title"].as_i64(), saved["profileId"].as_str()), (Some(99), Some(pid.as_str())));
+        assert!(saved.get("extendedStorage").is_none(), "no file, no links");
+
+        // batch: own card from the DB; a player this server does not know has none
+        let r = handle(&st, &req("GET", &format!("/v2/profiles/entities?profileIds={pid},{FRIEND}&type=PROFILE"), &auth));
+        assert_eq!(r.how, "entities(1)");
+        let cards = body(&r);
+        assert_eq!((cards["entities"][0]["profileId"].as_str(), cards["entities"][0]["obj"]["RIDER_CARD"]["title"].as_i64()),
+                   (Some(pid.as_str()), Some(99)));
+
+        // favorites: create (by the session's player), list by tags, delete
+        let fav = body(&send_json(&st, "POST", "/v2/profiles/entities", &auth,
+                                  &json!({"type": "FAVORITE_CHALLENGE", "tags": ["TRAIL"], "obj": {"c": 1}})));
+        assert_eq!(fav["profileId"], pid.as_str());
+        let fav_id = fav["entityId"].as_str().unwrap();
+        let path = format!("/v2/profiles/{pid}/entities?type=FAVORITE_CHALLENGE&tags=TRAIL");
+        let favs = body(&handle(&st, &req("GET", &path, &auth)));
+        assert_eq!(favs["entities"].as_array().unwrap().len(), 1);
+        assert_eq!(favs["entities"][0]["entityId"], fav_id);
+        let r = handle(&st, &req("DELETE", &format!("/v2/profiles/entities/{fav_id}"), &auth));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("entity-deleted", &b"{}"[..]));
+        assert!(st.entities.get(fav_id).unwrap().is_none());
+        assert_eq!(handle(&st, &req("DELETE", &format!("/v2/profiles/entities/{fav_id}"), &auth)).how, "entity-absent");
+        let r = handle(&st, &req("GET", &format!("/v2/profiles/entities/{fav_id}"), &auth));
+        assert_eq!((r.status, String::from_utf8(r.body).unwrap()),
+                   (404, r#"{"errorCode": 1002, "message": "entity not found", "httpCode": 404}"#.to_string()));
+        let r = send(&st, "PUT", &format!("/v2/profiles/entities/{fav_id}"), &auth, b"");
+        assert_eq!((r.status, r.how.as_str()), (400, "bad-request"));
+        // no session and no owner: refused
+        let r = send_json(&st, "PUT", "/v2/profiles/entities/00000000-0000-4000-8000-000000000001", &[], &json!({}));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (400, Some("entity without an owner")));
+    }
+
+    /// Saving a replay: an entity asking for extended storage gets a putUrl; reads get getUrl / headUrl.
+    #[test]
+    fn a_saved_replay_gets_its_file_stored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _) = files_state(tmp.path(), None);
+        let created = body(&send_json(&st, "POST", "/v2/profiles/entities", &[], &json!({
+            "type": "FAVORITE_REPLAY", "name": "DefaultEntityName", "tags": ["TRAIL", "REPLAY"],
+            "obj": {"savename": "TrailReport_1"}, "extendedStorage": {"provider": "s3", "fileExtension": ""}})));
+        let storage = &created["extendedStorage"];
+        let keys: Vec<&str> = storage.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["provider", "fileExtension", "putUrl", "deleteUrl", "headUrl", "getUrl", "expirationTime"]);
+        let id = created["entityId"].as_str().unwrap();
+        assert_eq!(storage["putUrl"], format!("https://public-ubiservices.ubi.com/_powder/entity-files/{id}"));
+        assert!(storage["expirationTime"].as_str().unwrap().ends_with('Z'));
+        let path = path_of(storage["putUrl"].as_str().unwrap());
+        assert_eq!(send(&st, "PUT", &path, &[], b"REPLAYDATA").status, 200);
+        let read = body(&handle(&st, &req("GET", &format!("/v2/profiles/entities/{id}"), &[])));
+        assert!(read["extendedStorage"].get("putUrl").is_none());
+        assert_eq!(read["extendedStorage"]["getUrl"], storage["putUrl"]);
+        let r = handle(&st, &req("GET", &path, &[]));
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"REPLAYDATA"[..]));
+        assert_eq!(header(&r, "content-type"), Some("application/octet-stream"));
+        // the links name the host the client asked for
+        let read = body(&handle(&st, &req("GET", &format!("/v2/profiles/entities/{id}"), &[("Host", "localhost:8443")])));
+        assert_eq!(read["extendedStorage"]["headUrl"], format!("https://localhost:8443/_powder/entity-files/{id}"));
+        handle(&st, &req("DELETE", &format!("/v2/profiles/entities/{id}"), &[]));
+        assert_eq!(handle(&st, &req("GET", &path, &[])).status, 404);
+        assert_eq!(send(&st, "PUT", &path, &[], b"x").status, 404, "no entity, no file");
+        assert_eq!(handle(&st, &req("GET", "/_powder/entity-files/..%2Fx", &[])).status, 404);
+    }
+
+    /// A ranked run's ghost (a BEST_GHOST_* entity with its file) is the best's associated_replay, which other
+    /// players download; once the game deletes the entity the board says "none" again.
+    #[test]
+    fn a_ranked_ghost_is_offered_on_the_leaderboard() {
+        use crate::nex::rmc::Variant;
+        use crate::services::{leaderboards, stats::StatEvent};
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, pid) = files_state(tmp.path(), None);
+        let ghost = body(&send_json(&st, "POST", &format!("/v2/profiles/{pid}/entities"), &[], &json!({
+            "type": "BEST_GHOST_CHALLENGE_PUBLIC_ALLTIME", "name": "ScimitarEntity",
+            "tags": ["TRAIL", "WORLD_10af88fa9e4", "SANDBOX_A", "BEST_GHOST"],
+            "obj": {"leaderboard": "public_challenge_ascending_ranked_ldb", "challenge": "Steep_A09", "score": 58250},
+            "extendedStorage": {"provider": "s3", "fileExtension": ""}})));
+        let id = ghost["entityId"].as_str().unwrap();
+        assert_eq!(send(&st, "PUT", &path_of(ghost["extendedStorage"]["putUrl"].as_str().unwrap()), &[], b"GHOST").status, 200);
+        let event = StatEvent { name: "ascending_public_challenge_ranked_score_event".into(), fields: vec![
+            ("challenge_id_to_use".into(), Variant::String("Steep_A09".into())),
+            ("replay".into(), Variant::String(id.into())), ("score".into(), Variant::String("58250".into()))] };
+        st.stats.apply_events(&pid, &[event], "player_profile").unwrap();
+        let board = "public_challenge_ascending_ranked_ldb:Steep_A09:infinite";
+        let rows = leaderboards::ranks(&st.repos, board, 1, 1).unwrap().rows;
+        assert_eq!(rows[0].replay, id);
+        let read = body(&handle(&st, &req("GET", &format!("/v2/profiles/entities/{}", rows[0].replay), &[])));
+        let r = handle(&st, &req("GET", &path_of(read["extendedStorage"]["getUrl"].as_str().unwrap()), &[]));
+        assert_eq!(r.body, b"GHOST");
+        handle(&st, &req("DELETE", &format!("/v2/profiles/entities/{id}"), &[]));
+        assert_eq!(leaderboards::ranks(&st.repos, board, 1, 1).unwrap().rows[0].replay, "none");
+    }
+
+    /// The friends' trails come in one request for several players, filtered by the world's tags.
+    #[test]
+    fn friends_trails_by_world() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, pid) = files_state(tmp.path(), None);
+        for world in ["WORLD_10af88fa9e4", "WORLD_7a954c6bd0"] {
+            let e = json!({"type": "FAVORITE_CHALLENGE", "tags": ["TRAIL", world, "SANDBOX_A"], "obj": {"world": world}});
+            st.entities.create(e.as_object().unwrap(), &pid).unwrap();
+        }
+        let q = format!("profileIds={pid}&type=FAVORITE_CHALLENGE&tags=TRAIL,WORLD_7a954c6bd0,SANDBOX_A");
+        let found = body(&handle(&st, &req("GET", &format!("/v2/profiles/entities?{q}"), &[])));
+        assert_eq!(found["entities"].as_array().unwrap().iter().map(|e| e["obj"]["world"].clone()).collect::<Vec<_>>(),
+                   [json!("WORLD_7a954c6bd0")]);
+        let all = body(&handle(&st, &req("GET", &format!("/v2/profiles/entities?profileIds={pid}&offset=1"), &[])));
+        assert_eq!(all["entities"].as_array().unwrap().len(), 1);
+    }
+
+    // ---- cloud saves (tests/test_cloudsaves.py; the links come from the service, as the demux gets them) ------
+    const PRODUCT: u64 = 3280;
+
+    fn cloud_name(product: u64) -> String {
+        format!("upcCloudSaveUplayId_{product}")
+    }
+
+    fn entity_body(revision: Option<i64>, sizes: &[i64]) -> Value {
+        let slots: Vec<Value> = sizes.iter().enumerate().map(|(i, n)| json!({
+            "id": i + 1, "filename": (i + 1).to_string(), "hash": "0".repeat(32), "size": n,
+            "lastModified": "2026-01-01T00:00:00.000Z"})).collect();
+        let mut body = json!({"spaceId": SPACE_ID, "name": cloud_name(PRODUCT), "tags": [], "type": "cloudSave",
+                              "obj": {"slots": slots, "timestamp": "1700000000", "pc_name": "TEST-PC"}});
+        if let Some(r) = revision {
+            body["revision"] = json!(r);
+        }
+        body
+    }
+
+    /// The link the demux hands out for one slot (its path on this server).
+    fn link(saves: &CloudSaveService, pid: &str, product: u64, slot: &str, md5: Option<&str>, method: &str) -> String {
+        format!("/_powder/cloudsaves/{product}/{slot}?t={}", saves.link(pid, product, slot, md5, method).unwrap())
+    }
+
+    #[test]
+    fn no_cloud_save_metadata() {
+        let (st, pid) = with_player();
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{pid}/entities?name={}", cloud_name(PRODUCT)), &[]));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("no-cloud-save", &br#"{"entities": []}"#[..]));
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{pid}/entities?name=other"), &[]));
+        assert_eq!((r.how.as_str(), r.body.as_slice()), ("entities-v1", &br#"{"entities": []}"#[..]));
+    }
+
+    #[test]
+    fn a_save_goes_up_and_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, me) = files_state(tmp.path(), None);
+        let url = format!("/v1/profiles/{me}/entities?name={}", cloud_name(PRODUCT));
+        assert_eq!(body(&handle(&st, &req("GET", &url, &[]))), json!({"entities": []}));
+        // game exit: the entity first (creating it), then links, then the files
+        let r = send_json(&st, "POST", &format!("/v1/profiles/{me}/entities"), &[], &entity_body(None, &[10, 20]));
+        assert_eq!(r.how, "cloud-save-written(rev 1)");
+        let created = body(&r);
+        assert_eq!((created["name"].as_str(), created["type"].as_str()), (Some(cloud_name(PRODUCT).as_str()), Some("cloudSave")));
+        let id = created["entityId"].as_str().unwrap();
+        assert_eq!(body(&handle(&st, &req("GET", &url, &[]))), json!({"entities": []}), "files not there yet");
+        let files: [(&str, &[u8]); 2] = [("1", b"first slot"), ("2", b"second slot!")];
+        for (slot, data) in files {
+            let md5 = md5_b64(data);
+            let path = link(&st.cloudsaves, &me, PRODUCT, slot, Some(&md5), "PUT");
+            let r = send(&st, "PUT", &path, &[("Content-MD5", &md5)], data);
+            assert_eq!((r.status, r.how.as_str()), (200, "cloud-save-upload"));
+        }
+        let offered = body(&handle(&st, &req("GET", &url, &[])));
+        assert_eq!(offered["entities"].as_array().unwrap().len(), 1);
+        assert_eq!(offered["entities"][0]["entityId"], id);
+        assert_eq!(offered["entities"][0]["obj"]["slots"][1]["filename"], "2");
+        // next exit: PUT with the current revision; seen live: Connect writes to .../entitites/<id> (sic)
+        let put = body(&send_json(&st, "PUT", &format!("/v1/profiles/entities/{id}"), &[], &entity_body(Some(1), &[10, 20])));
+        assert_eq!(put["revision"], 2);
+        let put = body(&send_json(&st, "PUT", &format!("/v1/profiles/entitites/{id}"), &[], &entity_body(Some(2), &[11, 22])));
+        assert_eq!((put["revision"].as_i64(), put["obj"]["slots"][1]["size"].as_i64()), (Some(3), Some(22)));
+        // another PC downloads (links for GET)
+        for (slot, data) in files {
+            let r = handle(&st, &req("GET", &link(&st.cloudsaves, &me, PRODUCT, slot, None, "GET"), &[]));
+            assert_eq!((r.status, r.how.as_str(), r.body.as_slice()), (200, "cloud-save-download", data));
+            assert_eq!(header(&r, "content-type"), Some("application/octet-stream"));
+        }
+        let get = link(&st.cloudsaves, &me, PRODUCT, "1", None, "GET");
+        assert_eq!(handle(&st, &req("HEAD", &get, &[])).status, 200);
+        assert_eq!(send(&st, "PUT", &get, &[], b"x").status, 403, "GET only");
+        assert_eq!(handle(&st, &req("GET", &link(&st.cloudsaves, &me, PRODUCT, "3", None, "GET"), &[])).status, 404);
+        // deleting
+        let r = handle(&st, &req("DELETE", &link(&st.cloudsaves, &me, PRODUCT, "2", None, "DELETE"), &[]));
+        assert_eq!((r.status, r.how.as_str()), (204, "cloud-save-delete"));
+        assert!(!st.cloudsaves.path(&me, PRODUCT, "2").unwrap().exists());
+    }
+
+    /// Ubisoft Connect version (3279) and Steam version (3280): one cloud save, under the name asked for.
+    #[test]
+    fn steeps_two_versions_share_one_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, me) = files_state(tmp.path(), None);
+        let mut b = entity_body(None, &[10, 20]);
+        b["name"] = json!(cloud_name(3279));
+        let created = body(&send_json(&st, "POST", &format!("/v1/profiles/{me}/entities"), &[], &b));
+        assert_eq!(created["name"], cloud_name(3279));
+        let id = created["entityId"].as_str().unwrap();
+        assert_eq!(st.entities.get(id).unwrap().unwrap()["name"], cloud_name(PRODUCT), "kept under 3280");
+        for slot in ["1", "2"] {
+            let token = st.cloudsaves.link(&me, 3279, slot, None, "PUT").unwrap();
+            let l = st.cloudsaves.resolve(&token, 3279, slot, None).unwrap();
+            st.cloudsaves.store(&l, format!("slot {slot}").as_bytes(), None).unwrap();
+        }
+        let steam = body(&handle(&st, &req("GET", &format!("/v1/profiles/{me}/entities?name={}", cloud_name(PRODUCT)), &[])));
+        assert_eq!((&steam["entities"][0]["entityId"], &steam["entities"][0]["name"]), (&json!(id), &json!(cloud_name(PRODUCT))));
+        let r = handle(&st, &req("GET", &link(&st.cloudsaves, &me, PRODUCT, "1", None, "GET"), &[]));
+        assert_eq!(r.body, b"slot 1");
+        // creating it again (another PC's first exit) writes the same entity
+        let again = body(&send_json(&st, "POST", &format!("/v1/profiles/{me}/entities"), &[], &entity_body(None, &[1, 2])));
+        assert_eq!((again["entityId"].as_str(), again["revision"].as_i64()), (Some(id), Some(2)));
+    }
+
+    #[test]
+    fn a_damaged_upload_never_replaces_a_stored_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, me) = files_state(tmp.path(), None);
+        let good = link(&st.cloudsaves, &me, PRODUCT, "1", Some(&md5_b64(b"good data")), "PUT");
+        assert_eq!(send(&st, "PUT", &good, &[], b"good data").status, 200, "MD5 from the link request");
+        let newer = link(&st.cloudsaves, &me, PRODUCT, "1", Some(&md5_b64(b"newer data")), "PUT");
+        assert_eq!(send(&st, "PUT", &newer, &[], b"newer da").status, 400, "cut off");
+        assert_eq!(std::fs::read(st.cloudsaves.path(&me, PRODUCT, "1").unwrap()).unwrap(), b"good data");
+    }
+
+    #[test]
+    fn links_and_entities_belong_to_one_player() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _) = files_state(tmp.path(), None);
+        register(&st, "host@example.com", "Host"); // takes over the default player
+        let other = st.accounts.register("guest@example.com", PASSWORD, "Guest").unwrap().profile_id;
+        let token = st.cloudsaves.link(&other, PRODUCT, "1", None, "PUT").unwrap();
+        let r = send(&st, "PUT", &format!("/_powder/cloudsaves/{PRODUCT}/2?t={token}"), &[], b"x");
+        assert_eq!((r.status, r.how.as_str(), r.body.len()), (403, "?", 0), "another slot");
+        assert_eq!(handle(&st, &req("GET", &format!("/_powder/cloudsaves/{PRODUCT}/1?t=made-up"), &[])).status, 403);
+        assert_eq!(handle(&st, &req("GET", &format!("/_powder/cloudsaves/-1/1?t={token}"), &[])).status, 403);
+        let mut b = entity_body(None, &[10, 20]);
+        b["type"] = json!("cloudSave");
+        st.entities.put("00000000-0000-4000-8000-0000000000aa", b.as_object().unwrap(), Some(&other)).unwrap();
+        let r = send_json(&st, "PUT", "/v1/profiles/entities/00000000-0000-4000-8000-0000000000aa", &[],
+                          &entity_body(Some(1), &[10, 20]));
+        assert_eq!((r.status, r.how.as_str()), (403, "forbidden"), "not the requester's");
+        let r = handle(&st, &req("GET", &format!("/v1/profiles/{other}/entities?name={}", cloud_name(PRODUCT)), &[]));
+        assert_eq!(body(&r), json!({"entities": []}));
+        let r = send_json(&st, "POST", &format!("/v1/profiles/{other}/entities"), &[], &json!({"name": "x"}));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (400, Some("not a cloud save")));
+    }
+
+    /// Without a cloud save, Connect lists the old system's slots first: empty.
+    #[test]
+    fn nothing_to_migrate_from_the_old_cloud_saves() {
+        let (st, _) = with_player();
+        let r = handle(&st, &req("GET", &format!("/_powder/cloudsaves/legacy-list/{PRODUCT}"), &[]));
+        assert_eq!((r.status, r.how.as_str()), (200, "cloud-save-legacy-list"));
+        assert_eq!(header(&r, "content-type"), Some("application/xml; charset=utf-8"));
+        assert_eq!(String::from_utf8(r.body).unwrap(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
+            xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>savegames</Name><Prefix></Prefix><KeyCount>0\
+            </KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>");
+    }
+
+    #[test]
+    fn python_slices() {
+        let v = || vec![1, 2, 3, 4];
+        assert_eq!(super::py_slice(v(), 1, 2), [2, 3]);
+        assert_eq!(super::py_slice(v(), -1, 100), [4]);
+        assert_eq!(super::py_slice(v(), -3, 1), [2]);
+        assert!(super::py_slice(v(), 2, -1).is_empty() && super::py_slice(v(), 9, 1).is_empty());
+        assert_eq!(super::py_slice(v(), 0, -1), [1, 2, 3]);
     }
 }

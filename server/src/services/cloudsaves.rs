@@ -41,6 +41,11 @@ pub fn entity_name(product: u64) -> String {
     format!("upcCloudSaveUplayId_{product}")
 }
 
+/// The product a cloud-save entity name is for (`upcCloudSaveUplayId_<product>`), None for any other name.
+pub fn product_of(name: &str) -> Option<u64> {
+    NAME.captures(name).and_then(|c| c[1].parse().ok())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link {
     pub profile_id: String,
