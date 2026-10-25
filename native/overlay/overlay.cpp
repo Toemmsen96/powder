@@ -334,6 +334,8 @@ static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT 
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
+            ImGui::GetIO().MouseDrawCursor = true;   // the game hides the OS cursor; draw ImGui's own
+            ClipCursor(nullptr);                     // the game clips the cursor to centre for camera look; free it
             draw_ui();
             ImGui::Render();
             g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
