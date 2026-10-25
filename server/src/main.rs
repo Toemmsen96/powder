@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use powder_server::assets::Assets;
 use powder_server::config::Config;
-use powder_server::core::ratelimit::FailureLimiter;
 use powder_server::core::sessions::SessionRegistry;
 use powder_server::db::Db;
 use powder_server::https::{self, HttpState};
@@ -14,6 +13,7 @@ use powder_server::logging;
 use powder_server::mods::ModHost;
 use powder_server::repos::Repos;
 use powder_server::services::accounts::AccountService;
+use powder_server::services::Services;
 use powder_server::tls;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -271,9 +271,8 @@ async fn run(config: Config) -> Result<()> {
     let assets = Arc::new(if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() });
     let repos = Arc::new(Repos::new(db));
     let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, repos.clone())));
-    // one registry for both transports: HTTPS logins issue the tickets NEX's LoginWithToken looks up
-    let sessions = Arc::new(SessionRegistry::new());
-    let accounts = Arc::new(AccountService::new(config.clone(), repos.clone(), sessions.clone()));
+    let services = Arc::new(Services::new(config.clone(), assets.clone(), repos.clone(), Some(mods.clone())));
+    let accounts = services.accounts.clone();
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
     log::warn!(target: "powder", "not ported yet: most UbiServices routes (only sign-in), NEX stats and \
                                   matchmaking (use the Python server to play)");
@@ -286,7 +285,7 @@ async fn run(config: Config) -> Result<()> {
     let signing_key = powder_server::nex::secure::load_or_create_signing_key(&config.data_dir().join("nex_signing_key.pem"))?;
     let nex_public_key = powder_server::nex::secure::config_public_key(&signing_key);
     let mut dispatcher = powder_server::nex::dispatch::Dispatcher::new(assets.clone(), Some(mods.clone()));
-    let handler_deps = powder_server::nex::handlers::HandlerDeps::new(accounts.clone(), Some(mods.clone()));
+    let handler_deps = powder_server::nex::handlers::HandlerDeps::new(services.clone());
     powder_server::nex::handlers::register(&mut dispatcher, handler_deps);
     powder_server::nex::server::start(dispatcher, signing_key, &s.bind, &s.public_host, s.nex_port).await?;
     log::info!(target: "powder", "NEX listening on udp {}:{} (game reaches it at {})", s.bind, s.nex_port, s.public_host);
@@ -309,15 +308,11 @@ async fn run(config: Config) -> Result<()> {
         }
     });
     log::info!(target: "powder", "HTTPS on {}:{} (local CA {})", s.bind, s.https_port, pki.ca_thumbprint()?);
-    // Connect's demux hands out cloud-save links the HTTPS routes redeem: one CloudSaveService for both
-    let cloudsaves = Arc::new(powder_server::services::cloudsaves::CloudSaveService::new(repos.clone(), config.data_dir()));
     let demux = Arc::new(powder_server::demux::DemuxDeps {
-        config: config.clone(), assets: assets.clone(), accounts: accounts.clone(), cloudsaves,
-        clients: Arc::new(powder_server::demux::ConnectClients::new()), mods: Some(mods.clone()),
+        config: config.clone(), assets, accounts, cloudsaves: services.cloudsaves.clone(),
+        clients: services.connect_clients.clone(), mods: Some(mods),
     });
-    let state = Arc::new(HttpState { config: config.clone(), assets, mods: Some(mods), accounts,
-                                     login_failures: Arc::new(FailureLimiter::default()), nex_public_key,
-                                     demux: Some(demux) });
+    let state = Arc::new(HttpState { services, nex_public_key, demux: Some(demux) });
     https::serve(addr(s.https_port)?, pki.server_config()?, state).await
 }
 

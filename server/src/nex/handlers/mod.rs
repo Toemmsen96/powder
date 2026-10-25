@@ -15,11 +15,14 @@ use crate::core::sessions::SessionRegistry;
 use crate::mods::ModHost;
 use crate::repos::Repos;
 use crate::services::accounts::AccountService;
+use crate::services::Services;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// What the handlers need besides the call.
 pub struct HandlerDeps {
+    /// Everything else (stats, ...).
+    pub services: Arc<Services>,
     pub config: Arc<Config>,
     pub accounts: Arc<AccountService>,
     pub sessions: Arc<SessionRegistry>,
@@ -29,10 +32,10 @@ pub struct HandlerDeps {
 }
 
 impl HandlerDeps {
-    /// Config, repos and sessions are the account service's.
-    pub fn new(accounts: Arc<AccountService>, mods: Option<Arc<Mutex<ModHost>>>) -> Arc<HandlerDeps> {
-        Arc::new(HandlerDeps { config: accounts.config.clone(), sessions: accounts.sessions.clone(),
-                               repos: accounts.repos.clone(), accounts, mods })
+    pub fn new(services: Arc<Services>) -> Arc<HandlerDeps> {
+        Arc::new(HandlerDeps { config: services.config.clone(), accounts: services.accounts.clone(),
+                               sessions: services.sessions.clone(), repos: services.repos.clone(),
+                               mods: services.mods.clone(), services })
     }
 }
 
@@ -51,13 +54,9 @@ pub fn register(d: &mut Dispatcher, deps: Arc<HandlerDeps>) {
 pub(crate) mod testing {
     use super::*;
     use crate::assets::Assets;
-    use crate::db::Db;
 
     pub fn deps(config: Config) -> Arc<HandlerDeps> {
-        let db = Arc::new(Db::memory().unwrap());
-        db.migrate().unwrap();
-        let accounts = AccountService::new(Arc::new(config), Arc::new(Repos::new(db)), Arc::new(SessionRegistry::new()));
-        HandlerDeps::new(Arc::new(accounts), None)
+        HandlerDeps::new(Arc::new(Services::memory(config)))
     }
 
     pub fn dispatcher(deps: &Arc<HandlerDeps>) -> Dispatcher {

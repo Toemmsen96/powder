@@ -20,15 +20,11 @@
 pub mod routes_powder;
 pub mod routes_ubi;
 
-use crate::assets::Assets;
 use crate::builtin::http as builtin_http;
-use crate::config::Config;
 use crate::constants::{APP_ID, DEMUX_HOST};
 use crate::core::identity::parse_authorization;
-use crate::core::ratelimit::FailureLimiter;
-use crate::core::sessions::{PlayerSession, SessionRegistry};
-use crate::mods::ModHost;
-use crate::services::accounts::AccountService;
+use crate::core::sessions::PlayerSession;
+use crate::services::Services;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -38,7 +34,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -58,24 +53,21 @@ const CORS_EXPOSE: &str = "X-Total-Count, Ubi-TransactionId";
 static GAME_CONFIG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?i)^/v\d+/applications/{APP_ID}/configuration$")).unwrap());
 
-/// What every request needs; shared by all connections.
+/// What every request needs; shared by all connections. The services are reached through it
+/// (`state.accounts`, `state.economy`, ...).
 pub struct HttpState {
-    pub config: Arc<Config>,
-    pub assets: Arc<Assets>,
-    pub mods: Option<Arc<Mutex<ModHost>>>,
-    /// Logins and tickets; its `sessions` registry is the one NEX shares.
-    pub accounts: Arc<AccountService>,
-    /// Failed email + password sign-ins per address.
-    pub login_failures: Arc<FailureLimiter>,
+    pub services: Arc<Services>,
     /// The key that signs the NEX handshake, as the rendezvous configuration publishes it.
     pub nex_public_key: String,
     /// Ubisoft Connect's demux, on the same TLS port (None: its connections are closed).
     pub demux: Option<Arc<crate::demux::DemuxDeps>>,
 }
 
-impl HttpState {
-    pub fn sessions(&self) -> &Arc<SessionRegistry> {
-        &self.accounts.sessions
+impl std::ops::Deref for HttpState {
+    type Target = Services;
+
+    fn deref(&self) -> &Services {
+        &self.services
     }
 }
 
@@ -479,19 +471,20 @@ where
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::assets::{HttpFixture, HttpFixtures};
+    use crate::assets::{Assets, HttpFixture, HttpFixtures};
+    use crate::config::Config;
     use crate::db::Db;
+    use crate::mods::ModHost;
     use crate::repos::Repos;
+    use parking_lot::Mutex;
 
     pub fn state_with(config: Config, fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {
         let assets = Assets { http: HttpFixtures::new(fixtures), ..Default::default() };
-        let config = Arc::new(config);
         let db = Arc::new(Db::memory().unwrap());
         db.migrate().unwrap();
-        let accounts = AccountService::new(config.clone(), Arc::new(Repos::new(db)), Arc::new(SessionRegistry::new()));
-        HttpState { config, assets: Arc::new(assets), mods: mods.map(|m| Arc::new(Mutex::new(m))),
-                    accounts: Arc::new(accounts), login_failures: Arc::new(FailureLimiter::default()),
-                    nex_public_key: "TESTKEY".into(), demux: None }
+        let mods = mods.map(|m| Arc::new(Mutex::new(m)));
+        let services = Services::new(Arc::new(config), Arc::new(assets), Arc::new(Repos::new(db)), mods);
+        HttpState { services: Arc::new(services), nex_public_key: "TESTKEY".into(), demux: None }
     }
 
     pub fn state(fixtures: Vec<HttpFixture>, mods: Option<ModHost>) -> HttpState {
@@ -526,6 +519,8 @@ mod tests {
     use super::testing::*;
     use super::*;
     use crate::assets::HttpFixture;
+    use crate::config::Config;
+    use crate::mods::ModHost;
 
     #[test]
     fn unmatched_is_empty_json() {
@@ -717,7 +712,7 @@ mod tests {
         let st = state_with(config, vec![], None);
         let routes = [Route::new("GET", "/whoami", whoami)];
         let pid = st.accounts.default_profile_id().unwrap();
-        let s = st.sessions().issue(st.accounts.player(&pid).unwrap(), "10.0.0.2", "");
+        let s = st.sessions.issue(st.accounts.player(&pid).unwrap(), "10.0.0.2", "");
         let ask = |auth: &str| body(&routed(&st, &req("GET", "/whoami", &[("Authorization", auth)]), &routes));
         assert_eq!(ask(&format!("Ubi_v1 t={}", s.ticket))["who"], pid.as_str());
         assert_eq!(ask(&format!("ubi_v1 t={}", s.ticket))["who"], pid.as_str(), "the scheme in any case");

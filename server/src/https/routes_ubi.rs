@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(b["profileId"], pid.as_str());
         assert_eq!(b["spaceId"], crate::constants::SPACE_ID);
         assert!(b["ticket"].as_str().unwrap().starts_with("powder."));
-        assert!(st.sessions().by_token(b["ticket"].as_str().unwrap()).is_some());
+        assert!(st.sessions.by_token(b["ticket"].as_str().unwrap()).is_some());
         // Python's key order and json.dumps separators
         let keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["platformType", "environment", "profileId", "userId", "nameOnPlatform", "ticket",
@@ -197,7 +197,7 @@ mod tests {
             assert_eq!(b["spaceId"], crate::constants::CONNECT_SPACE_ID);
             let keys: Vec<&str> = b.as_object().unwrap().keys().skip(13).map(String::as_str).collect();
             assert_eq!(keys, ["spaceId", "rememberMeTicket", "codeGenerationPreference", "maskedPhone"]);
-            assert_eq!(st.sessions().by_token(b["ticket"].as_str().unwrap()).unwrap().profile_id(), pid);
+            assert_eq!(st.sessions.by_token(b["ticket"].as_str().unwrap()).unwrap().profile_id(), pid);
         }
     }
 
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(b["profileId"], pid.as_str(), "the first account takes over the default player");
         let rm = format!("rm_v1 t={}", b["rememberMeTicket"].as_str().unwrap());
         assert_eq!(connect_login(&st, &rm).status, 200);
-        st.sessions().drop_player(&pid); // a server restart: remember-me still works
+        st.sessions.drop_player(&pid); // a server restart: remember-me still works
         assert_eq!(connect_login(&st, &rm).status, 200);
         assert_eq!(connect_login(&st, "rm_v1 t=made-up").status, 401);
     }
@@ -281,7 +281,7 @@ mod tests {
 
     fn limited(max_failures: usize) -> HttpState {
         let mut st = state_with(Config::default(), vec![], None);
-        st.login_failures = Arc::new(FailureLimiter::new(max_failures, 30, 300.0));
+        Arc::get_mut(&mut st.services).unwrap().login_failures = Arc::new(FailureLimiter::new(max_failures, 30, 300.0));
         st
     }
 
