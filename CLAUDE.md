@@ -26,31 +26,30 @@ Crate layout (`server/src/`, library `lib.rs` + binary `main.rs`):
 |---|---|---|
 | config, db, repos, util, logging, assets, gamedata | `config.rs` … `gamedata/` | base commit |
 | TLS + local CA, OS trust | `tls.rs`, `trust.rs` | `tls.py`, `trust.py` (+ Linux/Wine) |
-| HTTPS pipeline + router | `https/mod.rs`, `https/routes_ubi.rs`, `https/routes_powder.rs` | `transport/https/app.py`, part of `routes_ubi.py` |
+| HTTPS pipeline + router | `https/mod.rs`, `https/routes_{powder,profile,ubi,ugc}.rs`, `https/websocket.rs` | `transport/https/` |
 | built-in replies (no pack) | `builtin/` | `builtin/` |
-| NEX transport + handlers | `nex/{connection,server,dispatch}.rs`, `nex/handlers/` | `transport/nex/` (login, gamestorage, profile) |
+| NEX transport + handlers | `nex/{connection,server,dispatch}.rs`, `nex/handlers/` | `transport/nex/` |
 | Storm (UDP P2P helpers) | `storm.rs` | `transport/storm.py` |
 | accounts, sessions | `core/`, `services/accounts.rs`, `services/seed.rs` | `core/`, `services/accounts.py` |
-| services | `services/{economy,entities,stats,leaderboards,cloudsaves,friends}.rs` | `services/*.py` |
+| services (`Services` in `services/mod.rs`) | `services/*.rs` | `services/*.py` |
+| admin CLI | `admin.rs` + `main.rs` | `admin/cli.py` |
 | Ubisoft Connect's demux | `demux/` (shares `CloudSaveService` and `ConnectClients` via `DemuxDeps`) | `transport/demux/` |
 | mods | `mods.rs` (Lua), `client_mods.rs` | `plugins/` (new design) |
 
-CLI: `run` (default), `mods`, `admin trust|players|accounts|account-*`, `gamedata build|verify|zip|install`.
+CLI: `run` (default), `mods`, `admin …` (all of Python's), `gamedata build|verify|zip|install`.
 
 Python tests (`tests/`, pytest; `uv run pytest`): on Linux 4 fail before and after any change
 (`test_launcher.py` run_game tests and `test_packaging.py::test_busy_port_is_detected` need Windows). The launcher's
 client mods are `powder/launcher/mods.py` (+ the "Client mods" step in `session.py`, `tests/test_client_mods.py`).
 
-### Not ported yet (pick from here)
+### State of the port
 
-- HTTPS: `routes_profile.py` (users/me, profiles, friends, graphql…), `routes_ugc.py`, the rest of
-  `routes_powder.py` (status, account API, ca.pem), `websocket.py`, and the rest of `routes_ubi.py` (inventory
-  + store → `services/economy.rs` is ready, entities v2 → `services/entities.rs` is ready, Connect cloud saves).
-- NEX handlers: `stats.py` (→ `services/stats.rs` is ready), `matchmaking.py` (needs `services/matchmaking.py`).
-- Services: `matchmaking.py`, `channels.py`, `importer.py`. The cloud-save HTTPS routes must use the same
-  `CloudSaveService` as the demux (built in `run`); `/_powder/status` lists `ConnectClients::snapshot()`.
-- Admin: inventory, grant, stats, ledger, events, cloud-saves, scores, achievements, entities, import, reset, offers.
-- `run` logs a warning listing what is missing; keep it accurate.
+Everything of the Python server is ported (2026-10-25): all HTTPS routes, the websocket (`/v2/websocket` and
+Connect's `/v2/websocket/server`), NEX stats and matchmaking, channels, the importer, the admin CLI. Not yet
+played against the game: that is the next test (`POWDER_SERVER=rust powder-wrap`). Known gaps: `/_powder/status`
+lists a game's address without its port (`NexChannel` does not know its UDP peer); entity/UGC/cloud-save files
+are sent whole (no Range / If-Modified-Since); websocket permessage-deflate is declined. Each port's commit
+message lists its behaviour differences. `run` logs a warning while the Rust server is untested; keep it accurate.
 
 ## Conventions
 
@@ -114,6 +113,11 @@ Paths differ per device; on the first PC the prefix is `~/Games/ubisoft-connect`
 makes a private user+mount+net namespace (loopback only), a private `/etc/hosts` with the Ubisoft names, starts
 the Powder server inside (Python by default, `POWDER_SERVER=rust`), and puts the local CA into the prefix's root
 store only for the session. No system changes, no root. Server output: `$XDG_RUNTIME_DIR/powder-wrap.log`.
+It needs a Python server to run (`.venv` from `uv sync`, else `uv`, else a system `python3` with aiohttp and
+cryptography) or `POWDER_SERVER=rust`. Lutris shows none of its output: a failure goes to that log and a desktop
+notification ("the game ran for a very short time" in Lutris' log means the wrapper stopped). Arch resolves names
+through systemd-resolved before `/etc/hosts`, so the session also bind-mounts an `nsswitch.conf` with
+`hosts: files myhostname`. A killed session's CA is removed by the next one (`<prefix>/.powder-wrap-ca`).
 After changing a game's config in Lutris, restart Lutris (it may rename the config file and keep a stale copy:
 "This game has no executable set").
 
@@ -135,10 +139,8 @@ don't run commands against the user's real prefix or data: test on scratch copie
 
 ## Next steps
 
-1. Connect's notification websocket: it asks for `GET /v2/websocket/server?SpaceIds=...&NotificationTypes=...`,
-   which the Python server does not route (`/v2/websocket` only) -> UNMATCHED, retried every ~30 s. Fix in the
-   Python server (main) and when porting `websocket.py` to Rust.
-2. The game on Linux: the TLS helper from `native/` is Windows-only so far; getting the game past the loading
+1. The game on Linux: the TLS helper from `native/` is Windows-only so far; getting the game past the loading
    screen under Wine/Proton is the open problem (the user decides how to approach it).
-3. The Rust port: see "Not ported yet" above; once the HTTPS routes, NEX stats/matchmaking and the websocket are
-   done, `POWDER_SERVER=rust powder-wrap` can replace the Python server in the user's sessions.
+2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
+   Python server in the user's sessions.
+3. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
