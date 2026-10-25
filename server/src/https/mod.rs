@@ -2,8 +2,12 @@
 //! routed by the name the client asked for (SNI): Ubisoft Connect's demux (dmx.upc.ubisoft.com) is not HTTP,
 //! everything else is.
 //!
+//! Before the pipeline, limits.rs: connections (in all, per address), TLS handshake and header timeouts, request
+//! body sizes by path (413) and the bodies' memory budget.
+//!
 //! Request pipeline (outermost first), as in the Python server:
-//!   access log      one line per request; uploaded remotelog/events bodies are kept (they explain client errors)
+//!   access log      one line per request; uploaded remotelog/events bodies are kept (they explain client errors;
+//!                   cut to 256 KiB each, the newest 200)
 //!   CORS            Ubisoft Connect's web UI calls UbiServices from its embedded browser: preflights, Allow-Origin
 //!                   (Ubisoft's origins only; other origins may only GET / HEAD, see connect_origin)
 //!   mods            `api.before_http` hooks may answer a request themselves
@@ -20,6 +24,7 @@
 //! method does not falls through to the next one and finally to the pack, as with aiohttp's catch-all route.
 //! A websocket handshake the route accepted (101) is answered by hyper, then the connection is websocket.rs's.
 
+pub mod limits;
 pub mod routes_powder;
 pub mod routes_profile;
 pub mod routes_ubi;
@@ -32,8 +37,9 @@ use crate::core::identity::parse_authorization;
 use crate::core::sessions::PlayerSession;
 use crate::services::Services;
 use anyhow::{Context, Result};
+use limits::{BodyError, ConnGuard, Gate, Limits};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
@@ -51,8 +57,12 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 pub const JSON: &str = "application/json; charset=utf-8";
-const MAX_BODY: usize = 64 * 1024 * 1024; // UGC files (photos, trails)
 const SAVED_UPLOADS: [&str; 2] = ["/remotelog", "/profiles/me/events"];
+/// Kept uploads (data/bodies/): each cut to this much (a remotelog or events batch is a few KB), and only the
+/// newest so many (the oldest are deleted), so they cannot fill the disk.
+const KEPT_BODY_MAX: usize = 256 << 10;
+const KEPT_BODIES: usize = 200;
+const SAVED_KINDS: [&str; 2] = ["remotelog", "events"];
 const CORS_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS";
 const CORS_EXPOSE: &str = "X-Total-Count, Ubi-TransactionId";
 
@@ -301,8 +311,30 @@ fn keep_upload(state: &HttpState, req: &Req) {
     let kind = if req.path().ends_with("/remotelog") { "remotelog" } else { "events" };
     let dir: PathBuf = state.config.data_dir().join("bodies");
     let name = chrono::Local::now().format(&format!("{kind}-%Y%m%d-%H%M%S-%6f.txt")).to_string();
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(name), &req.body)) {
+    let body = &req.body[..req.body.len().min(KEPT_BODY_MAX)];
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(name), body)) {
         log::warn!(target: "powder.https", "keeping a {kind} upload: {e}");
+    }
+    if body.len() < req.body.len() {
+        log::debug!(target: "powder.https", "kept {kind} upload cut to {} of {} bytes", body.len(), req.body.len());
+    }
+    prune_kept(&dir, KEPT_BODIES);
+}
+
+/// Delete the oldest kept uploads beyond the newest `keep` (names sort by time after their kind).
+fn prune_kept(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut kept: Vec<(String, PathBuf)> = entries.filter_map(Result::ok).filter_map(|e| {
+        let name = e.file_name().into_string().ok()?;
+        let (kind, stamp) = name.split_once('-')?;
+        (SAVED_KINDS.contains(&kind) && name.ends_with(".txt")).then(|| (stamp.to_string(), e.path()))
+    }).collect();
+    if kept.len() <= keep {
+        return;
+    }
+    kept.sort();
+    for (_, path) in &kept[..kept.len() - keep] {
+        let _ = std::fs::remove_file(path); // another request may have deleted it already
     }
 }
 
@@ -425,21 +457,52 @@ fn to_response(reply: Reply) -> Response<Full<Bytes>> {
     resp
 }
 
-async fn serve_request(state: Arc<HttpState>, sni: String, peer: SocketAddr, mut req: Request<Incoming>)
-                       -> Result<Response<Full<Bytes>>> {
+/// A request refused before the pipeline (its body): UbiServices' error shape, and the connection closed (its
+/// body was not read to the end).
+fn refused(req: &Req, status: u16, message: &str, how: &str) -> Response<Full<Bytes>> {
+    let mut reply = Reply::json(&json!({"errorCode": 1, "message": message, "httpCode": status}), how, status);
+    reply.headers.push(("Connection".into(), "close".into()));
+    log::warn!(target: "powder.https", "{} {}{} from {}: {message}", req.method, req.host, req.path(), req.peer);
+    access_log(req, how, status, &reply.body.len().to_string());
+    to_response(reply)
+}
+
+async fn serve_request(state: Arc<HttpState>, gate: Arc<Gate>, conn: Arc<ConnGuard>, sni: String, peer: SocketAddr,
+                       mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
     // kept for the websocket route; hyper hands over the connection once its 101 is sent
     let upgrade = websocket::is_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
-    let body = Limited::new(body, MAX_BODY).collect().await.map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();
     let host = parts.headers.get("host").and_then(|h| h.to_str().ok())
         .map(|h| h.split(':').next().unwrap_or("").to_lowercase()).filter(|h| !h.is_empty()).unwrap_or(sni);
     let path_qs = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-    let req = Req { method: parts.method.to_string(), host, path_qs, headers: parts.headers, body, peer };
+    let mut req = Req { method: parts.method.to_string(), host, path_qs, headers: parts.headers, body: Bytes::new(),
+                        peer };
+    let (limit, class) = limits::body_rules(req.path());
+    let timeout = gate.limits.body_timeout(class);
+    // held until the reply is made: the body counts against the budget while it is in memory
+    let _budget = match tokio::time::timeout(timeout, limits::read_body(body, limit, gate.budget(class))).await {
+        Ok(Ok((bytes, held))) => {
+            req.body = bytes;
+            held
+        }
+        Ok(Err(BodyError::TooLarge)) => {
+            let message = format!("Request body too large (at most {limit} bytes).");
+            return Ok(refused(&req, 413, &message, "body-too-large"));
+        }
+        Ok(Err(BodyError::Failed(e))) => anyhow::bail!("{e}"),
+        Err(_) => {
+            let message = format!("Request body not received within {} s.", timeout.as_secs());
+            return Ok(refused(&req, 408, &message, "body-timeout"));
+        }
+    };
     // the pipeline blocks (SQLite, scrypt for password sign-ins, the mods' lock): off the async workers
     let shared = state.clone();
     let (reply, req) = tokio::task::spawn_blocking(move || (handle(&shared, &req), req)).await?;
     if let Some(upgrade) = upgrade.filter(|_| reply.status == 101 && reply.how == websocket::HOW) {
-        tokio::spawn(websocket::run(state, req, upgrade));
+        tokio::spawn(async move {
+            websocket::run(state, req, upgrade).await;
+            drop(conn); // the websocket is this connection: it counts until it closes
+        });
     }
     Ok(to_response(reply))
 }
@@ -454,7 +517,14 @@ pub async fn serve(addr: SocketAddr, tls: Arc<ServerConfig>, state: Arc<HttpStat
 
 /// [`serve`] on a listener that is already bound.
 pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<HttpState>) -> Result<()> {
+    serve_limited(listener, tls, state, Limits::default()).await
+}
+
+/// [`serve_on`] with these limits.
+pub async fn serve_limited(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<HttpState>, limits: Limits)
+                           -> Result<()> {
     let acceptor = TlsAcceptor::from(tls);
+    let gate = Gate::new(limits);
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(c) => c,
@@ -463,13 +533,19 @@ pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<
                 continue;
             }
         };
+        let Some(conn) = gate.admit(peer.ip()) else { continue }; // dropped: closed
+        let conn = Arc::new(conn);
         let acceptor = acceptor.clone();
-        let state = state.clone();
+        let (state, gate) = (state.clone(), gate.clone());
         tokio::spawn(async move {
-            let stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
+            let stream = match tokio::time::timeout(gate.limits.tls_handshake, acceptor.accept(tcp)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     log::debug!(target: "powder.tls", "handshake with {peer} failed: {e}");
+                    return;
+                }
+                Err(_) => {
+                    log::debug!(target: "powder.tls", "handshake with {peer} timed out");
                     return;
                 }
             };
@@ -490,13 +566,23 @@ pub async fn serve_on(listener: TcpListener, tls: Arc<ServerConfig>, state: Arc<
                 }
                 return;
             }
-            let service = service_fn(move |req| serve_request(state.clone(), sni.clone(), peer, req));
-            let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service).with_upgrades();
+            let header_read = gate.limits.header_read;
+            let service = service_fn(move |req| serve_request(state.clone(), gate.clone(), conn.clone(), sni.clone(),
+                                                              peer, req));
+            let conn = http1_builder(header_read).serve_connection(TokioIo::new(stream), service).with_upgrades();
             if let Err(e) = conn.await {
                 log::debug!(target: "powder.https", "connection from {peer}: {e}");
             }
         });
     }
+}
+
+/// hyper's HTTP/1 with a timer, so that a client gets `header_read` to send its headers (and an idle keep-alive
+/// connection is closed after it).
+fn http1_builder(header_read: std::time::Duration) -> http1::Builder {
+    let mut builder = http1::Builder::new();
+    builder.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(header_read);
+    builder
 }
 
 /// Plain HTTP serving fixed bytes at a few paths (the local CA's revocation list, which Windows checks for
@@ -508,10 +594,13 @@ where
     let listener = TcpListener::bind(addr).await.with_context(|| format!("HTTP on {addr}"))?;
     log::info!(target: "powder.https", "plain HTTP on {addr} ({})", paths.join(", "));
     let shared = Arc::new((paths, body));
+    let gate = Gate::new(Limits::default());
     loop {
-        let Ok((tcp, _)) = listener.accept().await else { continue };
-        let shared = shared.clone();
+        let Ok((tcp, peer)) = listener.accept().await else { continue };
+        let Some(conn) = gate.admit(peer.ip()) else { continue };
+        let (shared, header_read) = (shared.clone(), gate.limits.header_read);
         tokio::spawn(async move {
+            let _conn = conn;
             let service = service_fn(move |req: Request<Incoming>| {
                 let shared = shared.clone();
                 async move {
@@ -527,7 +616,7 @@ where
                     Ok::<_, std::convert::Infallible>(to_response(reply))
                 }
             });
-            let _ = http1::Builder::new().serve_connection(TokioIo::new(tcp), service).await;
+            let _ = http1_builder(header_read).serve_connection(TokioIo::new(tcp), service).await;
         });
     }
 }
@@ -731,16 +820,25 @@ mod tests {
 
     /// A server on a free port with the local CA's certificate; -> its address and the CA (PEM).
     async fn tls_server(state: HttpState, dir: &std::path::Path) -> (SocketAddr, Vec<u8>) {
+        tls_server_limited(state, dir, Limits::default()).await
+    }
+
+    async fn tls_server_limited(state: HttpState, dir: &std::path::Path, limits: Limits) -> (SocketAddr, Vec<u8>) {
         let pki = crate::tls::ensure_pki(dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_on(listener, pki.server_config().unwrap(), Arc::new(state)));
+        tokio::spawn(serve_limited(listener, pki.server_config().unwrap(), Arc::new(state), limits));
         (addr, std::fs::read(&pki.ca_pem).unwrap())
     }
 
     /// A TLS connection to the server, checked against the CA, with this SNI.
     async fn tls_connect(addr: SocketAddr, ca: &[u8], sni: &str)
                          -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        try_tls_connect(addr, ca, sni).await.unwrap()
+    }
+
+    async fn try_tls_connect(addr: SocketAddr, ca: &[u8], sni: &str)
+                             -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
         use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
         let mut roots = RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut &ca[..]) {
@@ -752,7 +850,7 @@ mod tests {
             .with_no_client_auth();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = ServerName::try_from(sni.to_string()).unwrap();
-        tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap()
+        tokio_rustls::TlsConnector::from(Arc::new(client)).connect(name, tcp).await
     }
 
     /// One request over a real TLS connection (SNI public-ubiservices.ubi.com); -> the raw response.
@@ -897,6 +995,117 @@ mod tests {
         let text = tls_request(addr, &ca, &get("/_powder/ca.pem")).await;
         assert!(text.starts_with("HTTP/1.1 200"), "{text}");
         assert_eq!(text.split_once("\r\n\r\n").unwrap().1.as_bytes(), ca);
+    }
+
+    /// Bodies over their path's limit get a 413 (from the Content-Length, before the body is read), uploads may be
+    /// bigger, chat channels less; a body that does not arrive in time gets a 408.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn body_limits_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits { body: std::time::Duration::from_millis(300), ..Limits::default() };
+        let (addr, ca) = tls_server_limited(state(vec![], None), dir.path(), limits).await;
+        let post = |method: &str, path: &str, length: usize, sent: &[u8]| {
+            let head = format!("{method} {path} HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\nContent-Length: \
+                                {length}\r\nConnection: close\r\n\r\n");
+            [head.as_bytes(), sent].concat()
+        };
+        let ca = &ca;
+        let request = |raw: Vec<u8>| async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut tls = tls_connect(addr, ca, "public-ubiservices.ubi.com").await;
+            tls.write_all(&raw).await.unwrap();
+            let mut out = vec![];
+            let _ = tls.read_to_end(&mut out).await;
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let too_big = limits::MAX_BODY + 1;
+        let text = request(post("POST", "/v1/profiles/me/remotelog", too_big, b"{}")).await;
+        assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+        assert!(text.to_lowercase().contains("connection: close"), "{text}");
+        let body: Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body, json!({"errorCode": 1, "message": format!("Request body too large (at most {} bytes).",
+                                                                     limits::MAX_BODY), "httpCode": 413}));
+        // an upload of that size is read and handed to its route
+        let big = vec![b'x'; too_big];
+        let text = request(post("PUT", "/_powder/entity-files/abc", big.len(), &big)).await;
+        assert!(text.starts_with("HTTP/1.1 ") && !text.starts_with("HTTP/1.1 413"), "{text}");
+        let channel = vec![b' '; limits::MAX_CHANNEL_BODY + 1];
+        let text = request(post("POST", "/v1/spaces/s/channels", channel.len(), &channel)).await;
+        assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+        let text = request(post("POST", "/v1/profiles/me/remotelog", 100, b"0123456789")).await;
+        assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    }
+
+    /// The connection limits: per address (and the slot freed when one closes), a TLS handshake and a request's
+    /// headers that take too long, an idle keep-alive connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connection_limits_over_tls() {
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits { max_per_ip: 2, tls_handshake: Duration::from_millis(300),
+                              header_read: Duration::from_millis(300), ..Limits::default() };
+        let (addr, ca) = tls_server_limited(state(vec![], None), dir.path(), limits).await;
+        let host = "public-ubiservices.ubi.com";
+        let first = tls_connect(addr, &ca, host).await;
+        let _second = tls_connect(addr, &ca, host).await;
+        assert!(try_tls_connect(addr, &ca, host).await.is_err(), "a third one from the same address");
+        drop(first);
+        let mut tries = 0;
+        let mut third = loop {
+            match try_tls_connect(addr, &ca, host).await {
+                Ok(c) => break c,
+                Err(_) => {
+                    tries += 1;
+                    assert!(tries < 100, "the closed connection's slot was never freed");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        // headers not finished in time: closed (also how an idle keep-alive connection ends)
+        let start = Instant::now();
+        third.write_all(b"GET /v1/nothing HTTP/1.1\r\nHost: public-ubiservices.ubi.com\r\n").await.unwrap();
+        let mut out = vec![];
+        let _ = tokio::time::timeout(Duration::from_secs(5), third.read_to_end(&mut out)).await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3) && !String::from_utf8_lossy(&out).contains("200"));
+        drop(_second);
+        // no TLS handshake at all: closed
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf)).await.unwrap();
+        assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+    }
+
+    /// Kept remotelog/events uploads: each cut to KEPT_BODY_MAX, only the newest KEPT_BODIES (other files stay).
+    #[test]
+    fn kept_uploads_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_path_buf();
+        let st = state_with(config, vec![], None);
+        let bodies = dir.path().join("bodies");
+        std::fs::create_dir_all(&bodies).unwrap();
+        std::fs::write(bodies.join("notes.txt"), b"mine").unwrap();
+        let post = |path: &str, body: Vec<u8>| {
+            let mut r = req("POST", path, &[]);
+            r.body = body.into();
+            handle(&st, &r)
+        };
+        assert_eq!(post("/v1/profiles/me/remotelog", vec![b'x'; KEPT_BODY_MAX + 10]).how, "remotelog");
+        let only: Vec<_> = std::fs::read_dir(&bodies).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("remotelog-")).collect();
+        assert_eq!(std::fs::metadata(&only[0]).unwrap().len(), KEPT_BODY_MAX as u64);
+        for i in 0..KEPT_BODIES + 5 {
+            let path = if i % 2 == 0 { "/v1/profiles/me/remotelog" } else { "/v3/profiles/me/events" };
+            post(path, format!("{i}").into_bytes());
+        }
+        let names: Vec<String> = std::fs::read_dir(&bodies).unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(names.len(), KEPT_BODIES + 1, "the newest {KEPT_BODIES} and notes.txt");
+        assert!(names.contains(&"notes.txt".to_string()));
+        let contents: std::collections::BTreeSet<String> = names.iter().filter(|n| *n != "notes.txt")
+            .map(|n| std::fs::read_to_string(bodies.join(n)).unwrap()).collect();
+        assert!(contents.contains(&format!("{}", KEPT_BODIES + 4)) && !contents.contains("0"), "oldest deleted");
     }
 
     #[test]
