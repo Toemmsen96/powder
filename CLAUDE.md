@@ -239,7 +239,9 @@ API. Everything below is on `rework/rust-server`.
   camera-relative: camera.cpp calibrates the camera live (turn it once standing still) - pointer chains to it
   were NOT stable across launches. fixes.cpp: a null guard at steep.exe+0x5c8f73 (Alaska crash: no record for
   rider 0, gear key 6). crashlog.cpp logs faults with module+offset to powder_overlay.log.
-  Camera-relative fly: built, the live calibration is Wine-tested, NOT yet confirmed in-game.
+  Camera-relative fly: CONFIRMED in-game (2026-10-26), but it had to be calibrated again too often. Since then
+  the calibration waits for the rider to stand still instead of failing, and keeps every agreeing copy (a copy
+  that stops following hands over to the next); this is NOT yet confirmed in-game.
 - **Client-mod API** (`native/sdk/powder_api.h` v2, guide `native/sdk/README.md`): hooks (function, mid with
   registers), patch_code, find_pattern, read/write, add_panel (ImGui), on_frame, http to /_powder/ (no session),
   player_position. Hosted by the overlay (modhost.cpp, hooks.cpp on MinHook's trampolines, codepatch.cpp).
@@ -274,8 +276,8 @@ API. Everything below is on `rework/rust-server`.
 
 ## Next steps (open)
 
-1. Confirm in-game: camera-relative Fly (live camera calibration); then a mod that adds a bone / grows a bone
-   map (export --rig).
+1. Confirm in-game: Fly's camera stays found without new calibrations (camera.cpp's copy hand-over); then a
+   mod that adds a bone / grows a bone map (export --rig).
 2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch), e.g.
    Master Chief as a new costume (asked 2026-10-26; today it replaces costume 016). Game Bootstrap Settings
    (0x800) is one 146 MB datafile of 17,292 resources. The skeleton resource (hierarchy) is still not decoded.
