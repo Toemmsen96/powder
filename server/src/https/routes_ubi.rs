@@ -330,6 +330,29 @@ fn post_inventory(c: &Ctx) -> Reply {
     Reply::json(&reply, "economy", 200)
 }
 
+/// Steep's "intro finished" token. The game looks up its offer right after the Alps intro and when it loads a save
+/// that still holds the intro's completion record - it then drops that record from the save and expects the token
+/// in the inventory (Ubisoft's store gave it; Powder has no such offer, and the game ignores a synthetic one). So
+/// the lookup is the signal: the asking player is granted the token once. Without it every later save makes the
+/// game replay the intro (found and confirmed in-game 2026-10-26). Never asked before the intro is done.
+pub const ONBOARDING_TOKEN: &str = "8d9430c2-d08f-493e-8028-2fc2d448fdb0";
+
+fn grant_onboarding_token(c: &Ctx, item_ids: &str) {
+    if !item_ids.split(',').any(|i| i.trim().eq_ignore_ascii_case(ONBOARDING_TOKEN)) {
+        return;
+    }
+    let Some(pid) = owner(c) else { return };
+    match c.state.repos.quantity(&pid, ONBOARDING_TOKEN) {
+        Ok(0) => match c.state.economy.grant(&pid, ONBOARDING_TOKEN, 1, "onboarding") {
+            Ok(Ok(_)) => log::info!(target: "powder.economy", "{pid} finished the intro: onboarding token granted"),
+            Ok(Err(e)) => log::warn!(target: "powder.economy", "onboarding token for {pid}: {}", e.message),
+            Err(e) => log::warn!(target: "powder.economy", "onboarding token for {pid}: {e:#}"),
+        },
+        Ok(_) => {}
+        Err(e) => log::warn!(target: "powder.economy", "onboarding token for {pid}: {e:#}"),
+    }
+}
+
 /// Store catalogue, filtered like the real service (assets.rs' OfferCatalog::query).
 fn get_offers(c: &Ctx) -> Reply {
     let q = query(c.req);
@@ -338,6 +361,9 @@ fn get_offers(c: &Ctx) -> Reply {
         (Ok(o), Ok(l)) => (o, l),
         (Err(e), _) | (_, Err(e)) => return Reply::internal_error(&format!("offers: offset/limit: {e}")),
     };
+    if let Some(ids) = q.get("itemIds") {
+        grant_onboarding_token(c, ids);
+    }
     let mut all = c.state.assets.catalog.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX);
     if c.state.assets.synthesizes_offers() && q.get("tags").is_none() && q.get("type").is_none() {
         for item in q.get("itemIds").unwrap_or("").split(',').filter(|s| !s.is_empty()) {
@@ -1151,6 +1177,28 @@ mod tests {
         let r = handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?type=shop"), &[]));
         assert_eq!(r.how, "catalog(2)");
         assert_eq!(handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?limit=x"), &[])).status, 500);
+    }
+
+    #[test]
+    fn the_intro_token_is_granted_when_the_game_asks_for_it() {
+        use super::ONBOARDING_TOKEN;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, pid) = files_state(tmp.path(), None);
+        let auth = auth_for(&st, &pid);
+        let auth = [("Authorization", auth.as_str())];
+        let ask = |headers: &[(&str, &str)]| {
+            handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?itemIds={}&offset=0&limit=100",
+                                             ONBOARDING_TOKEN.to_uppercase()), headers)).status
+        };
+        assert_eq!(ask(&[]), 200);
+        assert_eq!(st.repos.quantity(&pid, ONBOARDING_TOKEN).unwrap(), 0, "no session: nobody to grant it to");
+        assert_eq!(ask(&auth), 200);
+        assert_eq!(st.repos.quantity(&pid, ONBOARDING_TOKEN).unwrap(), 1);
+        assert_eq!(ask(&auth), 200);
+        assert_eq!(st.repos.quantity(&pid, ONBOARDING_TOKEN).unwrap(), 1, "once");
+        let other = handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?itemIds={SKI_A_ITEM}"), &auth));
+        assert_eq!(other.status, 200);
+        assert_eq!(st.repos.quantity(&pid, SKI_A_ITEM).unwrap(), 0, "other items are not granted by asking");
     }
 
     #[test]

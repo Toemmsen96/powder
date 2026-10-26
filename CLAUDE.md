@@ -201,6 +201,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
 - MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
   game's OpenSSL is pinned. Real entitlement/offer formats can't be recorded that way.
 - Imported stats (level) without a matching save make the game replay the intro ("progress, but at the start").
+  SOLVED 2026-10-26: the "intro finished" state is the inventory item 8d9430c2-d08f-493e-8028-2fc2d448fdb0. The game
+  looks up its offer right after the intro (and when it loads a save still holding the intro's completion record,
+  which it then drops from the save); Ubisoft's store granted it, Powder had no offer, so every later save replayed
+  the intro. The Rust server now grants it on that lookup (routes_ubi.rs ONBOARDING_TOKEN); not yet in Python.
   Confirmed three ways on 2026-10-26: a migrated live save (stats too small), 19.5 h playtime from that save, and
   setting all viewpoint bits (unlockable_exploration:2:*) by hand each brought the intro back. The game checks the
   save against the online stats; never change a player's unlock/level stats by hand (or restore an older save)
@@ -263,7 +267,11 @@ don't run commands against the user's real prefix or data: test on scratch copie
    ntdll NtCreateFile/NtOpenFile/NtReadFile: per-file read stats in the Mods tab, optional read log
    powder_asset_trace.log = "<ms> <file> <offset> <length>"). Steep's data: AnvilNext .forge archives
    ("scimitar", v27) + _patch_01/_02 per archive, Wwise .pck, Bink .bk2, terrain .tbf (tools/forge/ for the
-   format). Deferred: camera-relative fly (needs the view matrix); the Windows launcher loading mods through the
+   format). ASSET MODS CONFIRMED IN-GAME 2026-10-26: mods/<name>/client/forge/<Base>/ entries -> powder-wrap builds a
+   per-session <Base>_patch_03.forge; the game loads it and our entries win (mods/model_swap recolours the menu
+   rider's jacket via `forge.py swap`; its entries are Steep's data, generated locally by generate.sh, gitignored).
+   Client-mod API v2 adds on_frame and http (/_powder/ paths only, no session). Guide: native/sdk/README.md.
+   Deferred: decoding mesh/texture payloads (a new model needs that); camera-relative fly (needs the view matrix); the Windows launcher loading mods through the
    overlay (it injects client DLLs directly today); live POWDER_* delivery to non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
