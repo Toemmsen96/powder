@@ -19,6 +19,7 @@ forge.py pack    out/<id>_<name>/ -o modded.datafile                 # unpacked 
 forge.py stack   DataPC_extra.forge [--entries | -g NAME]            # base + _patch_NN, who provides what
 forge.py verify  DataPC_extra.forge [--decompress]
 forge.py build   OUT.forge --like DataPC_extra.forge <datafile or unpacked folder>...
+forge.py swap    DataPC_extra_chr.forge 0xeac3434be5 --with DataPC_extra_chr.forge 0x9c6dd7015f -o out/  # see below
 ```
 
 Example output:
@@ -145,10 +146,14 @@ Type ids, named after the entry names that carry them (G):
 
 This entry is one LZO1X stream block. Decompressed it is: u32 n, n x (u64 id, u32 size, u32 offset), u32 blob
 length, blob. It lists **every datafile** of the archive, sorted by id; the metadata entry and the prefetch
-list itself are left out. Most blobs are 4 zero bytes. G: the others are 4 + 11k bytes and look like
-dependency lists (`u16, u16 k, k x (u64 id, 3 bytes)`). `build` copies each id's blob from the newest archive
-in the stack that has it, and writes 4 zero bytes for a new id. Our builder reproduces
-`DataPC_extra_patch_02`'s list byte for byte (decompressed).
+list itself are left out. Most blobs are 4 zero bytes. The others are 4 + 11k bytes: `u16, u16 k, k x (u64 id,
+3 bytes)`, a list of the **entries the datafile depends on** (C on jacket materials: exactly the 4 textures of
+the material's TextureSet plus the badge atlas and maps; G in general, and the u16 and the 3 bytes are unknown).
+Dependencies can point into other archives: `DataPC_extra_chr` -> `_onboarding` 62 times, `DataPC_STP_Alpes`
+-> the character archives 35 times, and 974 Alpes dependencies are ids in no archive at all. `build` copies each
+id's blob from the newest archive in the stack that has it, and writes 4 zero bytes for a new id. An unpacked
+folder whose `datafile.json` has a `prefetch` key (hex) brings its own blob instead (`swap` writes one). Our
+builder reproduces `DataPC_extra_patch_02`'s list byte for byte (decompressed).
 
 ## How the patches override the base
 
@@ -205,6 +210,30 @@ What a modder must watch:
 - The name-record hash is unknown; if the engine checks it, our archives fail. Ubisoft Connect's "verify
   files" would flag a replaced file, but a bind mount in the session namespace never touches the real one.
 
+### Swapping an entry for another (`swap`)
+
+`swap BASE ENTRY --with SRC_BASE SRC_ENTRY -o DIR` writes an unpacked folder, `DIR/<id>_<name>/`. The folder
+holds ENTRY's id and name but SRC_ENTRY's content. Both entries are taken from the newest archive of their
+stacks. Feed the folder to `build`. The swap does this:
+
+- The first resource gets ENTRY's id and name. Its **nested object ids** are retargeted too: a resource's
+  sub-objects carry ids of their own, serialized as u64 id + u32 class hash. A jacket material has 6, its id
+  + 1..4 and two allocated elsewhere. When both payloads have the same length, every place where the two hold
+  different id-sized u64s (2^32..2^42) followed by the same class-hash-like u32 maps SRC's id to ENTRY's. Floats
+  and other parameters that differ are left alone: they are not followed by a class hash. For payloads of
+  different lengths, only the resource id is retargeted. `datafile.json` lists the mapping under `swap.ids`.
+- The other resources (e.g. the material's TextureSet) come along unchanged, under their own ids. The tool warns
+  if one of them refers to a retargeted id.
+- SRC's prefetch blob goes into `datafile.json` as `prefetch`, so the game is told to prefetch the new
+  dependencies, not the old ones.
+- Different entry types are refused (`--force` overrides).
+
+This is meant for swaps within one family: another colourway's material of the same mesh, for example. That is
+what `mods/model_swap/` does, and its README shows how an item in the save leads to its material through the
+character template. Checked on 3 jacket materials (1242 bytes each): the results equal the source except for
+the 7 retargeted ids, and the archives built from them pass `verify --decompress`. The game has not loaded them
+yet.
+
 ## Open questions
 
 - Does the engine load `_patch_03` (or `_patch_NN` in general)? This needs a live test. Search a memory dump
@@ -212,7 +241,7 @@ What a modder must watch:
   whether the asset trace shows reads of it.
 - The name record's u64 hash at +4: its algorithm, and whether the engine verifies it.
 - The meaning of the datafile header's `extra` u16s, the resource `pre` section (flag 1), and the prefetch
-  blobs beyond the 4-byte "none".
+  blobs' leading u16 and 3 bytes per dependency.
 - The rest of the GlobalMetaFile (the type list?), and whether a copied one with a new GUID is accepted.
 - Payload formats: TextureMap header (format code, dimensions, mips), Mip, Mesh. They are needed for real
   asset replacement (e.g. a DDS to TextureMap converter).

@@ -3,12 +3,12 @@
 
 The groundwork for asset mods: read an archive's index, pull an entry out raw or decompressed (datafiles are
 zstd-chunked, the prefetch list is LZO1X), split a datafile into its resources, see which of the base and its
-_patch_NN archives provides each entry id, and build datafiles/archives back (format-correct as far as the
-reader and the shipped archives go; not yet tried in the game). The format, and what is confirmed vs guessed,
-is in README.md next to this file.
+_patch_NN archives provides each entry id, build datafiles/archives back (format-correct as far as the
+reader and the shipped archives go; not yet tried in the game), and swap an entry's content for another's under
+its own id. The format, and what is confirmed vs guessed, is in README.md next to this file.
 
-Archives are opened read-only and read by seeking (never whole); only `extract`, `pack` and `build` write, to the
-paths given. Needs Python 3.10+ and `zstandard` or `pyzstd` for zstd; LZO1X is built in.
+Archives are opened read-only and read by seeking (never whole); only `extract`, `pack`, `build` and `swap` write,
+to the paths given. Needs Python 3.10+ and `zstandard` or `pyzstd` for zstd; LZO1X is built in.
 """
 
 from __future__ import annotations
@@ -594,19 +594,24 @@ def cmd_extract(a):
                     f.write(parse_block(data)[0].decompress())
             else:
                 df = parse_datafile(data)
-                os.makedirs(base, exist_ok=True)
-                manifest = []
-                for k, r in enumerate(df.resources):
-                    fn = f"{k:03d}_{r.id:016x}_{safe_name(r.name)}.payload"
-                    with open(os.path.join(base, fn), "wb") as f:
-                        f.write(r.payload)
-                    manifest.append({"id": f"{r.id:#x}", "type": f"{r.type:#010x}", "name": r.name,
-                                     "flag": r.flag, "pre": r.pre.hex(), "extra": list(r.extra), "payload": fn})
-                with open(os.path.join(base, "datafile.json"), "w") as f:
-                    json.dump({"entry": f"{e.id:#x}", "name": e.name, "type": f"{e.type:#010x}",
-                               "resources": manifest}, f, indent=1)
+                write_unpacked(base, e.id, e.name, e.type, df.resources)
                 line += f", {len(df.resources)} resource(s) -> {base}/"
         print(line)
+
+
+def write_unpacked(base: str, eid: int, name: str, typ: int, resources: list[Resource], **more):
+    """An unpacked datafile: one .payload per resource + datafile.json (`more` adds top-level keys)."""
+    os.makedirs(base, exist_ok=True)
+    manifest = []
+    for k, r in enumerate(resources):
+        fn = f"{k:03d}_{r.id:016x}_{safe_name(r.name)}.payload"
+        with open(os.path.join(base, fn), "wb") as f:
+            f.write(r.payload)
+        manifest.append({"id": f"{r.id:#x}", "type": f"{r.type:#010x}", "name": r.name,
+                         "flag": r.flag, "pre": r.pre.hex(), "extra": list(r.extra), "payload": fn})
+    with open(os.path.join(base, "datafile.json"), "w") as f:
+        json.dump({"entry": f"{eid:#x}", "name": name, "type": f"{typ:#010x}", "resources": manifest, **more},
+                  f, indent=1)
 
 
 def load_unpacked(d: str) -> tuple[dict, list[Resource]]:
@@ -688,6 +693,82 @@ def cmd_verify(a):
     return 1 if bad else 0
 
 
+ID_MIN, ID_MAX = 1 << 32, 1 << 42  # object ids in Steep's data are 35..41 bits; one shifted by a byte is not
+
+
+def newest_entry(base: str, spec: str) -> tuple[Forge, Entry]:
+    """An entry as the game loads it: from the newest archive of `base`'s stack that has it (one match only)."""
+    for p in reversed([p for p in patch_stack(base) if os.path.exists(p)]):
+        fg = Forge(p)
+        found = fg.find(spec)
+        if len(found) > 1:
+            sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(p)} match; give the id or the exact name")
+        if found:
+            return fg, found[0]
+    sys.exit(f"{spec}: in no archive of {base}'s stack")
+
+
+def remap_ids(src: bytes, dst: bytes, keep: set[int]) -> dict[int, int]:
+    """Object ids that `src` holds where the same-layout `dst` holds its own, compared offset by offset.
+
+    A resource's nested objects carry ids of their own (a material's 6 sub-objects: its id + 1..4 and two ids
+    allocated elsewhere). Each is serialized as u64 id + u32 class hash, like the resource itself (id + type).
+    A pair is taken where both sides hold a u64 in [ID_MIN, ID_MAX), the u64s differ, and the same class-hash-like
+    u32 follows (low and high byte nonzero: parameters such as floats or small ints that differ are not ids). Ids
+    in `keep` (resources the datafile carries along, e.g. a material's texture set) stay. Contradicting pairs drop.
+    """
+    pairs: dict[int, int] = {}
+    bad: set[int] = set()
+    o, end = 0, min(len(src), len(dst)) - 11
+    while o < end:
+        s, d = struct.unpack_from("<Q", src, o)[0], struct.unpack_from("<Q", dst, o)[0]
+        cls = src[o + 8:o + 12]
+        if (s != d and s not in keep and ID_MIN <= s < ID_MAX and ID_MIN <= d < ID_MAX and cls == dst[o + 8:o + 12]
+                and cls[0] and cls[3]):
+            if pairs.get(s, d) != d:
+                bad.add(s)
+            pairs[s] = d
+            o += 8
+        else:
+            o += 1
+    return {s: d for s, d in pairs.items() if s not in bad}
+
+
+def cmd_swap(a):
+    dfg, de = newest_entry(a.base, a.entry)
+    sfg, se = newest_entry(*a.src)
+    dd, sd = parse_datafile(dfg.read(de)), parse_datafile(sfg.read(se))
+    d0, s0 = dd.resources[0], sd.resources[0]
+    if d0.type != s0.type and not a.force:
+        sys.exit(f"swap: {de.name} is {fmt_type(d0.type)}, {se.name} is {fmt_type(s0.type)} (--force to do it anyway)")
+    keep = {r.id for r in sd.resources[1:]}
+    idmap = {s0.id: d0.id}
+    if len(s0.payload) == len(d0.payload):
+        idmap.update(remap_ids(s0.payload, d0.payload, keep | {s0.id}))
+    else:
+        print(f"  payloads differ in size ({len(s0.payload)} vs {len(d0.payload)}): only the resource id is retargeted")
+    payload = s0.payload
+    for s, d in idmap.items():
+        payload = payload.replace(struct.pack("<Q", s), struct.pack("<Q", d))
+        print(f"  id {s:#x} -> {d:#x}")
+    for r in sd.resources[1:]:
+        if any(struct.pack("<Q", s) in r.payload for s in idmap):
+            print(f"  warning: {r.name or hex(r.id)} (carried along unchanged) refers to a retargeted id")
+    res = [Resource(d0.id, s0.type, d0.name, payload, s0.flag, s0.pre, s0.extra)] + sd.resources[1:]
+    check = parse_datafile(build_datafile(res))
+    assert check.resources[0].id == de.id and [r.payload for r in check.resources] == [r.payload for r in res]
+    blob = read_prefetch(sfg).get(se.id)
+    out = os.path.join(a.out, f"{de.id:016x}_{safe_name(de.name)}")
+    more = {"swap": {"entry": f"{de.id:#x}", "entry_archive": os.path.basename(dfg.path), "from": f"{se.id:#x}",
+                     "from_name": se.name, "from_archive": os.path.basename(sfg.path),
+                     "ids": {f"{s:#x}": f"{d:#x}" for s, d in idmap.items()}}}
+    if blob is not None:
+        more["prefetch"] = blob.hex()
+    write_unpacked(out, de.id, de.name, d0.type, res, **more)
+    print(f"{out}/: {de.name} ({os.path.basename(dfg.path)}) now holds {se.name} ({os.path.basename(sfg.path)}), "
+          f"{len(res)} resource(s)" + (", its prefetch blob" if blob is not None else ""))
+
+
 def cmd_build(a):
     stack = [Forge(p) for p in patch_stack(a.like) if os.path.exists(p)]
     meta = stack[-1].read(stack[-1].by_id[META_ID])  # the newest archive's GlobalMetaFile ...
@@ -696,22 +777,27 @@ def cmd_build(a):
     blobs: dict[int, bytes] = {}
     for fg in stack:  # each id's prefetch blob as the newest archive that has it says
         blobs.update(read_prefetch(fg))
+    own_blobs: dict[int, bytes] = {}  # ... unless an unpacked folder brings its own (`swap` does)
     items = []
     for p in a.datafiles:
+        m = None
         if os.path.isdir(p):
-            _, res = load_unpacked(p)
+            m, res = load_unpacked(p)
             data = build_datafile(res, level=a.level)
         else:
             with open(p, "rb") as f:
                 data = f.read()
         df = parse_datafile(data)
         first = df.resources[0]
+        if m and "prefetch" in m:
+            own_blobs[first.id] = bytes.fromhex(m["prefetch"])
         items.append((first.id, first.type, first.name or f"File_{first.id:#x}", data))
         known = next((os.path.basename(fg.path) for fg in reversed(stack) if first.id in fg.by_id), "new id")
-        print(f"  {first.id:#018x}  {fmt_type(first.type):24} {len(data):9}  {first.name}  ({known})")
+        print(f"  {first.id:#018x}  {fmt_type(first.type):24} {len(data):9}  {first.name}  ({known})"
+              + (", own prefetch blob" if first.id in own_blobs else ""))
     if os.path.realpath(a.out) in {os.path.realpath(fg.path) for fg in stack}:
         sys.exit("build: refusing to overwrite an archive of the stack")
-    write_forge(a.out, items, meta, blobs)
+    write_forge(a.out, items, meta, {**blobs, **own_blobs})
     check = Forge(a.out)
     print(f"{a.out}: {check.count} entries ({len(items)} + GlobalMetaFile + PrefetchingFileInfos), "
           f"{os.path.getsize(a.out)} bytes")
@@ -764,6 +850,15 @@ def main(argv=None):
     p.add_argument("--keep-guid", action="store_true", help="keep the copied GlobalMetaFile's archive GUID")
     p.add_argument("--level", type=int, default=9)
     p.set_defaults(fn=cmd_build)
+    p = sp.add_parser("swap", help="an entry that keeps its id but holds another entry's content (unpacked folder)")
+    p.add_argument("base", help="the base archive of the entry to replace, e.g. DataPC_extra_chr.forge")
+    p.add_argument("entry", help="id (0x...) or exact name; taken from the newest archive of the stack")
+    p.add_argument("--with", dest="src", nargs=2, required=True, metavar=("SRC_BASE", "SRC_ENTRY"),
+                   help="the base archive and entry whose content goes in")
+    p.add_argument("-o", "--out", required=True,
+                   help="folder for the unpacked result (e.g. mods/<mod>/client/forge/<base>)")
+    p.add_argument("--force", action="store_true", help="allow entries of different types")
+    p.set_defaults(fn=cmd_swap)
     a = ap.parse_args(argv)
     if a.cmd == "extract" and not a.all and not a.entry:
         ap.error("extract: name entries or use --all")

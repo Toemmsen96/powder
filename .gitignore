@@ -16,3 +16,4 @@ launcher.toml
 /target/
 native/third_party/
 /mods/*/client/*.dll
+/mods/*/client/forge/
