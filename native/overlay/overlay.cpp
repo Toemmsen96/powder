@@ -48,6 +48,7 @@
 #include "codepatch.h"
 #include "modhost.h"
 #include "crashlog.h"
+#include "fixes.h"
 
 using json = nlohmann::json;
 
@@ -465,6 +466,9 @@ static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT 
     if (g_init && !mods_loaded) {
         mods_loaded = true;
         pw::crashlog_install(g_logpath);      // after the game's own handlers, so ours chains to them
+        wchar_t trainer[MAX_PATH];
+        _snwprintf(trainer, MAX_PATH, L"%spowder_trainer.json", g_dir);
+        pw::fixes_apply(trainer, olog_line);
         pw::mods_load(g_dir, g_base_url, olog_line);
     }
     if (g_init && g_rtv) {

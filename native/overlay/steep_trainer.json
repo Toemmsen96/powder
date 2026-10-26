@@ -5,7 +5,8 @@
   "[[module+root] + o1] + o2 ... = the struct; the position float3 is at struct + offset. Found in one",
   "session and not yet confirmed across launches/maps: the overlay takes the address most chains agree on.",
   "writers: the instructions that write the position (tools/trainer/watch.py) and their original bytes;",
-  "the overlay hooks them for noclip (native/overlay/noclip.cpp) and refuses if the bytes differ."
+  "the overlay hooks them for noclip (native/overlay/noclip.cpp) and refuses if the bytes differ.",
+  "fixes: crash guards (native/overlay/fixes.cpp): a NULL in null_guard at rva is pointed at a zeroed block."
  ],
  "module": "steep.exe",
  "position": {
@@ -238,6 +239,17 @@
    "rva": "0x37fd6b",
    "bytes": "0f297a300f283c24",
    "asm": "movaps [rdx+0x30],xmm7; movaps xmm7,[rsp]"
+  }
+ ],
+ "fixes": [
+  {
+   "name": "Alaska crash: no record for (rider, sport/gear key)",
+   "rva": "0x5c8f73",
+   "bytes": "8b401c488d8d28010000",
+   "null_guard": "rax",
+   "args_at": "0x5c8f42",
+   "args_bytes": "e849f7fdff488b0dc23ab602",
+   "asm": "call 0x5a8690 (lookup(ecx=rider, edx=key) -> NULL); mov eax,[rax+0x1c] faults (crash log 2026-10-26)"
   }
  ]
 }
