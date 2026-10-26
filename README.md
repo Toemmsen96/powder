@@ -555,7 +555,7 @@ A mod is a folder `mods/<name>/` with up to three parts; the full guide is
 | ---- | ---- | ------ |
 | `mod.lua` | **server mod** (Lua): events, HTTP/NEX hooks, admin tools | ✅ |
 | `client/*.dll` | **client mod** (native, hosted by the overlay): function and mid-function hooks on the game's code, per-frame logic, overlay panels, talking to its server half (`native/sdk/powder_api.h`) | ✅ (e.g. `mods/asset_trace`) |
-| `client/forge/<Base>/` | **asset mod**: entries of Steep's `.forge` archives that override the game's, loaded from a per-session `<Base>_patch_03.forge` | ✅ textures (`mods/custom_texture`), material swaps (`mods/model_swap`); 🟡 meshes (`mods/mesh_edit`, not yet seen in-game) |
+| `client/forge/<Base>/` | **asset mod**: entries of Steep's `.forge` archives that override the game's, loaded from a per-session `<Base>_patch_03.forge` | ✅ textures (`mods/custom_texture`), meshes (`mods/mesh_edit`), material swaps (`mods/model_swap`) |
 
 The asset tools: `tools/forge/forge.py` (the archives: list, extract, swap, build), `texture.py` (textures
 to and from PNG, all their formats), `mesh.py` (meshes to and from OBJ, also with a new topology),

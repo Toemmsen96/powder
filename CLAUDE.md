@@ -246,9 +246,9 @@ API. Everything below is on `rework/rust-server`.
   Confirmed in-game with mods/asset_trace (ntdll file hooks).
 - **Asset mods:** `mods/<name>/client/forge/<Base>/` -> powder-wrap builds a per-session `<Base>_patch_03.forge`
   (listed in `.powder-assets`, removed afterwards). CONFIRMED in-game: mods/model_swap (material swap) and
-  mods/custom_texture (a generated "POWDER" checkerboard on the menu rider's jacket). mods/mesh_edit (jacket
-  inflated 15 cm) is built but was never enabled in a session yet - test with
-  POWDER_CLIENT_MODS=custom_texture,mesh_edit (restart Lutris after changing its environment). Game data in
+  mods/custom_texture (a generated "POWDER" checkerboard on the menu rider's jacket) and mods/mesh_edit (the
+  jacket inflated 15 cm along its normals, all 4 LODs: it renders skinned and textured). Restart Lutris after
+  changing POWDER_CLIENT_MODS in its environment. Game data in
   mods is generated locally by each mod's generate.sh and gitignored.
 - **Tools:** tools/forge (forge.py archives + swap, texture.py, mesh.py, TEXTURES.md, MESHES.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and
@@ -257,7 +257,7 @@ API. Everything below is on `rework/rust-server`.
 
 ## Next steps (open)
 
-1. Confirm in-game: mods/mesh_edit (meshes), camera-relative Fly (live camera calibration).
+1. Confirm in-game: camera-relative Fly (live camera calibration).
 2. A fully new character model: a Blender export path with real skin weights (today weights come from the
    nearest original vertex), the skeleton resource (not decoded), new ids (entity, template selector entry,
    bootstrap item, prefetch).

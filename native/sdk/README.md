@@ -33,5 +33,5 @@ Extract an entry (`tools/forge/forge.py extract <archive> <id>`), change it, put
 folder) in `mods/<name>/client/forge/<Base>/`. powder-wrap builds `<Base>_patch_03.forge` from all named mods'
 entries for the session and removes it afterwards (confirmed in-game: mods/model_swap). Textures are decoded
 and re-encoded by `tools/forge/texture.py` (format: `tools/forge/TEXTURES.md`; example: mods/custom_texture);
-meshes by `tools/forge/mesh.py` (OBJ export/import, also with a new topology; `tools/forge/MESHES.md`; example:
+meshes by `tools/forge/mesh.py` (both confirmed in-game 2026-10-26) (OBJ export/import, also with a new topology; `tools/forge/MESHES.md`; example:
 mods/mesh_edit). Swapping whole entries/resources: `forge.py swap` (mods/model_swap).
