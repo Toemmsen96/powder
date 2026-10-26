@@ -39,7 +39,7 @@ def test_settings_roundtrip(tmp_path):
 
 def test_load_missing_returns_defaults(tmp_path):
     s = Settings.load(tmp_path / "does-not-exist.toml")
-    assert s.server_impl == "python"
+    assert s.server_impl == "rust"
     assert s.overlay is False
     assert s.game_command == []
     assert s.enabled_mods == []

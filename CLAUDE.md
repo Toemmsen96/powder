@@ -50,7 +50,8 @@ against the game once (2026-10-26, `POWDER_SERVER=rust powder-wrap`): Connect, d
 channel (the game's packets carry our signature), cloud-save upload all worked; no unrouted game requests. Known gaps: `/_powder/status`
 lists a game's address without its port (`NexChannel` does not know its UDP peer); entity/UGC/cloud-save files
 are sent whole (no Range / If-Modified-Since); websocket permessage-deflate is declined. Each port's commit
-message lists its behaviour differences. `run` logs a warning while the Rust server is untested; keep it accurate.
+message lists its behaviour differences. The Rust server is the default (powder-wrap and the Linux launcher, since
+2026-10-26); the Python server stays available (POWDER_SERVER=python) and the reference for parity.
 
 Toolchain: Rust 1.99.1 (latest stable as of 2026-10-26), pinned in rust-toolchain.toml; edition 2024
 (`rust-version = "1.99"`, resolver 3).

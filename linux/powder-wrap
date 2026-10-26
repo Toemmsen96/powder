@@ -16,8 +16,8 @@
 # Lutris: Configure the game > System options > Command prefix:  /path/to/powder/linux/powder-wrap
 # By hand:   WINEPREFIX=~/Games/ubisoft-connect powder-wrap <command...>
 #
-# Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (python | rust, default
-# python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version),
+# Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (rust | python, default
+# rust; without a Rust build it falls back to python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version),
 # POWDER_OVERLAY=1 (the in-game overlay, native/overlay/), POWDER_CLIENT_MODS=name,name (with the overlay: load
 # these client mods of this repo, mods/<name>/client/*.dll built by native/build.sh mods - your choice, nothing
 # loads unless named).
@@ -28,7 +28,7 @@ set -euo pipefail
 SELF=$(readlink -f "$0")
 REPO=$(cd "$(dirname "$SELF")/.." && pwd)
 CONFIG=${POWDER_CONFIG:-$REPO/config.toml}
-SERVER=${POWDER_SERVER:-python}
+SERVER=${POWDER_SERVER:-rust}
 # never a fixed name in /tmp (anyone could put a link there first); the inner stages use the outer's
 if [ "${POWDER_WRAP_STAGE:-outer}" != outer ] && [ -n "${POWDER_WRAP_LOG:-}" ]; then
     LOG=$POWDER_WRAP_LOG
@@ -120,6 +120,10 @@ server_command() {
         for b in "$REPO/target/release/powder-server" "$REPO/target/debug/powder-server"; do
             [ -x "$b" ] && { SERVER_CMD=("$b"); return; }
         done
+        if [ -z "${POWDER_SERVER:-}" ]; then       # the default, not asked for: the Python server instead
+            say "no Rust server built (cargo build --release in $REPO): using the Python server"
+            SERVER=python; server_command; return
+        fi
         die "no Rust server built (cargo build --release in $REPO)" ;;
     *) die "POWDER_SERVER must be python or rust, not $SERVER" ;;
     esac

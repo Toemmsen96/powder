@@ -54,7 +54,7 @@ class Server:
 @dataclass
 class Settings:
     repo: str                                              # powder repo root
-    server_impl: str = "python"                            # "python" | "rust"
+    server_impl: str = "rust"                              # "rust" | "python"
     overlay: bool = False
     steep_dir: str = ""                                    # POWDER_STEEP_DIR override ("" = autodetect)
     game_command: list[str] = field(default_factory=list)  # the command powder-wrap wraps; [] = not set
@@ -78,7 +78,7 @@ class Settings:
                    for s in data.get("servers", []) if isinstance(s, dict)]
         return cls(
             repo=str(data.get("repo") or _repo_root()),
-            server_impl=str(data.get("server_impl", "python")),
+            server_impl=str(data.get("server_impl", "rust")),
             overlay=bool(data.get("overlay", False)),
             steep_dir=str(data.get("steep_dir", "")),
             game_command=[str(x) for x in data.get("game_command", [])],

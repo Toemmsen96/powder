@@ -490,7 +490,7 @@ In Lutris: Configure the game (Steep, and Ubisoft Connect if you start it on its
 (show advanced options) > **Command prefix**: `/path/to/powder/linux/powder-wrap`. Close Ubisoft Connect
 first, and don't run another Powder server on the same `config.toml`. By hand:
 `WINEPREFIX=~/Games/ubisoft-connect linux/powder-wrap <command>`. Settings: `POWDER_CONFIG`,
-`POWDER_SERVER=python|rust`, `POWDER_WINE`; the server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log`
+`POWDER_SERVER=rust|python` (default `rust`, the Python server when no Rust build exists), `POWDER_WINE`; the server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log`
 (without `XDG_RUNTIME_DIR`: `~/.cache/powder/powder-wrap.log`).
 
 Steep itself needs its certificate check intercepted; on Windows the launcher injects the helper, on
