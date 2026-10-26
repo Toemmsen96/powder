@@ -19,6 +19,7 @@ forge.py pack    out/<id>_<name>/ -o modded.datafile                 # unpacked 
 forge.py stack   DataPC_extra.forge [--entries | -g NAME]            # base + _patch_NN, who provides what
 forge.py verify  DataPC_extra.forge [--decompress]
 forge.py build   OUT.forge --like DataPC_extra.forge <datafile or unpacked folder>...
+forge.py where   <game folder | archives...> --id 0x7a5374f895      # which datafiles hold a resource (header blocks)
 forge.py swap    DataPC_extra_chr.forge 0xeac3434be5 --with DataPC_extra_chr.forge 0x9c6dd7015f -o out/  # see below
 ```
 
@@ -206,7 +207,9 @@ The game has never loaded any of this. To get a modded entry in, in order of pre
 What a modder must watch:
 - Resources are duplicated inline. To retexture something, replace the resource in **every datafile that
   embeds it**. `show` lists a datafile's resources; search by resource id.
-- Payload formats: textures (TEXTURES.md, texture.py) and meshes (MESHES.md, mesh.py) are decoded.
+- Payload formats: textures (TEXTURES.md, texture.py) and meshes (MESHES.md, mesh.py) are decoded. Meshes go to
+  and from Blender as glTF, with their armature and weights (BLENDER.md). `where` lists every datafile that
+  holds a resource (all 27 archives in about 15 s).
 - The name-record hash is unknown; if the engine checks it, our archives fail. Ubisoft Connect's "verify
   files" would flag a replaced file, but a bind mount in the session namespace never touches the real one.
 

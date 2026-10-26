@@ -803,6 +803,44 @@ def cmd_build(a):
           f"{os.path.getsize(a.out)} bytes")
 
 
+def header_ids(fg: Forge, e: Entry) -> list[int]:
+    """The resource ids a datafile holds, from its header block alone (usually the entry's first few hundred
+    bytes, so a whole archive is scanned without reading its bodies)."""
+    fg.f.seek(e.offset)
+    head = fg.f.read(min(e.size, 4096))
+    try:
+        blk, _ = parse_block(head)
+    except (ValueError, struct.error):
+        blk, _ = parse_block(fg.read(e))
+    h = blk.decompress()
+    (n,) = struct.unpack_from("<H", h)
+    out, p = [], 2
+    for _ in range(n):
+        rid, _, k = struct.unpack_from("<QIH", h, p)
+        out.append(rid)
+        p += 14 + 2 * k
+    return out
+
+
+def cmd_where(a):
+    paths = []
+    for p in a.archives:
+        paths += sorted(glob.glob(os.path.join(p, "*.forge"))) if os.path.isdir(p) else [p]
+    want = {int(x, 16) for x in a.id}
+    hits = 0
+    for p in paths:
+        fg = Forge(p)
+        base = re.sub(r"_patch_\d+$", "", os.path.basename(p)[:-6])
+        for e in fg.entries:
+            if e.id in (META_ID, PREFETCH_ID):
+                continue
+            found = want & set(header_ids(fg, e))
+            for rid in sorted(found):
+                hits += 1
+                print(f"{rid:#018x} in {os.path.basename(p)}: entry {e.id:#x} {e.name}  (base {base})")
+    print(f"{hits} datafile(s) hold {', '.join(a.id)}", file=sys.stderr)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -850,6 +888,10 @@ def main(argv=None):
     p.add_argument("--keep-guid", action="store_true", help="keep the copied GlobalMetaFile's archive GUID")
     p.add_argument("--level", type=int, default=9)
     p.set_defaults(fn=cmd_build)
+    p = sp.add_parser("where", help="which datafiles hold a resource (by id; from the header blocks alone)")
+    p.add_argument("archives", nargs="+", help="archives, or a folder (the game folder: all its archives)")
+    p.add_argument("--id", action="append", required=True, help="resource id (hex); repeatable")
+    p.set_defaults(fn=cmd_where)
     p = sp.add_parser("swap", help="an entry that keeps its id but holds another entry's content (unpacked folder)")
     p.add_argument("base", help="the base archive of the entry to replace, e.g. DataPC_extra_chr.forge")
     p.add_argument("entry", help="id (0x...) or exact name; taken from the newest archive of the stack")
