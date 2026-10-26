@@ -1,10 +1,12 @@
-//! Game logic over the repositories: accounts and logins (accounts), Connect's chat channels (channels), cloud
-//! saves (cloudsaves), inventory and store (economy), profile entities (entities), friends (friends), challenge
-//! leaderboards (leaderboards), multiplayer sessions (matchmaking), new players (seed), player statistics (stats).
+//! Game logic over the repositories: bans and the whitelist (access), accounts and logins (accounts), Connect's
+//! chat channels (channels), cloud saves (cloudsaves), inventory and store (economy), profile entities (entities),
+//! friends (friends), challenge leaderboards (leaderboards), multiplayer sessions (matchmaking), new players
+//! (seed), player statistics (stats).
 //!
 //! [`Services`] is one server's set of them (the Python server's `Services`): the HTTPS routes, the NEX handlers,
 //! the demux and the admin CLI share it.
 
+pub mod access;
 pub mod accounts;
 pub mod channels;
 pub mod cloudsaves;
@@ -94,6 +96,17 @@ impl Services {
             login_failures: Arc::new(FailureLimiter::default()),
             config, assets, repos, sessions, accounts, mods,
         }
+    }
+
+    /// Kick whoever is online but no longer allowed, and the kicks the admin CLI asked for (see
+    /// access::AccessService::sweep); -> the profile ids kicked.
+    pub fn enforce_access(&self) -> anyhow::Result<Vec<String>> {
+        let connect: Vec<(String, String)> = self.connect_clients.snapshot().into_iter()
+            .filter_map(|c| {
+                let ip = c.peer.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_default();
+                Some((c.profile_id?, ip))
+            }).collect();
+        self.accounts.access.sweep(&connect)
     }
 
     /// Over an in-memory database, without a pack or mods (tests).

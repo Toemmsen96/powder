@@ -289,8 +289,11 @@ API. Everything below is on `rework/rust-server`.
 5. Python parity for the intro token (and anything else marked "not yet in Python" in commit messages).
 6. Windows: the launcher loading client mods through the overlay (it injects DLLs directly today);
    `native/build.ps1` overlay target.
-7. Server management interface (asked 2026-10-25): whitelist/blacklist, ban/kick, in accounts/sign-in + NEX/HTTPS
-   auth, admin CLI + admin mod entry. Decide storage (config vs DB) with the user.
+7. Server management: DONE in Rust (2026-10-26, services/access.rs, migration 0006): player/address bans
+   (temporary or not), whitelist (kv access/whitelist), kicks (SessionRegistry::kick closes NEX, websockets, demux);
+   CLI `admin bans|ban|unban|ban-ip|unban-ip|kick|whitelist`, applied by the running server's 5 s sweep; admin page
+   + api.admin.ban/kick/... Open: Python parity (the Python server ignores the rules; migration 0006 is shared),
+   in-game test of a kick (does the game show a clean disconnect?).
 8. Map / line builder mod (idea 2026-10-25, asked again 2026-10-26): Tier 1 curate/share Steep's own custom
    lines/challenges (UGC + entities already stored); Tier 2 an overlay planning tool drawing waypoints in 3D
    (needs the view matrix); Tier 3 new rideable geometry: static meshes (formats 6/8) now round-trip through

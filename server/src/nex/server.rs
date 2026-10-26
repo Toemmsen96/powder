@@ -95,8 +95,17 @@ impl NexServer {
 
     /// Send what was queued on the connections' outboxes (server-initiated requests).
     pub fn flush(&mut self, now: f64) {
-        for c in self.conns.values_mut() {
-            c.flush_outbox(now);
+        let mut kicked = vec![];
+        for (addr, c) in self.conns.iter_mut() {
+            if c.outbox.kicked() {
+                c.send_disconnect();
+                kicked.push(*addr);
+            } else {
+                c.flush_outbox(now);
+            }
+        }
+        for addr in kicked {
+            self.drop_conn(addr, "kicked");
         }
     }
 
@@ -303,9 +312,9 @@ impl NexServer {
             c.closed = true;
             c.outbox.close();
             // a later login of the same player shares the session's channels: clear the connection there, unless
-            // it was already replaced by a newer one
+            // it was already replaced by a newer one (a kick already cleared it)
             let channel: Arc<dyn crate::core::sessions::NexChannel> = c.outbox.clone();
-            if let Some(s) = c.session.take().filter(|s| s.channels.clear_nex_if(&channel))
+            if let Some(s) = c.session.take().filter(|s| s.channels.clear_nex_if(&channel) || c.outbox.kicked())
                 && let Some(f) = &self.on_disconnect {
                     f(s.profile_id());
                 }
@@ -433,6 +442,34 @@ mod tests {
         let call = rmc::build_request("TestProtocol", call_id, "TestProtocol::Echo_V1", &params.take());
         Packet { kind: DATA, flags: FLAG_RELIABLE | FLAG_NEED_ACK, sequence_id: seq, signature: sig,
                  payload: secure::encrypt_payload(key, seq, &call, false), ..Default::default() }
+    }
+
+    /// A kick (the session's Channels::close) closes the game's connection on the server's next pass, and the
+    /// player leaves matchmaking as if the game had gone.
+    #[test]
+    fn a_kicked_game_is_disconnected() {
+        use crate::core::sessions::{NexChannel, SessionRegistry};
+        let (mut srv, sent) = server(echo_dispatcher());
+        let left: Arc<Mutex<Vec<String>>> = Arc::default();
+        let l = left.clone();
+        srv.on_disconnect = Some(Box::new(move |pid| l.lock().push(pid.to_string())));
+        let game: SocketAddr = "192.0.2.50:3074".parse().unwrap();
+        handshake(&mut srv, &sent, game, 0.0);
+        let registry = SessionRegistry::new();
+        let player = crate::core::identity::Player { profile_id: "p1".into(), user_id: "p1".into(), name: "P".into() };
+        let session = registry.issue(player, "192.0.2.50", "");
+        let c = srv.conns.get_mut(&game).unwrap();
+        let channel: Arc<dyn NexChannel> = c.outbox.clone();
+        session.channels.set_nex(Some(channel));
+        c.session = Some(session);
+        srv.flush(1.0);
+        assert!(srv.conns.contains_key(&game), "not kicked: stays");
+        assert!(registry.kick("p1"));
+        srv.flush(1.1);
+        assert!(!srv.conns.contains_key(&game));
+        let bye = last(&sent);
+        assert_eq!((bye.kind, bye.has(FLAG_NEED_ACK)), (DISCONNECT, true));
+        assert_eq!(*left.lock(), vec!["p1".to_string()]);
     }
 
     #[test]

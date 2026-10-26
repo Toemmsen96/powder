@@ -3,6 +3,7 @@
 --   a player's inventory, grant or remove credits and items
 --   a player's stats (level, XP, ...): show and edit, reset a player
 --   a message to everyone online (websocket notification, optionally a Ubisoft Connect chat message)
+--   kick and ban players, ban addresses, the whitelist (also from the CLI: `powder-server admin bans`, ...)
 --
 -- Only server admins can use it: list their profile ids in config.toml (`powder-server admin accounts` shows
 -- them) and sign in on the page with that account's email and password:
@@ -51,11 +52,30 @@ local PAGE = [==[<!doctype html>
       <label class="inline"><input name="chat" type="checkbox"> also as a Ubisoft Connect chat message</label>
       <button>Send</button>
     </form>
+    <h2>Who may play</h2>
+    <label class="inline"><input id="whitelist" type="checkbox"> Whitelist: only the players on it (and the admins)
+      get in</label>
+    <form id="ban-ip" class="row">
+      <input name="address" placeholder="address or range, e.g. 192.0.2.7 or 192.0.2.0/24" required>
+      <select name="duration"><option value="">permanent</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="2592000">30 days</option></select>
+      <input name="reason" maxlength="200" placeholder="reason (shown to them)">
+      <button class="danger">Ban address</button>
+    </form>
+    <table id="rules"><thead><tr><th>Rule</th><th>Who</th><th>Until</th><th>Reason</th><th>By</th><th></th></tr>
+      </thead><tbody></tbody></table>
     <h2>Players <button id="refresh" class="small">Refresh</button></h2>
     <table id="players"><thead><tr><th>Name</th><th>Online</th><th>Level</th><th>Credits</th><th>Email</th>
       <th>Since</th><th></th></tr></thead><tbody></tbody></table>
     <section id="player" hidden>
       <h2 id="player-title"></h2>
+      <form id="ban" class="row">
+        <button type="button" id="kick">Kick</button>
+        <select name="duration"><option value="">permanent</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="2592000">30 days</option></select>
+        <input name="reason" maxlength="200" placeholder="reason (shown to them)">
+        <button class="danger">Ban</button>
+        <button type="button" id="unban" hidden>Lift the ban</button>
+        <button type="button" id="allow">Put on the whitelist</button>
+      </form>
       <form id="grant" class="row">
         <input name="item" placeholder="credits or an item id" required>
         <input name="amount" type="number" step="1" placeholder="amount (negative removes)" required>
@@ -92,7 +112,7 @@ h2 { font-size: 1rem; margin: 1.6rem 0 .6rem; display: flex; gap: .6rem; align-i
 form#login { max-width: 360px; display: grid; gap: .6rem; }
 label { display: grid; gap: .2rem; color: var(--muted); }
 label.inline { display: flex; align-items: center; gap: .3rem; }
-input { font: inherit; padding: .4rem .5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+input, select { font: inherit; padding: .4rem .5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
         color: var(--fg); min-width: 0; }
 button { font: inherit; padding: .4rem .8rem; border: 1px solid var(--accent); background: var(--accent); color: #fff;
          border-radius: 6px; cursor: pointer; }
@@ -169,11 +189,15 @@ async function loadPlayers() {
   $("#who").textContent = "signed in as " + data.me.name;
   const body = $("#players tbody");
   body.replaceChildren();
+  await loadAccess();
   for (const p of list(data.players)) {
     const tr = document.createElement("tr");
     if (selected && selected.profile_id === p.profile_id) tr.className = "selected";
     const name = cell(tr, p.name);
     if (p.admin) badge(name, "admin", true);
+    if (p.banned) badge(name, "banned", true);
+    if (p.allowed) badge(name, "whitelisted", false);
+    if (selected && selected.profile_id === p.profile_id) { selected = p; showAccess(p); }
     const online = cell(tr, "");
     badge(online, "game", p.game); badge(online, "Connect", p.connect);
     cell(tr, p.level, "num"); cell(tr, p.credits, "num"); cell(tr, p.email || "(no account)");
@@ -199,7 +223,43 @@ async function openPlayer(p) {
     inv.appendChild(tr);
   }
   renderStats(list(data.stats));
+  showAccess(p);
   await loadPlayers();
+}
+
+function until(t) { return t ? new Date(t * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : "permanent"; }
+
+async function loadAccess() {
+  const data = await call("access");
+  $("#whitelist").checked = !!data.whitelist;
+  const body = $("#rules tbody");
+  body.replaceChildren();
+  for (const r of list(data.rules)) {
+    const tr = document.createElement("tr");
+    const kind = { ban_player: "banned player", ban_ip: "banned address", allow_player: "whitelisted" }[r.kind];
+    cell(tr, kind || r.kind); cell(tr, r.name || r.value); cell(tr, r.kind === "allow_player" ? "" : until(r.expires));
+    cell(tr, r.reason); cell(tr, r.by);
+    const action = { ban_player: ["unban", { id: r.value }], ban_ip: ["unban_ip", { address: r.value }],
+                     allow_player: ["disallow", { id: r.value }] }[r.kind];
+    const td = cell(tr, "");
+    if (action) {
+      const btn = document.createElement("button");
+      btn.textContent = "Remove";
+      btn.addEventListener("click", () => run(async () => { await call(action[0], action[1]); await loadPlayers(); }));
+      td.appendChild(btn);
+    }
+    body.appendChild(tr);
+  }
+  if (!body.children.length) {
+    const tr = document.createElement("tr");
+    cell(tr, "no bans, nobody on the whitelist").colSpan = 6;
+    body.appendChild(tr);
+  }
+}
+
+function showAccess(p) {
+  $("#unban").hidden = !p.banned;
+  $("#allow").textContent = p.allowed ? "Take off the whitelist" : "Put on the whitelist";
 }
 
 function renderStats(stats) {
@@ -269,6 +329,52 @@ $("#broadcast").addEventListener("submit", (ev) => {
     ev.target.reset();
   });
 });
+
+$("#whitelist").addEventListener("change", (ev) => run(async () => {
+  const on = ev.target.checked;
+  if (on && !confirm("Switch the whitelist on? Everyone not on it (except the admins) is kicked now.")) {
+    ev.target.checked = false; return;
+  }
+  await call("whitelist", { on });
+  status("whitelist " + (on ? "on" : "off")); await loadPlayers();
+}));
+
+$("#ban-ip").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  run(async () => {
+    const r = await call("ban_ip", { address: f.get("address"), seconds: Number(f.get("duration")) || null,
+                                     reason: f.get("reason") });
+    status("banned " + r.result); ev.target.reset(); await loadPlayers();
+  });
+});
+
+$("#ban").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  if (!selected || !confirm("Ban " + selected.name + "? They are kicked now.")) return;
+  run(async () => {
+    await call("ban", { id: selected.profile_id, seconds: Number(f.get("duration")) || null, reason: f.get("reason") });
+    status(selected.name + " is banned"); ev.target.reset(); await loadPlayers();
+  });
+});
+
+$("#kick").addEventListener("click", () => {
+  if (!selected) return;
+  run(async () => {
+    const r = await call("kick", { id: selected.profile_id, reason: $("#ban").elements.reason.value });
+    status(r.result.online ? selected.name + " was kicked" : selected.name + " is not online");
+    await loadPlayers();
+  });
+});
+
+$("#unban").addEventListener("click", () => run(async () => {
+  await call("unban", { id: selected.profile_id }); status("lifted the ban of " + selected.name); await loadPlayers();
+}));
+
+$("#allow").addEventListener("click", () => run(async () => {
+  await call(selected.allowed ? "disallow" : "allow", { id: selected.profile_id }); await loadPlayers();
+}));
 
 run(loadPlayers);
 ]==]
@@ -437,7 +543,58 @@ return function(api)
         return json(200, { entries = entries, last = feed_seq })
     end
 
-    local READS = { players = true, player = true, feed = true }
+    function actions.access()
+        return json(200, api.admin.access())
+    end
+
+    local function seconds_of(body)
+        local n = math.tointeger(tonumber(body.seconds))
+        if n and n > 0 then return n end
+        return nil
+    end
+
+    local function reason_of(body)
+        return string.sub(tostring(body.reason or ""), 1, 200)
+    end
+
+    function actions.kick(req, admin, body)
+        local why = reason_of(body)
+        api.log.warn(admin.name, "kicks", tostring(body.id), why)
+        local online = api.admin.kick(tostring(body.id), why ~= "" and why or ("kicked by " .. admin.name))
+        return json(200, { ok = true, result = { online = online } })
+    end
+
+    function actions.ban(req, admin, body)
+        return result(api.admin.ban(tostring(body.id), reason_of(body), seconds_of(body), admin.name))
+    end
+
+    function actions.unban(req, admin, body)
+        return json(200, { ok = true, result = api.admin.unban(tostring(body.id), admin.name) })
+    end
+
+    function actions.ban_ip(req, admin, body)
+        return result(api.admin.ban_ip(tostring(body.address or ""), reason_of(body), seconds_of(body), admin.name))
+    end
+
+    function actions.unban_ip(req, admin, body)
+        local had, err = api.admin.unban_ip(tostring(body.address or ""), admin.name)
+        if had == nil then return fail(400, err) end
+        return json(200, { ok = true, result = had })
+    end
+
+    function actions.whitelist(req, admin, body)
+        return result(api.admin.set_whitelist(body.on == true, admin.name))
+    end
+
+    function actions.allow(req, admin, body)
+        return result(api.admin.allow(tostring(body.id), admin.name))
+    end
+
+    function actions.disallow(req, admin, body)
+        return json(200, { ok = true, result = api.admin.disallow(tostring(body.id)) })
+    end
+
+    local READS = { players = true, player = true, feed = true, access = true }
 
     api.before_http("*", "/_powder/admin*", function(req)
         local path, method = req.path, req.method

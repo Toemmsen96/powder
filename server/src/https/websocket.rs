@@ -135,12 +135,17 @@ where
     let who = session.as_ref().map(|s| s.player.name.as_str()).unwrap_or("unknown");
     log::info!(target: "powder.https", "websocket open ({connection_id}) for {who}");
     let result = async {
-        let mut pushing = registered.is_some();
+        let pushing = registered.is_some();
         loop {
             tokio::select! {
                 msg = pushed.recv(), if pushing => match msg {
                     Some(msg) => ws.send(Message::text(dumps(&msg))).await?,
-                    None => pushing = false,
+                    None => {
+                        // the session closed the queue: the player was kicked
+                        log::info!(target: "powder.https", "websocket {connection_id}: closed by the server (kick)");
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
                 },
                 incoming = ws.next() => match incoming {
                     Some(Ok(Message::Text(t))) => {

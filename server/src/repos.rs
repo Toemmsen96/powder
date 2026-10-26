@@ -547,6 +547,64 @@ impl Repos {
         }
         Ok(())
     }
+
+    // ---- access (bans, whitelist) -------------------------------------------------------------------
+    fn access_row(r: &Row) -> rusqlite::Result<AccessRow> {
+        Ok(AccessRow { kind: r.get("kind")?, value: r.get("value")?, reason: r.get("reason")?,
+                       created_at: r.get("created_at")?, expires: r.get("expires")?, by: r.get("by")? })
+    }
+
+    /// Every rule, expired ones included (the caller decides), oldest first.
+    pub fn access_rules(&self) -> Result<Vec<AccessRow>> {
+        self.db.query("SELECT * FROM access_rules ORDER BY created_at, kind, value", [], Self::access_row)
+    }
+
+    /// Add or replace the rule (kind, value).
+    pub fn set_access_rule(&self, kind: &str, value: &str, reason: &str, expires: Option<i64>, by: &str) -> Result<()> {
+        self.db.execute("INSERT INTO access_rules(kind, value, reason, created_at, expires, by) VALUES (?,?,?,?,?,?) \
+                         ON CONFLICT(kind, value) DO UPDATE SET reason = excluded.reason, \
+                         created_at = excluded.created_at, expires = excluded.expires, by = excluded.by",
+                        params![kind, value, reason, iso_now(), expires, by])?;
+        Ok(())
+    }
+
+    /// -> whether there was one.
+    pub fn delete_access_rule(&self, kind: &str, value: &str) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM access_rules WHERE kind = ? AND value = ?", params![kind, value])? > 0)
+    }
+
+    pub fn delete_expired_access_rules(&self, now: i64) -> Result<usize> {
+        self.db.execute("DELETE FROM access_rules WHERE expires IS NOT NULL AND expires <= ?", [now])
+    }
+
+    pub fn add_kick_request(&self, profile_id: &str, reason: &str) -> Result<()> {
+        self.db.execute("INSERT INTO kick_requests(profile_id, reason, requested_at) VALUES (?,?,?) \
+                         ON CONFLICT(profile_id) DO UPDATE SET reason = excluded.reason, \
+                         requested_at = excluded.requested_at", params![lc(profile_id), reason, iso_now()])?;
+        Ok(())
+    }
+
+    /// The waiting kick requests, removed: (profile id, reason).
+    pub fn take_kick_requests(&self) -> Result<Vec<(String, String)>> {
+        self.db.tx(|| {
+            let rows = self.db.query("SELECT profile_id, reason FROM kick_requests ORDER BY requested_at", [],
+                                     |r| Ok((r.get(0)?, r.get(1)?)))?;
+            self.db.execute("DELETE FROM kick_requests", [])?;
+            Ok(rows)
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccessRow {
+    /// "ban_player", "ban_ip" or "allow_player"
+    pub kind: String,
+    pub value: String,
+    pub reason: String,
+    pub created_at: String,
+    /// Unix seconds; None: until removed.
+    pub expires: Option<i64>,
+    pub by: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

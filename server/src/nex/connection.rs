@@ -14,7 +14,7 @@
 //! message passes MAX_MESSAGE_BYTES is closed.
 
 use crate::config::CheckSignatures;
-use super::prudp::{Packet, CONNECT, DATA, FLAG_ACK, FLAG_NEED_ACK, FLAG_RELIABLE};
+use super::prudp::{Packet, CONNECT, DATA, DISCONNECT, FLAG_ACK, FLAG_NEED_ACK, FLAG_RELIABLE};
 use super::{rmc, secure};
 use crate::core::sessions::{NexChannel, PlayerSession};
 use parking_lot::Mutex;
@@ -55,12 +55,15 @@ pub struct Outbox {
     queue: Mutex<Vec<QueuedRequest>>,
     next_call_id: AtomicU32,
     closed: AtomicBool,
+    /// Kicked: the server closes the connection on its next pass.
+    kicked: AtomicBool,
     wake: Arc<Notify>,
 }
 
 impl Outbox {
     pub fn new(wake: Arc<Notify>) -> Outbox {
-        Outbox { queue: Mutex::default(), next_call_id: AtomicU32::new(0x10000), closed: AtomicBool::new(false), wake }
+        Outbox { queue: Mutex::default(), next_call_id: AtomicU32::new(0x10000), closed: AtomicBool::new(false),
+                 kicked: AtomicBool::new(false), wake }
     }
 
     fn call_id(&self, call_id: Option<u32>) -> u32 {
@@ -72,6 +75,10 @@ impl Outbox {
         self.closed.store(true, Ordering::Relaxed);
         self.queue.lock().clear();
     }
+
+    pub fn kicked(&self) -> bool {
+        self.kicked.load(Ordering::Relaxed)
+    }
 }
 
 impl NexChannel for Outbox {
@@ -82,6 +89,11 @@ impl NexChannel for Outbox {
             self.wake.notify_one();
         }
         call_id
+    }
+
+    fn disconnect(&self) {
+        self.kicked.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
     }
 }
 
@@ -266,6 +278,16 @@ impl Connection {
         let call_id = self.outbox.call_id(call_id);
         self.send_message(&rmc::build_request(protocol, call_id, method, params), now);
         call_id
+    }
+
+    /// Tell the client we close the connection (best effort: it times out otherwise, as nothing answers it).
+    pub fn send_disconnect(&mut self) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let p = self.reply(DISCONNECT, FLAG_RELIABLE | FLAG_NEED_ACK, seq);
+        for _ in 0..3 {
+            self.send(&p, None);
+        }
     }
 
     /// Send the requests queued on the outbox.

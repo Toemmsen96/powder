@@ -28,6 +28,7 @@ use crate::constants::APP_ID;
 use crate::core::identity::{AccountResolver, DefaultResolver, LoginRequest, Player};
 use crate::core::sessions::{PlayerSession, SessionRegistry};
 use crate::repos::{AccountField, AccountRow, Repos};
+use crate::services::access::AccessService;
 use crate::services::seed::create_player;
 use crate::util::{random_bytes, token_urlsafe};
 use base64::Engine;
@@ -180,6 +181,8 @@ pub struct AccountService {
     pub config: Arc<Config>,
     pub repos: Arc<Repos>,
     pub sessions: Arc<SessionRegistry>,
+    /// Bans and the whitelist: checked at sign-in, registration and every ticket lookup.
+    pub access: Arc<AccessService>,
     resolver: RwLock<Arc<dyn AccountResolver>>,
 }
 
@@ -187,7 +190,8 @@ impl AccountService {
     pub fn new(config: Arc<Config>, repos: Arc<Repos>, sessions: Arc<SessionRegistry>) -> Self {
         let (c, r) = (config.clone(), repos.clone());
         let resolver = DefaultResolver::new(config.players.bind.clone(), Arc::new(move || default_profile_id(&c, &r)));
-        Self { config, repos, sessions, resolver: RwLock::new(Arc::new(resolver)) }
+        let access = Arc::new(AccessService::new(config.clone(), repos.clone(), sessions.clone()));
+        Self { config, repos, sessions, access, resolver: RwLock::new(Arc::new(resolver)) }
     }
 
     /// Install another resolver (who a login is while there are no accounts).
@@ -230,6 +234,10 @@ impl AccountService {
     pub fn register_from(&self, email: &str, password: &str, name: &str, client_ip: &str) -> Result<AccountRow> {
         if self.config.players.registration == Registration::Closed {
             return account_err("This server does not take registrations; ask its host for an account.");
+        }
+        if let Some(refusal) = self.access.check_address(client_ip)? {
+            log::warn!(target: "powder.accounts", "registration from {client_ip} refused: {}", refusal.message());
+            return Err(Error::Account(refusal.message()));
         }
         self.new_account(email, password, name, may_take_over(client_ip))
     }
@@ -403,6 +411,9 @@ impl AccountService {
         // Ubisoft Connect and its parts
         let connect = if !app_id.is_empty() && app_id != APP_ID { app_id.as_str() } else { "" };
         let (profile_id, how) = self.identify(req)?;
+        if let Some(refusal) = self.access.check(&profile_id, &req.client_ip)? {
+            return Err(Error::Auth(format!("{profile_id}: {}", refusal.message())));
+        }
         let session = self.sessions.issue(self.player(&profile_id)?, &req.client_ip, connect);
         log::info!(target: "powder.accounts", "login {} ({profile_id}) from {}{}: {how}", session.player.name,
                    req.client_ip, if connect.is_empty() { "" } else { " [Ubisoft Connect]" });
@@ -460,8 +471,19 @@ impl AccountService {
         self.config.server.strict_tickets || self.config.server.public
     }
 
-    /// HTTPS `Ubi_v1 t=` ticket or NEX LoginWithToken token -> session (lenient fallback, see the module doc).
+    /// HTTPS `Ubi_v1 t=` ticket or NEX LoginWithToken token -> session (lenient fallback, see the module doc), or
+    /// None, also for a player who is banned (or not on the whitelist) by now.
     pub fn session_for_ticket(&self, ticket: &str, client_ip: &str) -> anyhow::Result<Option<Arc<PlayerSession>>> {
+        let Some(s) = self.find_session(ticket, client_ip)? else { return Ok(None) };
+        if let Some(refusal) = self.access.check(s.profile_id(), client_ip)? {
+            log::warn!(target: "powder.accounts", "ticket of {} from {client_ip} refused: {}", s.player.name,
+                       refusal.message());
+            return Ok(None);
+        }
+        Ok(Some(s))
+    }
+
+    fn find_session(&self, ticket: &str, client_ip: &str) -> anyhow::Result<Option<Arc<PlayerSession>>> {
         let s = if ticket.is_empty() { None } else { self.sessions.by_token(ticket) };
         if s.is_some() || self.strict_tickets() {
             return Ok(s);
