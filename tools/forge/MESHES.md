@@ -173,7 +173,7 @@ payload passes `check`. Tested on the jacket: LOD0 subdivided (5854 -> 21165 ver
 LOD0 replaced by LOD3's geometry (226 vertices), and the unchanged OBJ (the same triangles, positions, UVs and
 skinning; only the normals' bytes differ, because they are renormalised). Also tested on a goggle submesh (empty
 section 2) and a ski-box submesh (subset draw list). The archives built from these pass `forge.py verify
---decompress`. The game has not loaded a rebuilt topology yet (`mods/shoulder_pads` is that test).
+--decompress`. The game loads a rebuilt topology (confirmed in-game with `mods/shoulder_pads`).
 
 A vertex that is an original vertex (the same position, UV and normal; at seams the best match among the vertices
 at that position) keeps that vertex's bytes, so an unchanged file gives back every position, UV, normal and
@@ -218,8 +218,8 @@ topology, and `--glb` carries real skin weights. Still to do:
    - draw lists of the "other" form;
    - whether the engine checks section 2 against section 1. Section 2 is written as a plain copy, not
      reordered.
-7. **An in-game test** of a rebuilt topology: same-topology edits are confirmed (`mods/mesh_edit`); new geometry
-   with explicit weights is `mods/shoulder_pads`.
+7. **In-game:** same-topology edits are confirmed (`mods/mesh_edit`), and so is new geometry with explicit
+   weights (`mods/shoulder_pads`).
 
 ## Results of `mesh.py check` (all 27 archives, 2026-10-26)
 

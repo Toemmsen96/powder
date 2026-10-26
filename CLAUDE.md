@@ -255,8 +255,8 @@ API. Everything below is on `rework/rust-server`.
   bone names = CRC-32 (94 known: SkelAddon strings + Mixamo names; others `0x<hash>`; hierarchy guessed), real
   weights, bones the mesh lacks appended, rigid parts via Parent to Bone or `name@Bone`, static formats 6/8
   (handedness = position w sign, confirmed). Round trips exact (also through headless Blender 4.5.9/5.0.1/5.2.2:
-  `blender --factory-startup -b --python s.py -- args`, or `uv pip install bpy` under Python 3.11). mods/shoulder_pads = first in-game test of new
-  geometry with explicit weights (NOT yet confirmed in-game). `forge.py where <game> --id X` lists the datafiles
+  `blender --factory-startup -b --python s.py -- args`, or `uv pip install bpy` under Python 3.11). mods/shoulder_pads = new geometry with explicit
+  weights, CONFIRMED in-game (2026-10-26: the pads render and follow the arms). `forge.py where <game> --id X` lists the datafiles
   holding a resource. Blender add-on `tools/forge/powder_blender.py` (sidebar tab Powder: Import item / Write mod,
   runs the tools in Blender's Python). The user's Blender 5.2.3 (Steam) has Blender Lab's MCP add-on; with the
   `blender` MCP server connected, Claude can drive it (execute_blender_code, screenshots).
@@ -274,8 +274,8 @@ API. Everything below is on `rework/rust-server`.
 
 ## Next steps (open)
 
-1. Confirm in-game: camera-relative Fly (live camera calibration); mods/shoulder_pads (rebuilt topology +
-   explicit weights); then a mod that adds a bone / grows a bone map (export --rig).
+1. Confirm in-game: camera-relative Fly (live camera calibration); then a mod that adds a bone / grows a bone
+   map (export --rig).
 2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch), e.g.
    Master Chief as a new costume (asked 2026-10-26; today it replaces costume 016). Game Bootstrap Settings
    (0x800) is one 146 MB datafile of 17,292 resources. The skeleton resource (hierarchy) is still not decoded.
