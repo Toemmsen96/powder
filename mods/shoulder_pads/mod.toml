@@ -1,0 +1,2 @@
+version = "0.1"
+description = "Asset-mod test: new geometry from a glTF (Blender) file - orange shoulder pads on the default male rider's jacket (STP_M_Jacket_001), bound to the upper-arm bones (forge _patch_03 override)"
