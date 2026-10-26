@@ -17,7 +17,10 @@
 # By hand:   WINEPREFIX=~/Games/ubisoft-connect powder-wrap <command...>
 #
 # Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (python | rust, default
-# python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version).
+# python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version),
+# POWDER_OVERLAY=1 (the in-game overlay, native/overlay/), POWDER_CLIENT_MODS=name,name (with the overlay: load
+# these client mods of this repo, mods/<name>/client/*.dll built by native/build.sh mods - your choice, nothing
+# loads unless named).
 # Log: $XDG_RUNTIME_DIR/powder-wrap.log, without XDG_RUNTIME_DIR ${XDG_CACHE_HOME:-~/.cache}/powder/powder-wrap.log.
 # Close Ubisoft Connect before starting: a Connect already running outside the session would be reused.
 set -euo pipefail
@@ -271,6 +274,20 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
                     cp -f "$ov" "$sdir/powder_overlay.dll"
                     # the Trainer tab's data for this game build (player position chains, noclip writers)
                     cp -f "$REPO/native/overlay/steep_trainer.json" "$sdir/powder_trainer.json" 2>/dev/null || true
+                    # client mods the player named (native code: only these, from this repo)
+                    rm -rf "$sdir/powder_mods"
+                    if [ -n "${POWDER_CLIENT_MODS:-}" ]; then
+                        mkdir -p "$sdir/powder_mods"
+                        for m in ${POWDER_CLIENT_MODS//,/ }; do
+                            case $m in */*|.*|'') say "client mod name '$m' ignored"; continue ;; esac
+                            if compgen -G "$REPO/mods/$m/client/*.dll" >/dev/null; then
+                                cp -f "$REPO/mods/$m/client/"*.dll "$sdir/powder_mods/"
+                                say "client mod $m loads with the overlay"
+                            else
+                                say "client mod $m has no mods/$m/client/*.dll (native/build.sh mods): skipped"
+                            fi
+                        done
+                    fi
                     rm -f "$sdir/powder_overlay.log"
                     p=$(https_port)
                     url="https://public-ubiservices.ubi.com"
@@ -291,6 +308,7 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
             rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/armer.exe" "$helper/powder_tls.pin"
             # the overlay (if it was deployed); powder_overlay.log is kept, like powder_tls.log
             rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg" "$helper/powder_trainer.json"
+            rm -rf "$helper/powder_mods"
             winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
         fi
         if winereg delete "$key" /f; then

@@ -13,6 +13,8 @@
 //                memory scanner (memscan.cpp) - no Steep reverse-engineering needed.
 //   Trainer tab- address slots (freeze/set), Fly, Teleport; the player's position found through
 //                powder_trainer.json's pointer chains, and noclip while flying (noclip.cpp).
+//   Mods tab   - the client mods it hosts (modhost.cpp: powder_mods/*.dll, native/sdk/powder_api.h), their
+//                hooks (hooks.cpp) and panels.
 //
 // All network calls run on a worker thread; the Present/UI thread never blocks on I/O. Diagnostics go to
 // powder_overlay.log beside the DLL.
@@ -43,6 +45,8 @@
 #include "memscan.h"
 #include "access.h"
 #include "noclip.h"
+#include "codepatch.h"
+#include "modhost.h"
 
 using json = nlohmann::json;
 
@@ -427,6 +431,7 @@ static LRESULT CALLBACK hk_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 
 static void draw_ui();   // below
+static void olog_line(const char *line) { olog("%s", line); }
 
 static void init_imgui(IDXGISwapChain *sc) {
     if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void **)&g_dev)) || !g_dev) {
@@ -455,6 +460,8 @@ static void init_imgui(IDXGISwapChain *sc) {
 
 static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     if (!g_init) init_imgui(sc);
+    static bool mods_loaded = false;
+    if (g_init && !mods_loaded) { mods_loaded = true; pw::mods_load(g_dir, g_base_url, olog_line); }
     if (g_init && g_rtv) {
         // harness: auto sign-in + load players once, so a headless run can verify the whole path
         if (!g_autologin_done && !g_cfg_login_email.empty() && g_net && g_net->valid()) {
@@ -989,6 +996,7 @@ static void draw_ui() {
         if (ImGui::BeginTabItem("Server")) { draw_server_tab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Debug")) { draw_debug_tab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Trainer")) { draw_trainer_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Mods")) { pw::mods_draw_tab(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::End();
@@ -1011,7 +1019,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
     std::string terr;
     wchar_t armer[MAX_PATH];
     _snwprintf(armer, MAX_PATH, L"%sarmer.exe", g_dir);
-    pw::noclip_set_helper(armer);
+    pw::code_set_helper(armer);
     if (pw::trainer_load(trainer, terr)) olog("trainer data loaded (powder_trainer.json)");
     else olog("trainer: %s", terr.c_str());
     olog("overlay DLL loaded pid=%lu, server=%s%s", GetCurrentProcessId(), g_base_url.c_str(),

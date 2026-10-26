@@ -15,3 +15,4 @@ launcher.toml
 /.claude/
 /target/
 native/third_party/
+/mods/*/client/*.dll

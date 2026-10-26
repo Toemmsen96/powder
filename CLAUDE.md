@@ -239,8 +239,21 @@ don't run commands against the user's real prefix or data: test on scratch copie
    native/overlay/steep_trainer.json (deployed as powder_trainer.json): the writers + their bytes, and 26
    pointer chains to the struct from one session (tools/trainer/ptrscan.py) - not yet confirmed across launches;
    the overlay needs two chains to agree. Trainer tab: Find player (auto), Fly = F6, noclip while flying,
-   re-resolves the position every frame while flying (map change). Deferred: MinHook-based function hooking
-   with arg logging + a hook API for client mods; camera-relative fly (needs the view matrix); live POWDER_* delivery to non-admin players'
+   re-resolves the position every frame while flying (map change). CONFIRMED 2026-10-26: chains found the
+   player after a restart (7 of 26 agree); hooks install in-game via armer.exe --write (VMProtect blocks the
+   game's own writes to its code, also WriteProcessMemory on itself).
+   MOD API (2026-10-26, Wine-tested, not yet in-game): native/sdk/powder_api.h is the C API client mods get via
+   `powder_mod_init(api, mod)`: log, module_base, find_pattern, read/write, patch_code, hook (function detour,
+   MinHook's trampoline builder + our write_code), hook_mid (register-context callback: PowderRegs with the GPRs
+   and xmm0-5, changes are kept), unhook, add_panel (+ the overlay's ImGui context), player_position. The overlay
+   is the host (modhost.cpp loads powder_mods/*.dll, Mods tab; hooks.cpp; codepatch.cpp = code writes with the
+   armer fallback). Mods: mods/<name>/src/*.cpp -> native/build.sh mods -> mods/<name>/client/<name>.dll
+   (gitignored); powder-wrap loads only those named in POWDER_CLIENT_MODS. Example: mods/asset_trace (hooks
+   ntdll NtCreateFile/NtOpenFile/NtReadFile: per-file read stats in the Mods tab, optional read log
+   powder_asset_trace.log = "<ms> <file> <offset> <length>"). Steep's data: AnvilNext .forge archives
+   ("scimitar", v27) + _patch_01/_02 per archive, Wwise .pck, Bink .bk2, terrain .tbf (tools/forge/ for the
+   format). Deferred: camera-relative fly (needs the view matrix); the Windows launcher loading mods through the
+   overlay (it injects client DLLs directly today); live POWDER_* delivery to non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
    `native/build.ps1` overlay target for Windows builds.

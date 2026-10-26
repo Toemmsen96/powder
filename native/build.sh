@@ -8,6 +8,7 @@
 #   native/build.sh            # everything
 #   native/build.sh tls        # just the TLS helper
 #   native/build.sh overlay    # just the overlay + nettest
+#   native/build.sh mods       # client mods: mods/<name>/src/*.cpp -> mods/<name>/client/<name>.dll (SDK: native/sdk/)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 bin="$here/bin"
@@ -43,7 +44,8 @@ build_overlay() {
     fetch_deps
     local img="$tp/imgui"
     local obj="$bin/obj"; rm -rf "$obj"; mkdir -p "$obj"
-    local inc=(-I"$img" -I"$img/backends" -I"$tp/minhook/include" -I"$tp/minhook/src/hde" -I"$tp/json" -I"$here/overlay")
+    local inc=(-I"$img" -I"$img/backends" -I"$tp/minhook/include" -I"$tp/minhook/src" -I"$tp/minhook/src/hde"
+               -I"$tp/json" -I"$here/overlay" -I"$here/sdk")
 
     # MinHook (C)
     for s in buffer hook trampoline; do
@@ -56,7 +58,7 @@ build_overlay() {
     local srcs=("$img/imgui" "$img/imgui_draw" "$img/imgui_tables" "$img/imgui_widgets"
                 "$img/backends/imgui_impl_dx11" "$img/backends/imgui_impl_win32"
                 "$here/overlay/overlay" "$here/overlay/http" "$here/overlay/memscan" "$here/overlay/access"
-                "$here/overlay/noclip")
+                "$here/overlay/noclip" "$here/overlay/codepatch" "$here/overlay/hooks" "$here/overlay/modhost")
     for s in "${srcs[@]}"; do
         cxx "${cxxflags[@]}" -c "$s.cpp" -o "$obj/$(basename "$s").o"
     done
@@ -73,9 +75,32 @@ build_overlay() {
     rm -rf "$obj"
 }
 
+# Client mods: each mods/<name>/src/ with C++ sources becomes mods/<name>/client/<name>.dll, linked with its own
+# copy of Dear ImGui (the overlay's version; the mod attaches to the overlay's context, native/sdk/powder_api.h).
+build_mods() {
+    fetch_deps
+    local img="$tp/imgui" obj="$bin/obj-mods"
+    rm -rf "$obj"; mkdir -p "$obj"
+    local flags=(-O2 -std=c++17 -Wall -I"$img" -I"$here/sdk")
+    for s in imgui imgui_draw imgui_tables imgui_widgets; do
+        cxx "${flags[@]}" -c "$img/$s.cpp" -o "$obj/$s.o"
+    done
+    local root; root=$(cd "$here/.." && pwd)
+    for src in "$root"/mods/*/src; do
+        compgen -G "$src/*.cpp" >/dev/null || continue
+        local name; name=$(basename "$(dirname "$src")")
+        mkdir -p "$src/../client"
+        cxx "${flags[@]}" -shared -o "$src/../client/$name.dll" "$src"/*.cpp "$obj"/*.o \
+            -static -static-libgcc -static-libstdc++ -s
+        echo "built: mods/$name/client/$name.dll"
+    done
+    rm -rf "$obj"
+}
+
 case "${1:-all}" in
     tls) build_tls ;;
     overlay) build_overlay ;;
-    all) build_tls; build_overlay ;;
-    *) echo "usage: build.sh [all|tls|overlay]" >&2; exit 1 ;;
+    mods) build_mods ;;
+    all) build_tls; build_overlay; build_mods ;;
+    *) echo "usage: build.sh [all|tls|overlay|mods]" >&2; exit 1 ;;
 esac
