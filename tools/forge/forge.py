@@ -378,13 +378,14 @@ class Forge:
         self.f.seek(e.offset)
         return self.f.read(e.size)
 
-    def find(self, spec: str) -> list[Entry]:
+    def find(self, spec: str, exact: bool = False) -> list[Entry]:
+        """Entries by id, exact name, or (unless `exact`) name substring."""
         if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", spec):
             e = self.by_id.get(int(spec, 0))
             if e:
                 return [e]
-        exact = [e for e in self.entries if e.name == spec]
-        return exact or [e for e in self.entries if spec.lower() in e.name.lower()]
+        named = [e for e in self.entries if e.name == spec]
+        return named or ([] if exact else [e for e in self.entries if spec.lower() in e.name.lower()])
 
 
 def fmt_time(ts: int) -> str:
@@ -697,14 +698,18 @@ ID_MIN, ID_MAX = 1 << 32, 1 << 42  # object ids in Steep's data are 35..41 bits;
 
 
 def newest_entry(base: str, spec: str) -> tuple[Forge, Entry]:
-    """An entry as the game loads it: from the newest archive of `base`'s stack that has it (one match only)."""
-    for p in reversed([p for p in patch_stack(base) if os.path.exists(p)]):
-        fg = Forge(p)
-        found = fg.find(spec)
-        if len(found) > 1:
-            sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(p)} match; give the id or the exact name")
-        if found:
-            return fg, found[0]
+    """An entry as the game loads it: from the newest archive of `base`'s stack that has it (one match only). An id
+    or exact name anywhere in the stack wins over a name substring (a patch's `X_Zippers01` must not shadow the
+    base's `X`)."""
+    archives = [Forge(p) for p in reversed(patch_stack(base)) if os.path.exists(p)]
+    for exact in (True, False):
+        for fg in archives:
+            found = fg.find(spec, exact)
+            if len(found) > 1:
+                sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(fg.path)} match; give the id or the "
+                         "exact name")
+            if found:
+                return fg, found[0]
     sys.exit(f"{spec}: in no archive of {base}'s stack")
 
 

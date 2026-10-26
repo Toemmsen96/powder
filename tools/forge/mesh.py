@@ -65,12 +65,14 @@ BONE_NAMES = ["Reference", "Hips", "Spine", "Spine1", "Spine2", "Neck", "Neck1",
                                                                               for f in _SIDED]
 BONE_BY_HASH = {zlib.crc32(n.encode()): n for n in BONE_NAMES}
 # The skeleton resource is not decoded: this hierarchy (Mixamo's) is a guess, only used to pose the armature in
-# Blender. Bones without an entry hang off the nearest bone that has one.
+# Blender. A helper bone (L_LeftArm_NoRoll, O_LeftKnee, ...) hangs off the bone its name points at, any other bone
+# off the nearest bone that has an entry.
 PARENTS = {"Hips": "Reference", "Spine": "Hips", "Spine1": "Spine", "Spine2": "Spine1", "Neck": "Spine2",
            "Neck1": "Neck", "Head": "Neck1"}
 for _s in ("Left", "Right"):
     PARENTS.update({f"{_s}Shoulder": "Spine2", f"{_s}Arm": f"{_s}Shoulder", f"{_s}ForeArm": f"{_s}Arm",
-                    f"{_s}Hand": f"{_s}ForeArm", f"{_s}UpLeg": "Hips", f"{_s}Foot": f"{_s}UpLeg",
+                    f"{_s}Hand": f"{_s}ForeArm", f"{_s}UpLeg": "Hips", f"{_s}Leg": f"{_s}UpLeg",
+                    f"{_s}Knee": f"{_s}Leg", f"{_s}Foot": f"{_s}Leg", f"{_s}Wrist": f"{_s}ForeArm",
                     f"{_s}ToeBase": f"{_s}Foot"})
     for _f in ("Thumb", "Index", "Middle", "Ring", "Pinky"):
         PARENTS.update({f"{_s}Hand{_f}1": f"{_s}Hand", f"{_s}Hand{_f}2": f"{_s}Hand{_f}1",
@@ -358,16 +360,20 @@ def game_entry(base: str, spec: str) -> tuple[forge.Forge, forge.Entry]:
             session = {line.strip() for line in f if line.strip()}
     except OSError:
         session = set()
+    archives = []
     for p in reversed([p for p in forge.patch_stack(base) if os.path.exists(p)]):
         if os.path.basename(p) in session:
             print(f"  ({os.path.basename(p)} is a powder-wrap session's, left out)", file=sys.stderr)
-            continue
-        fg = forge.Forge(p)
-        found = fg.find(spec)
-        if len(found) > 1:
-            sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(p)} match; give the id or the exact name")
-        if found:
-            return fg, found[0]
+        else:
+            archives.append(forge.Forge(p))
+    for exact in (True, False):  # an id or exact name anywhere in the stack wins over a substring in a patch
+        for fg in archives:
+            found = fg.find(spec, exact)
+            if len(found) > 1:
+                sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(fg.path)} match; give the id or the "
+                         "exact name")
+            if found:
+                return fg, found[0]
     sys.exit(f"{spec}: in no archive of {base}'s stack")
 
 
@@ -1156,8 +1162,11 @@ def guess_parents(rest: dict[int, list]) -> dict[int, int | None]:
     anchors = [h for h in present if bone_name(h) in PARENTS or h == ref]
     out = {}
     for h in present:
+        core = re.sub(r"^(L|O|P|RFX)_|(_NoRoll|Roll|Bend|_Upnodes?|Back)$", "", bone_name(h))
         if bone_name(h) in PARENTS:
             out[h] = up(bone_name(h))
+        elif core != bone_name(h) and core in PARENTS:  # a helper: follows its bone (or the nearest one up)
+            out[h] = zlib.crc32(core.encode()) if zlib.crc32(core.encode()) in present else up(core)
         elif h == ref or not anchors:
             out[h] = None
         else:

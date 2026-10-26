@@ -682,13 +682,14 @@ def open_forge(path: str, cache: dict) -> forge.Forge:
 def find_entry(archive: str, spec: str, cache: dict, newest: bool) -> tuple[forge.Forge, forge.Entry]:
     """`spec` in `archive` itself, or (newest=True) in the newest archive of its stack that has it."""
     paths = [p for p in forge.patch_stack(archive) if os.path.exists(p)] if newest else [archive]
-    for p in reversed(paths):
-        fg = open_forge(p, cache)
-        found = fg.find(spec)
-        if len(found) > 1:
-            sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(p)} match; give the id or the exact name")
-        if found:
-            return fg, found[0]
+    for exact in (True, False):  # an id or exact name anywhere in the stack wins over a substring in a patch
+        for p in reversed(paths):
+            fg = open_forge(p, cache)
+            found = fg.find(spec, exact)
+            if len(found) > 1:
+                sys.exit(f"{spec}: {len(found)} entries in {os.path.basename(p)} match; give the id or the exact name")
+            if found:
+                return fg, found[0]
     sys.exit(f"{spec}: not in {os.path.basename(archive)}" + ("'s stack" if newest else ""))
 
 
