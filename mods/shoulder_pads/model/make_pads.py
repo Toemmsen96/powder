@@ -2,7 +2,7 @@
 """Writes pads.glb: two shoulder pads for STP_M_Jacket_001, as a Blender user would model them.
 
 Each pad is a flattened ellipsoid sitting on a shoulder of the default male rider (Steep's space: metres, Z up,
-the rider faces +Y), tilted with the A-pose arm. The objects are named `pad_L@L_LeftArm_NoRoll` and
+the rider faces -Y, left is +X), tilted with the A-pose arm. The objects are named `pad_L@L_LeftArm_NoRoll` and
 `pad_R@L_RightArm_NoRoll`, so `mesh.py import --glb` binds each rigidly to that upper-arm bone, and their material
 is named after the jacket's (STP_M_Jacket_001_ALL), so they join its submesh. Every UV points at one texel of an
 orange patch of the jacket's diffuse map, so the pads come out plain orange. The file holds only this geometry, no

@@ -68,7 +68,7 @@ Blender inside its container. Everything they print goes to the *Powder log* tex
   modifier and one vertex group per bone that it uses.
 - **One material per submesh**, named after Steep's material (`STP_M_Jacket_001_ALL`). With `--textures` it has
   the diffuse map. A material shared by two submeshes of a mesh gets `#sm<k>` on its name.
-- **Metres, Z up, the rider facing +Y**, exactly as in the game. The default male rider stands about 1.8 m tall
+- **Metres, Z up, the rider facing -Y** (left is +X), exactly as in the game. The default male rider stands about 1.8 m tall
   in an A-pose.
 
 ## Editing: the rules

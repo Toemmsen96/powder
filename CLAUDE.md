@@ -260,6 +260,10 @@ API. Everything below is on `rework/rust-server`.
   holding a resource. Blender add-on `tools/forge/powder_blender.py` (sidebar tab Powder: Import item / Write mod,
   runs the tools in Blender's Python). The user's Blender 5.2.3 (Steam) has Blender Lab's MCP add-on; with the
   `blender` MCP server connected, Claude can drive it (execute_blender_code, screenshots).
+- **mods/master_chief (2026-10-26):** a Sketchfab glTF (CC-BY, in gitignored `models/`) retargeted onto Steep's
+  skeleton by make_chief.py (bone map, per-bone fit to the jacket/glove/pants/boot rest poses, 2x2 texture atlas
+  into the jacket's 4 maps, the rest of the default male outfit shrunk). First mod that ADDS bones (38) to a mesh:
+  NOT yet confirmed in-game. The rider faces -Y (left = +X) - earlier docs said +Y, fixed.
 - **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
   BLENDER.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and

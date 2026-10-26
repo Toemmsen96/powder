@@ -34,7 +34,7 @@ way a Blender user would model it:
 - two objects, `pad_L@L_LeftArm_NoRoll` and `pad_R@L_RightArm_NoRoll`. The `@Bone` suffix binds an unskinned
   object rigidly to that bone. In Blender, *Parent to Bone* does the same;
 - the material is named `STP_M_Jacket_001_ALL`, the jacket's, so the pads join the jacket's submesh;
-- Steep's space: metres, Z up, the rider faces +Y, the shoulder tops at x = +-0.2 m, z = 1.53 m.
+- Steep's space: metres, Z up, the rider faces -Y (left is +X), the shoulder tops at x = +-0.2 m, z = 1.53 m.
 
 `generate.sh` adds them to the jacket from your install, without exporting the jacket itself:
 
