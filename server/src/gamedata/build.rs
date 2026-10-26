@@ -152,11 +152,10 @@ fn products(demux: &Value) -> Result<Vec<Vec<u8>>> {
     let list = pb::decode(pb::bytes(&init, 2).unwrap_or(&[]))?;
     let mut decoded: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for f in &list {
-        if let pb::V::Bytes(v) = &f.1 {
-            if let Some(pid) = pb::int(&pb::decode(v)?, 1) {
+        if let pb::V::Bytes(v) = &f.1
+            && let Some(pid) = pb::int(&pb::decode(v)?, 1) {
                 decoded.insert(pid, v.clone());
             }
-        }
     }
     let mut wanted: BTreeSet<u64> = STEEP_PRODUCTS.iter().copied().collect();
     for pid in STEEP_PRODUCTS {

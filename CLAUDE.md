@@ -16,7 +16,7 @@ modding (Lua server mods, client mods for the players' games).
 
 ```
 cargo test                      # from the repo root; all must pass
-cargo clippy --all-targets      # new code clippy-clean; 2 old warnings (gamedata/privacy.rs, nex/secure.rs) are known
+cargo clippy --all-targets      # clippy-clean (no warnings)
 cargo build && ./target/debug/powder-server --help
 ```
 
@@ -51,6 +51,9 @@ channel (the game's packets carry our signature), cloud-save upload all worked; 
 lists a game's address without its port (`NexChannel` does not know its UDP peer); entity/UGC/cloud-save files
 are sent whole (no Range / If-Modified-Since); websocket permessage-deflate is declined. Each port's commit
 message lists its behaviour differences. `run` logs a warning while the Rust server is untested; keep it accurate.
+
+Toolchain: Rust 1.99.1 (latest stable as of 2026-10-26), pinned in rust-toolchain.toml; edition 2024
+(`rust-version = "1.99"`, resolver 3).
 
 ## Conventions
 

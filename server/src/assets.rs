@@ -252,11 +252,10 @@ impl OfferCatalog {
         };
         let (want_tags, want_items) = (split(tags), split(item_ids));
         self.offers.iter().filter(|o| {
-            if let Some(k) = kind.filter(|k| !k.is_empty()) {
-                if o.get("type").and_then(Value::as_str) != Some(k) {
+            if let Some(k) = kind.filter(|k| !k.is_empty())
+                && o.get("type").and_then(Value::as_str) != Some(k) {
                     return false;
                 }
-            }
             let has_tag = |t: &String| o.get("tags").and_then(Value::as_array)
                 .is_some_and(|tags| tags.iter().any(|x| x.as_str() == Some(t)));
             if !want_tags.iter().all(has_tag) {

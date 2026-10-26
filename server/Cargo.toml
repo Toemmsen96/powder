@@ -3,6 +3,7 @@ name = "powder-server"
 description = "Powder: self-hosted stand-in for Steep's online services, to keep an owned copy playable"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

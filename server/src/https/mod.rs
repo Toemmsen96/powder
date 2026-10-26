@@ -234,8 +234,8 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
         keep_upload(state, req);
     }
     let origin = req.header("Origin").map(str::to_string);
-    if let Some(foreign) = origin.as_deref().filter(|o| !connect_origin(o) && !same_origin(req, o)) {
-        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+    if let Some(foreign) = origin.as_deref().filter(|o| !connect_origin(o) && !same_origin(req, o))
+        && !matches!(req.method.as_str(), "GET" | "HEAD") {
             // a web page elsewhere (the hosts file sends the player's browser here too): no preflight, no writes
             log::warn!(target: "powder.https", "{} {} from {} refused: origin {foreign:?} is not Ubisoft Connect's",
                        req.method, req.path(), req.client_ip());
@@ -244,7 +244,6 @@ pub fn handle(state: &HttpState, req: &Req) -> Reply {
             access_log(req, &reply.how, reply.status, &reply.body.len().to_string());
             return reply;
         }
-    }
     let origin = origin.filter(|o| connect_origin(o));
     let mut reply = match &origin {
         Some(_) if req.method == "OPTIONS" && req.headers.contains_key("Access-Control-Request-Method") => {

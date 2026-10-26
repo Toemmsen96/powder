@@ -236,11 +236,10 @@ impl StatsService {
         for ev in events.iter().filter(|e| e.name == "update_level") {
             let (Some(e), Some(level)) = (ev.field("expertise_id"), ev.field("level_expertise").and_then(Variant::as_f64))
             else { continue };
-            if let Some(row) = self.repos.stat(profile_id, group, &format!("level_stat:{}:infinite", e.to_text()))? {
-                if level < stat_value(&row).as_f64() {
+            if let Some(row) = self.repos.stat(profile_id, group, &format!("level_stat:{}:infinite", e.to_text()))?
+                && level < stat_value(&row).as_f64() {
                     stale.insert(e.to_text());
                 }
-            }
         }
         Ok(stale)
     }

@@ -149,7 +149,7 @@ pub fn encrypt_payload(key: &[u8; 16], seq: u16, payload: &[u8], compress: bool)
 }
 
 pub fn decrypt_payload(key: &[u8; 16], data: &[u8], seq: Option<u16>) -> Result<Vec<u8>> {
-    if data.len() < 32 || data.len() % 16 != 0 {
+    if data.len() < 32 || !data.len().is_multiple_of(16) {
         bail!("encrypted payload of {} bytes", data.len());
     }
     let (iv, ct) = data.split_at(16);
@@ -172,11 +172,10 @@ pub fn decrypt_payload(key: &[u8; 16], data: &[u8], seq: Option<u16>) -> Result<
     }
     let (data, trailer) = inner.split_at(inner.len() - 2);
     let trailer = u16::from_le_bytes([trailer[0], trailer[1]]);
-    if let Some(seq) = seq {
-        if trailer != seq {
+    if let Some(seq) = seq
+        && trailer != seq {
             bail!("seq trailer {trailer} != packet seq {seq}");
         }
-    }
     Ok(data.to_vec())
 }
 

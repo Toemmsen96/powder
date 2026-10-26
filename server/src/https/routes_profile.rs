@@ -304,11 +304,10 @@ fn achievement_icon(c: &Ctx) -> Reply {
 /// GET /v1/profiles/me/populations and PUT .../populations/data (the game reports its populations).
 fn populations(c: &Ctx) -> Result<Reply> {
     let (repos, pid) = (&c.state.repos, me(c)?);
-    if c.req.method == "PUT" {
-        if let Some(body) = json_body(c) {
+    if c.req.method == "PUT"
+        && let Some(body) = json_body(c) {
             repos.kv_set(&pid, "populations_data", &body)?;
         }
-    }
     let stored = repos.kv_get(&pid, "populations_data")?;
     let pops = stored.as_ref().and_then(|s| s.get("populations")).filter(|p| truthy(p)).cloned();
     Ok(ok(json!({"populations": pops.unwrap_or_else(|| json!([]))}), "populations"))

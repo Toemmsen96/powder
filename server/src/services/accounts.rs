@@ -344,11 +344,10 @@ impl AccountService {
         if self.repos.player(&profile_id)?.is_none() {
             return Err(Error::Account(format!("no player {profile_id}")));
         }
-        if let Some(other) = self.repos.account_by_profile(&profile_id)? {
-            if other.account_id != account.account_id {
+        if let Some(other) = self.repos.account_by_profile(&profile_id)?
+            && other.account_id != account.account_id {
                 return Err(Error::Account(format!("player {profile_id} belongs to account {}", other.email)));
             }
-        }
         self.repos.update_account(&account.account_id, AccountField::ProfileId, &profile_id)?;
         self.sessions.drop_player(&account.profile_id);
         Ok(())
@@ -438,11 +437,10 @@ impl AccountService {
                 return Err(Error::Auth("unknown or revoked remember-me ticket".into()));
             }
         }
-        if !req.auth_value.is_empty() {
-            if let Some(s) = self.sessions.by_token(&req.auth_value) {
+        if !req.auth_value.is_empty()
+            && let Some(s) = self.sessions.by_token(&req.auth_value) {
                 return Ok((s.profile_id().to_string(), "ticket of ours"));
             }
-        }
         if required {
             if let Some(s) = self.sessions.latest_from(&req.client_ip, true) {
                 return Ok((s.profile_id().to_string(), "Ubisoft Connect signed in from the same address"));

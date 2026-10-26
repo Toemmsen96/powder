@@ -81,11 +81,10 @@ fn walk(value: &Value, out: &mut HashSet<Marker>) {
                 let text = IDENTIFYING_KEYS.contains(&key.as_str()).then(|| scalar(v)).flatten();
                 if let Some(t) = text.filter(|t| t.chars().count() >= MIN_MARKER) {
                     out.insert(Marker::Value(t));
-                } else if let Value::String(s) = v {
-                    if NAME_KEYS.contains(&key.as_str()) && s.trim().chars().count() >= MIN_NAME {
+                } else if let Value::String(s) = v
+                    && NAME_KEYS.contains(&key.as_str()) && s.trim().chars().count() >= MIN_NAME {
                         out.insert(Marker::Name(s.trim().to_string()));
                     }
-                }
                 walk(v, out);
             }
         }
@@ -327,11 +326,10 @@ fn identifying_values(value: &Value, out: &mut Vec<(String, String)>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                if let Some(text) = scalar(v).filter(|_| IDENTIFYING_KEYS.contains(&k.to_lowercase().as_str())) {
-                    if !text.trim().is_empty() && !PLACEHOLDER.is_match(&text) {
+                if let Some(text) = scalar(v).filter(|_| IDENTIFYING_KEYS.contains(&k.to_lowercase().as_str()))
+                    && !text.trim().is_empty() && !PLACEHOLDER.is_match(&text) {
                         out.push((k.clone(), text));
                     }
-                }
                 identifying_values(v, out);
             }
         }

@@ -305,11 +305,10 @@ impl NexServer {
             // a later login of the same player shares the session's channels: clear the connection there, unless
             // it was already replaced by a newer one
             let channel: Arc<dyn crate::core::sessions::NexChannel> = c.outbox.clone();
-            if let Some(s) = c.session.take().filter(|s| s.channels.clear_nex_if(&channel)) {
-                if let Some(f) = &self.on_disconnect {
+            if let Some(s) = c.session.take().filter(|s| s.channels.clear_nex_if(&channel))
+                && let Some(f) = &self.on_disconnect {
                     f(s.profile_id());
                 }
-            }
             log::info!(target: "powder.nex", "{addr} connection closed ({why})");
         }
     }
