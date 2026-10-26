@@ -1158,18 +1158,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (st, pid) = files_state(tmp.path(), None);
         let reward = "8d9430c2-d08f-493e-8028-2fc2d448fdb0";
-        let offers = |q: &str| body(&handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?{q}"), &[])))
+        let query = |q: &str| body(&handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?{q}"), &[])))
             ["offers"].as_array().unwrap().clone();
         // an item no offer grants: one free synthetic offer for it
-        let got = offers(&format!("itemIds={reward}&offset=0&limit=100"));
+        let got = query(&format!("itemIds={reward}&offset=0&limit=100"));
         assert_eq!(got.len(), 1);
         let offer_id = got[0]["offerId"].as_str().unwrap().to_string();
         assert_eq!(offer_id, "28319567-752a-ec9b-258d-8a6771ed5815", "the item's UUID, every byte XOR 0xA5");
         assert_eq!(got[0]["items"], json!([{"itemId": reward, "quantity": 1}]));
         // an item the catalogue has: its real offer only; tag/type queries never synthesize
-        let real = offers(&format!("itemIds={}", SKI_A_ITEM.to_uppercase()));
+        let real = query(&format!("itemIds={}", SKI_A_ITEM.to_uppercase()));
         assert_eq!(real.iter().map(|o| o["offerId"].as_str().unwrap()).collect::<Vec<_>>(), [SKI_A]);
-        assert_eq!(offers("tags=REWARDS").len(), 0);
+        assert_eq!(query("tags=REWARDS").len(), 0);
         // buying it grants +1 of exactly that item
         let auth = auth_for(&st, &pid);
         let auth = [("Authorization", auth.as_str())];
