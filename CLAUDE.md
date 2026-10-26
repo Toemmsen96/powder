@@ -194,7 +194,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
 - Save migration from a live account: NOT a dead end after all (2026-10-26). The 32-hex at offset 8 is a
   per-session save-instance id; the account binding is a 16-byte XOR key per account over the body (aligned to its
   end). tools/savegame/savegame.py decodes saves (sections of AnvilNext LZO blocks) and re-keys them between
-  accounts; no account id is inside. Not yet loaded by the game.
+  accounts; no account id is inside. TRIED 2026-10-26: the game loads a re-keyed live save but shows a save
+  mismatch / corruption popup ("Continue" = start over at the intro): it checks the save against the ONLINE stats
+  (unlock bitfields, levels), which the save does not contain a copy of. A full migration needs the live stats too:
+  `admin import <recordings>` from recordings of one's own online sessions (none on this device).
 - MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
   game's OpenSSL is pinned. Real entitlement/offer formats can't be recorded that way.
 - Imported stats (level) without a matching save make the game replay the intro ("progress, but at the start").
