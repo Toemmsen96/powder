@@ -4,12 +4,17 @@
 #include "noclip.h"
 #include "powder_api.h"
 #include "imgui.h"
+#include "http.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace pw {
@@ -18,6 +23,18 @@ namespace {
 
 struct Panel { const PowderMod *mod; std::string title; PowderPanelFn draw; void *user; };
 struct LoadedMod { PowderMod mod; std::string name, status; HMODULE dll; };
+
+struct FrameFn { const PowderMod *mod; PowderFrameFn fn; void *user; };
+std::vector<FrameFn> g_frame_fns;
+std::mutex g_frame_m;
+
+// Client mods' requests to the Powder server: their own client (no cookies - never the overlay's admin
+// session) on their own thread, so a slow server never stalls the game or the overlay's admin calls.
+struct HttpJob { std::string mod, method, path, body; PowderHttpFn done; void *user; };
+std::deque<HttpJob> g_http_q;
+std::mutex g_http_m;
+std::condition_variable g_http_cv;
+bool g_http_started = false;
 
 std::vector<LoadedMod *> g_mods;
 std::vector<Panel> g_panels;
@@ -139,6 +156,43 @@ void api_add_panel(const PowderMod *mod, const char *title, PowderPanelFn draw, 
     g_panels.push_back({mod, title ? title : "", draw, user});
 }
 
+void api_on_frame(const PowderMod *mod, PowderFrameFn fn, void *user) {
+    std::lock_guard<std::mutex> lk(g_frame_m);
+    g_frame_fns.push_back({mod, fn, user});
+}
+
+void http_worker() {
+    HttpClient client(g_server);
+    for (;;) {
+        HttpJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_http_m);
+            g_http_cv.wait(lk, [] { return !g_http_q.empty(); });
+            job = std::move(g_http_q.front());
+            g_http_q.pop_front();
+        }
+        HttpResponse r = client.request(job.method, job.path, job.body);
+        client.clear_cookies();                       // nothing carries over between mods' requests
+        if (r.status == 0) logf("[%s] http %s %s: %s", job.mod.c_str(), job.method.c_str(), job.path.c_str(),
+                                r.error.c_str());
+        if (job.done) job.done(r.status, r.body.data(), r.body.size(), job.user);
+    }
+}
+
+int api_http(const PowderMod *mod, const char *method, const char *path, const char *body, PowderHttpFn done,
+             void *user) {
+    if (!method || !path || strncmp(path, "/_powder/", 9) != 0 || strstr(path, "..")) {
+        t_err = "http: only paths under /_powder/ of the Powder server";
+        return 1;
+    }
+    std::lock_guard<std::mutex> lk(g_http_m);
+    if (g_http_q.size() >= 64) { t_err = "http: too many requests queued"; return 1; }
+    if (!g_http_started) { g_http_started = true; std::thread(http_worker).detach(); }
+    g_http_q.push_back({mod && mod->name ? mod->name : "?", method, path, body ? body : "", done, user});
+    g_http_cv.notify_one();
+    return 0;
+}
+
 uintptr_t api_player_position() {
     std::string why;
     return find_player_pos(why);
@@ -184,6 +238,8 @@ void mods_load(const std::wstring &dir, const std::string &server_url, void (*lo
                                  &alloc_user);
     g_api.player_position = api_player_position;
     g_api.server_url = g_server.c_str();
+    g_api.on_frame = api_on_frame;
+    g_api.http = api_http;
 
     std::wstring folder = dir + L"powder_mods\\";
     WIN32_FIND_DATAW fd;
@@ -207,6 +263,12 @@ void mods_load(const std::wstring &dir, const std::string &server_url, void (*lo
         g_mods.push_back(m);
     } while (FindNextFileW(f, &fd));
     FindClose(f);
+}
+
+void mods_frame() {
+    std::vector<FrameFn> fns;
+    { std::lock_guard<std::mutex> lk(g_frame_m); fns = g_frame_fns; }
+    for (auto &f : fns) f.fn(f.user);
 }
 
 void mods_draw_tab() {

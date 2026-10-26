@@ -15,6 +15,11 @@
  * milliseconds. Windows/system DLL functions are hooked in-process. Addresses: module_base + RVA (stable for
  * one game build) or find_pattern (survives small updates).
  *
+ * Every frame: on_frame runs a callback once per rendered frame (the game's render thread: keep it short).
+ * Server: http sends a request to the Powder server this game is connected to, only to /_powder/... paths (a
+ * server mod answers them with api.before_http in Lua: client and server halves of one mod talk this way). It
+ * carries no session of the player or the admin; the reply comes to `done` on the mod host's network thread.
+ *
  * UI: add_panel draws inside the overlay's Mods tab. To use Dear ImGui, compile it into your mod (the same
  * version as the overlay, POWDER_IMGUI_VERSION) and call powder_imgui_attach(api) (C++, below) once.
  *
@@ -31,7 +36,7 @@
 extern "C" {
 #endif
 
-#define POWDER_API_VERSION 1
+#define POWDER_API_VERSION 2
 #define POWDER_IMGUI_VERSION "1.91.5"
 #define POWDER_EXPORT __declspec(dllexport)
 
@@ -51,6 +56,8 @@ typedef struct PowderMod {
 
 typedef void (*PowderMidFn)(PowderRegs *regs, void *user);
 typedef void (*PowderPanelFn)(void *user);
+typedef void (*PowderFrameFn)(void *user);
+typedef void (*PowderHttpFn)(int status, const char *body, size_t len, void *user);   /* status 0: no reply */
 
 typedef struct PowderApi {
     uint32_t version;      /* POWDER_API_VERSION of the host; check >= what you need */
@@ -81,6 +88,12 @@ typedef struct PowderApi {
     /* game */
     uintptr_t (*player_position)(void);    /* address of the player's float3 (x, y, z; z is up), 0 if unknown */
     const char *server_url;                 /* the Powder server, e.g. "https://public-ubiservices.ubi.com" */
+
+    /* version 2 */
+    void (*on_frame)(const PowderMod *mod, PowderFrameFn fn, void *user);
+    /* method "GET"/"POST"/...; path must start with "/_powder/"; body may be NULL. 0 = queued. */
+    int (*http)(const PowderMod *mod, const char *method, const char *path, const char *body, PowderHttpFn done,
+                void *user);
 } PowderApi;
 
 typedef int (*PowderModInitFn)(const PowderApi *api, PowderMod *mod);

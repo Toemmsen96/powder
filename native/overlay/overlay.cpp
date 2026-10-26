@@ -502,6 +502,7 @@ static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT 
         }
     }
     if (!g_scanning.load()) { g_scan.apply_frozen(); trainer_apply(); }
+    if (mods_loaded) pw::mods_frame();
     return g_present_orig(sc, sync, flags);
 }
 
