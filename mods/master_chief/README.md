@@ -1,80 +1,85 @@
-# master_chief: a whole character from a downloaded model
+# master_chief: a costume from a downloaded model
 
-This mod puts Master Chief on the default male rider (Freerider M). A skinned glTF model from Sketchfab is fitted
-onto Steep's skeleton and takes the place of the default jacket, `STP_M_Jacket_001`, in all 4 LODs. Its textures
-replace the jacket's texture set, and the rest of the default male outfit is shrunk away so nothing pokes through.
+This mod turns costume 016 (the camo soldier with gas mask and helmet) into Master Chief, for male and female
+riders. A skinned glTF model from Sketchfab is fitted onto Steep's skeleton and replaces the costume's mesh in all
+4 LODs, and its textures replace the costume's. A costume is a whole-body item: the game takes the rest of the
+outfit off while it is worn, so nothing else is touched.
 
 **Model:** "Master Chief High Poly" by HarrisonHag1, licensed CC-BY-4.0
 (https://sketchfab.com/3d-models/master-chief-high-poly-18f5ee1d13904939971601055102c91b). This work is based on it.
 The model is not in git (`models/` is ignored). Download it as glTF and unpack it into
 `models/master_chief_high_poly/` (`scene.gltf`, `scene.bin`, `textures/`), then run `mods/master_chief/generate.sh`.
 
+**An addition instead of a replacement is not possible yet** (TODO.md). A new costume needs:
+- a new item in `Game Bootstrap Settings`, one 146 MB datafile of 17,292 resources, and whatever lists reference
+  it (store, unlocks);
+- a selector entry in the character template;
+- an icon and a localized name;
+- ownership from the server.
+
+Most of those formats are not decoded.
+
 ## What changes
 
-| what | entries | how |
+| what | entries (all in `DataPC_extra_chr`) | how |
 |---|---|---|
-| the body | `STP_M_Jacket_001` (entity, `DataPC_extra_chr_onboarding`) with LOD0..3, and `STP_M_Jacket_001_LOD0` (`DataPC_STP_Alpes`) | `mesh.py import --glb`: 31,600 vertices, 28,037 triangles in every LOD; 38 bones added (legs, forearms, fingers) |
-| the textures | `STP_M_Jacket_001_T01_{Diffuse,Normal,Specular,Mask1}Map` in `DataPC_extra_chr_onboarding`, `DataPC_extra_chr`, `DataPC_STP_Alpes`, and their `_Mip0`/`_Mip1` | `texture.py replace`: the model's 4 materials packed 2x2 |
-| the rest of the outfit | 43 datafiles: head (+ beard, teeth, tongue), hair, hat, helmets, goggles, gloves, pants, boots, scarves, backpacks, harness, the jacket's zippers, jacket 002 | `mesh.py edit --scale 0.001`: each shrunk to a point |
+| the male costume | `STP_M_Costume_016` (entity) with LOD0..3 | `mesh.py import --glb`: armor -> the jacket submesh, undersuit -> the pants submesh, helmet and visor -> the helmet submesh, the glass submesh shrunk to one 1 mm triangle; 63,203 vertices, 56,075 triangles in every LOD |
+| the female costume | `STP_F_Costume_016` with LOD0..3 | the same, fitted to the female skeleton |
+| the textures | the 12 maps of `STP_MF_Costume_016_{Jacket,Pants,Helmet}_T01_Set` and their `_Mip0`/`_Mip1` | `texture.py replace`: armor and suit at 2048, helmet and visor side by side |
 
-These items are shared: every male rider who wears one of them loses it too, and anyone wearing the default jacket
-becomes Master Chief. `mods/mesh_edit`, `mods/shoulder_pads` and `mods/custom_texture` replace some of the same
-entries, so enable only this one. With two of them, building the session's `_patch_03` fails on the duplicate ids,
-and powder-wrap logs that and leaves the archive out.
+The glass material (`STP_MF_Glass_ALL`) is shared with goggles and other gear, so its textures stay as they are and
+only the costume's glass geometry goes. Every costume 016 a rider wears becomes Master Chief.
+
+`mods/shoulder_pads`, `mods/mesh_edit` and `mods/custom_texture` change the jacket, not this costume, so they can
+run alongside this mod.
 
 ## What you should see
 
-In the main menu, Freerider M is Master Chief: green armour, the gold visor, about 1.9 m tall. He should move with
-the rider's animations (arms, legs, fingers), because his own skin weights were renamed to Steep's bones.
-
-If something goes wrong:
-- *Still the old outfit.* Check powder-wrap's log for "asset mods: ..." with the three archives.
-- *Chief shows but other clothes poke through.* Freerider M wears an item that is not in the list above; tell
-  which, and it is added to `HIDE` in `make_chief.py`.
-- *Chief is invisible, stretched or exploded.* The added bones (legs, fingers) are the suspect. This is the first
-  mod that adds bones to a mesh.
-- *A crash.* Turn the mod off and report it.
+Equip costume 016 under Costumes & Equipments. The rider becomes Master Chief: green armour, black undersuit and the
+gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the rider's animations (arms, legs,
+fingers), because his own skin weights were renamed to Steep's bones.
 
 ## How it was made (`make_chief.py`)
 
 1. **Bones.** The model's skeleton (`bip_pelvis`, `bip_spine_0..2`, `bip_upperArm_L`, `f_index.01.L`, ...) maps onto
    Steep's (`Reference`, `Spine`..`Spine2`, `LeftArm`, `LeftHandIndex1`, ...). The knee is Steep's `L_LeftLeg`.
    Joints without a match (bone ends, the root) follow their parent.
-2. **Fit.** Both stand in an A-pose facing -Y. The model is scaled from its own units (0.000278 m each) so that
-   head and ankle match. Then each bone is turned to point along Steep's bone and moved onto Steep's joint. The
-   rest poses come from the default jacket, gloves, pants and boots, and every vertex follows its weights. The feet
-   are squashed in height so the soles end on the floor.
-3. **Weights.** The model's own weights, renamed to Steep's bones: up to 4 per vertex.
-4. **Textures.** One 2048 atlas per map. Armour top left, suit top right, helmet bottom left, visor bottom right;
-   1024 each, with UVs moved into their quarter.
+2. **Fit, per gender.** Both stand in an A-pose facing -Y. The model is scaled so that head and ankle match. Then
+   each bone is turned to point along Steep's bone and moved onto Steep's joint, and every vertex follows its
+   weights. The rest pose is the costume's own. The bones it lacks come from the same gender's default gear:
+   `Reference` and the forearms. The feet are squashed in height so the soles end on the floor.
+3. **Weights.** The model's own weights, renamed to Steep's bones: up to 4 per vertex. A rebuilt submesh gets a
+   fresh bone map (the armor needs 15 bones, the suit 47, the helmet 1: the head).
+4. **Back faces.** The model's materials are double-sided, but Steep draws front faces only. 318 triangles wound
+   against their normals are turned round, and every triangle gets a back face.
+5. **Textures.** Per texture set:
    - **Diffuse:** the base colour.
-   - **Normal:** Steep keeps X in R, Y in G (pointing up the image, as glTF's) and B = 0. The 4th channel, unknown
-     (it looks like ambient occlusion), is set to the jacket's average.
+   - **Normal:** X in R, Y in G (pointing up the image, as glTF's), B = 0. The 4th channel, unknown (it looks like
+     ambient occlusion), is set to the default jacket's average.
    - **Specular:** from metalness and roughness.
-   - **Mask1:** R is white on fabric and black on hard parts, as the jacket's.
-5. **Out.** A glb with the fitted body skinned to Steep's bones. `mesh.py import --glb ... --to LOD --ignore-names`
-   puts it into every LOD of every datafile that holds a jacket LOD (`forge.py where`). It adds the bones the
-   jacket lacks with their rest pose (the jacket's bone map grows from 62 to 100 of 128).
+   - **Mask1:** R = 0. With R = 255 (the jackets' "fabric"), the dark undersuit turned pale cream in the game.
 
-Seen in Blender (5.2.3, through its MCP bridge), with the fitted glb and the atlas: the model stands on the floor,
-textured, with Steep's joints inside shoulders, elbows, hips, knees and ankles.
+## History
+
+The first version (2026-10-26) replaced the default jacket and shrank the rest of the default male outfit. In the
+game it showed with the right shape and armour, which confirmed that bones added to a mesh work. The undersuit came
+out cream (Mask1 R = 255), and single-sided shells left see-through spots. Both are fixed here. The costume version
+replaces nothing the rider wears every day.
 
 ## Verified vs assumed
 
 Verified with tools, without running the game:
-- every rebuilt and shrunk mesh (139) passes `mesh.py check`;
-- the three session archives built from the entries pass `forge.py verify --decompress`;
-- the diffuse's streamed top level (`_Mip0`, 2048) decodes to the atlas, the right way up.
+- both costumes' 8 meshes pass `mesh.py check`;
+- the session archive (`DataPC_extra_chr_patch_03`) builds and passes `forge.py verify --decompress`;
+- both fitted models in Blender (5.2.3, through its MCP bridge), textured with the new maps, look right.
 
-Assumed (this mod is the test):
-- **The engine accepts bones added to a mesh**, with their own inverse bind matrices.
-- The normal map's green points up the image (as glTF's) and its 4th channel is not critical. A wrong guess shows
-  as inverted bumps or odd shading, not as a broken model.
-- The mask and specular maps' meanings (G).
-- Every LOD carries the full 31,600 vertices. There is no reduced LOD yet, which costs some performance at a
-  distance.
+Confirmed in the game with the jacket version: the bone mapping, the fit, added bones and the texture layout.
+
+Assumed:
+- The costume's LODs take the full model (no reduced LODs yet: some cost at a distance).
+- The normal map's 4th channel and the specular map's meaning (G).
 
 ## Regenerating and undo
 
-`mods/master_chief/generate.sh [<Steep folder>] [<model folder>]` takes about 3 minutes. Turn the mod off by
-leaving it out of `POWDER_CLIENT_MODS`; the installed game files and the save are never changed.
+`mods/master_chief/generate.sh [<Steep folder>] [<model folder>]` takes about 6 minutes. Turn the mod off by leaving
+it out of `POWDER_CLIENT_MODS`; the installed game files and the save are never changed.

@@ -261,9 +261,11 @@ API. Everything below is on `rework/rust-server`.
   runs the tools in Blender's Python). The user's Blender 5.2.3 (Steam) has Blender Lab's MCP add-on; with the
   `blender` MCP server connected, Claude can drive it (execute_blender_code, screenshots).
 - **mods/master_chief (2026-10-26):** a Sketchfab glTF (CC-BY, in gitignored `models/`) retargeted onto Steep's
-  skeleton by make_chief.py (bone map, per-bone fit to the jacket/glove/pants/boot rest poses, 2x2 texture atlas
-  into the jacket's 4 maps, the rest of the default male outfit shrunk). First mod that ADDS bones (38) to a mesh:
-  NOT yet confirmed in-game. The rider faces -Y (left = +X) - earlier docs said +Y, fixed.
+  skeleton by make_chief.py (bone map, per-bone fit to the target's rest pose, weights renamed, back faces added).
+  The first version replaced the default jacket: CONFIRMED in-game that added bones (38) and the fit work (issues:
+  Mask1 R=255 turns dark cloth pale cream; single-sided shells were see-through). The user wants costumes, as
+  additions if possible: a new item is not possible yet (TODO), so it now replaces costume 016 (camo soldier, M+F,
+  3 texture sets, glass submesh shrunk; not yet confirmed in-game). The rider faces -Y (left = +X).
 - **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
   BLENDER.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and
@@ -274,8 +276,9 @@ API. Everything below is on `rework/rust-server`.
 
 1. Confirm in-game: camera-relative Fly (live camera calibration); mods/shoulder_pads (rebuilt topology +
    explicit weights); then a mod that adds a bone / grows a bone map (export --rig).
-2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch). The
-   skeleton resource (hierarchy) is still not decoded; the Blender path itself is done.
+2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch), e.g.
+   Master Chief as a new costume (asked 2026-10-26; today it replaces costume 016). Game Bootstrap Settings
+   (0x800) is one 146 MB datafile of 17,292 resources. The skeleton resource (hierarchy) is still not decoded.
 3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
    unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the
    intro back). A server admin command "roll stats back to a time" (fold stat_events) would make repairs routine.

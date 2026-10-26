@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Master Chief as the default male rider's outfit: converts a skinned glTF onto Steep's skeleton and writes this
-mod's .forge entries (client/forge/<Base>/).
+"""Master Chief as costume 016 (male and female): converts a skinned glTF onto Steep's skeleton and writes this mod's
+.forge entries (client/forge/<Base>/).
 
 The model is "Master Chief High Poly" by HarrisonHag1 (CC-BY-4.0,
 https://sketchfab.com/3d-models/master-chief-high-poly-18f5ee1d13904939971601055102c91b), unpacked into
-models/master_chief_high_poly/ (not in git). What it does:
+models/master_chief_high_poly/ (not in git). A costume is a whole-body item: the game takes the rest of the outfit
+off while one is worn. What this does:
 1. Retarget: the model's bones (bip_pelvis, bip_upperArm_L, f_index.01.L, ...) are mapped to Steep's (Reference,
-   LeftArm, LeftHandIndex1, ...). Each bone is rotated so it points along Steep's bone and moved onto Steep's joint
-   (the rest poses of the jacket, gloves, pants and boots); the vertices follow by their own weights. Both stand
-   in an A-pose facing -Y, so the changes are small. The weights are renamed to Steep's bones.
-2. Textures: the 4 materials (armor, suit, helmet, visor) are packed 2x2 into one 2048 atlas, for the jacket's
-   diffuse, normal, specular and mask maps, and the UVs are moved into their quarter.
-3. Mesh: the whole body replaces STP_M_Jacket_001 (all 4 LODs, and the LOD0 copy in the Alps archive), with the
-   leg and finger bones the jacket lacks added (`mesh.py import --glb`).
-4. The rest of the default male outfit (head, hair, hat, helmets, goggles, gloves, pants, boots, scarves,
-   backpacks, the jacket's zippers) is shrunk to a point (`mesh.py edit --scale 0.001`), so nothing pokes through.
+   LeftArm, LeftHandIndex1, ...). Each bone is turned to point along Steep's bone and moved onto Steep's joint (the
+   costume's own rest pose, for each gender); the vertices follow by their own weights. Both stand in an A-pose
+   facing -Y, so the changes are small. The weights are renamed to Steep's bones.
+2. Parts: the armor goes into the costume's jacket submesh, the suit into its pants, helmet and visor share its
+   helmet; each with its own texture set (diffuse, normal, specular, mask), so armor and suit keep 2048 pixels. The
+   glass submesh (its material is shared with other gear) shrinks to a speck. Every triangle gets a back face,
+   since the model's materials are double-sided and Steep draws front faces only.
+3. Out: `mesh.py import --glb` into every LOD of both costumes (bones they lack are added), `texture.py replace`
+   for the costume's 3 texture sets (the male and female costume share them).
 Needs numpy and Pillow (the textures are JPEG).
 """
 
@@ -22,6 +23,7 @@ import argparse
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,21 +38,18 @@ import gltf  # noqa: E402
 import mesh  # noqa: E402
 import texture  # noqa: E402
 
-ONB = "DataPC_extra_chr_onboarding"
-JACKET = "STP_M_Jacket_001"
-TEX = {"diffuse": "STP_M_Jacket_001_T01_DiffuseMap", "normal": "STP_M_Jacket_001_T01_NormalMap",
-       "specular": "STP_M_Jacket_001_T01_SpecularMap", "mask": "STP_M_Jacket_001_T01_Mask1Map"}
-REST_FROM = ["STP_M_Jacket_001", "STP_M_Glove_001", "STP_M_Pants_001", "STP_M_SkiBoot_001"]  # first one wins
-HIDE = ["STP_M_Jacket_001_Zippers01", "STP_M_Jacket_002", "STP_M_Jacket_002_Zippers01", "STP_M_Glove_001",
-        "STP_M_Pants_001", "STP_M_Pants_005", "STP_M_Pants_005_Zippers01", "STP_M_SkiBoot_001",
-        "STP_M_SkiBoot_001_Cut", "STP_M_SnowboardBoot_001", "STP_M_SnowboardBoot_001_Cut", "STP_M_Head_001",
-        "STP_M_Head_001_Beard", "STP_M_Head_001_TeethUp", "STP_M_Head_001_TeethDn", "STP_M_Head_001_Tongue",
-        "STP_M_Head_002", "STP_M_Head_002_TeethUp", "STP_M_Head_002_TeethDn", "STP_M_Head_002_Tongue",
-        "STP_M_Head_004_Hair", "STP_M_Hat_001", "STP_M_Helmet_001", "STP_M_Helmet_001_Sangle", "STP_M_Helmet_003",
-        "STP_M_Helmet_003_Sangle", "STP_M_Helmet_003_BP", "STP_M_Goggle_001", "STP_M_Goggle_002",
-        "STP_M_Goggle_001_BP", "STP_M_Scarf_001", "STP_M_Scarf_002", "STP_M_Backpack_001",
-        "STP_M_Backpack_001_Zipper01", "STP_M_Backpack_001_Zipper02", "STP_M_BackpackBelt_Default_001",
-        "STP_M_BackpackBelt_Large_001", "STP_M_Backpack_NoBJ_001", "STP_M_Harness_001"]
+BASE = "DataPC_extra_chr"
+COSTUMES = {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"}
+# Steep material -> the model's materials it takes, each with its rectangle of the textures (x, y, w, h in UV units,
+# v pointing down as in the upright image)
+LAYOUT = {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
+          "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
+          "STP_MF_Costume_016_Helmet_ALL": [("chiefhelmet", (0.0, 0.0, 0.5, 1.0)),
+                                            ("chiefvisor", (0.5, 0.0, 0.5, 1.0))]}
+COLLAPSE = ["STP_MF_Glass_ALL"]  # shared with goggles and more: only its geometry goes, its textures stay
+SLOTS = {0: "diffuse", 1: "normal", 2: "specular", 7: "mask"}  # TextureSet slot -> map
+FALLBACK = ("Pants", "Glove", "Jacket")  # gear of the same gender searched for bones the costume lacks
+SIZE, PAD = 2048, 6 / 2048
 
 # the model's bones (numeric suffix stripped) -> Steep's; fingers are handled by finger_bone
 BONES = {"bip_pelvis": "Reference", "bip_spine_0": "Spine", "bip_spine_1": "Spine1", "bip_spine_2": "Spine2",
@@ -66,9 +65,6 @@ for _s in ("Left", "Right"):
                   f"{_s}Hand": f"{_s}HandMiddle1", f"{_s}UpLeg": f"L_{_s}Leg", f"L_{_s}Leg": f"{_s}Foot"})
     for _f in ("Thumb", "Index", "Middle", "Ring", "Pinky"):
         CHILD.update({f"{_s}Hand{_f}1": f"{_s}Hand{_f}2", f"{_s}Hand{_f}2": f"{_s}Hand{_f}3"})
-
-ATLAS = {"chiefarmor": (0, 0), "chiefsuit": (1, 0), "chiefhelmet": (0, 1), "chiefvisor": (1, 1)}  # quarters
-SIZE, PAD = 2048, 6 / 2048
 
 
 def run(*cmd):
@@ -86,8 +82,8 @@ def finger_bone(name: str, side: str) -> str | None:
 
 
 def model_bones(g: gltf.Gltf) -> tuple[list, list, dict]:
-    """Per joint of the skin: its Steep bone (or None: it follows its parent), its skinning matrix (joint world x
-    inverse bind) and the rest position of every mapped joint (glTF space, the model's units)."""
+    """Per joint of the skin: its Steep bone (unmapped joints follow their nearest mapped ancestor), its skinning
+    matrix (joint world x inverse bind) and the rest position of every mapped joint (Steep's axes, model units)."""
     d = g.doc
     W = g.world_matrices()
     sk = d["skins"][0]
@@ -109,7 +105,7 @@ def model_bones(g: gltf.Gltf) -> tuple[list, list, dict]:
             pos.setdefault(s, np.array(gltf.from_gl(W[j][12:15])))
         steep.append(s)
     index = {j: k for k, j in enumerate(joints)}
-    for k, j in enumerate(joints):  # unmapped joints (ends, root) follow the nearest mapped ancestor
+    for k, j in enumerate(joints):
         p = j
         while steep[k] is None and p in parent:
             p = parent[p]
@@ -123,6 +119,7 @@ def model_bones(g: gltf.Gltf) -> tuple[list, list, dict]:
 def model_geometry(g: gltf.Gltf, skin: list) -> list[dict]:
     """Each primitive at rest in Steep's axes (still the model's units): positions, normals, UVs, joints, weights."""
     d = g.doc
+    S = np.array(skin).reshape(-1, 4, 4).transpose(0, 2, 1)  # row-major 4x4 per joint
     out = []
     for nd in d["nodes"]:
         if "mesh" not in nd:
@@ -133,27 +130,47 @@ def model_geometry(g: gltf.Gltf, skin: list) -> list[dict]:
             N = np.array(g.values(at["NORMAL"]))
             J = np.array(g.values(at["JOINTS_0"]), int)
             Wt = np.array(g.values(at["WEIGHTS_0"]))
-            S = np.array(skin).reshape(-1, 4, 4).transpose(0, 2, 1)  # row-major 4x4 per joint
             M = np.einsum("vk,vkij->vij", Wt, S[J])
             p = np.einsum("vij,vj->vi", M[:, :3, :3], P) + M[:, :3, 3]
             n = np.einsum("vij,vj->vi", M[:, :3, :3], N)
-            idx = np.array(g.values(pr["indices"]), int).reshape(-1, 3)
             out.append({"pos": p[:, [0, 2, 1]] * [1, -1, 1], "nrm": n[:, [0, 2, 1]] * [1, -1, 1],
-                        "uv": np.array(g.values(at["TEXCOORD_0"])), "joints": J, "weights": Wt, "tris": idx,
+                        "uv": np.array(g.values(at["TEXCOORD_0"])), "joints": J, "weights": Wt,
+                        "tris": np.array(g.values(pr["indices"]), int).reshape(-1, 3),
                         "material": d["materials"][pr["material"]]["name"]})
     return out
 
 
-# --- Steep's rest pose ----------------------------------------------------------------------------------------------
+# --- Steep's side -----------------------------------------------------------------------------------------------------
 
-def steep_rest(game: str) -> dict:
-    """Bone -> (inverse bind matrix, rest matrix) from the default items' LOD0 (the first item that has it)."""
-    rest = {}
-    for item in REST_FROM:
-        s = mesh.load_source(os.path.join(game, ONB + ".forge"), item)
-        r = [r for _, r in mesh.mesh_resources(s, ["LOD0"])][0]
-        for h, M in mesh.parse_mesh(r.payload).bones:
-            rest.setdefault(mesh.bone_name(h), (list(M), gltf.mat_inv_rigid(M)))
+def lod0_bones(source: mesh.Source) -> list:
+    r = [r for _, r in mesh.mesh_resources(source, ["LOD0"])][0]
+    return mesh.parse_mesh(r.payload).bones
+
+
+def steep_rest(game: str, gender: str, need: set) -> dict:
+    """Bone -> (inverse bind matrix, rest matrix): the costume's own, and for bones it lacks the first gear of the
+    same gender that has them."""
+    arch = os.path.join(game, BASE + ".forge")
+    rest = {mesh.bone_name(h): (list(M), gltf.mat_inv_rigid(M))
+            for h, M in lod0_bones(mesh.load_source(arch, COSTUMES[gender]))}
+    missing = need - set(rest)
+    gear = [(fg, e) for fg in (forge.Forge(os.path.join(game, "DataPC_extra_chr_onboarding.forge")), forge.Forge(arch))
+            for e in fg.entries if e.type == 0x51DC6B80 and e.name.startswith(f"STP_{gender}_")
+            and any(k in e.name for k in FALLBACK)]
+    for fg, e in gear:
+        if not missing:
+            break
+        try:
+            bones = lod0_bones(mesh.Source(e.name, e.id, e.name, e.type, forge.parse_datafile(fg.read(e)).resources))
+        except SystemExit:
+            continue
+        for h, M in bones:
+            if mesh.bone_name(h) in missing:
+                rest[mesh.bone_name(h)] = (list(M), gltf.mat_inv_rigid(M))
+                print(f"  {COSTUMES[gender]}: {mesh.bone_name(h)} from {e.name}")
+        missing = need - set(rest)
+    if missing:
+        sys.exit(f"{COSTUMES[gender]}: no rest pose for {sorted(missing)}")
     return rest
 
 
@@ -170,25 +187,21 @@ def rotation(a, b) -> np.ndarray:
 def fit(model_pos: dict, rest: dict, sole: float) -> tuple[float, dict]:
     """Per Steep bone a transform (rotation, scale, move) taking the model's bone onto Steep's. The feet are also
     squashed in height so the soles (the model's lowest point, `sole`) end on the floor, as Steep's do."""
-    sp = {b: np.array(rest[b][1][12:15]) for b in model_pos if b in rest}
-    missing = [b for b in model_pos if b not in rest]
-    if missing:
-        sys.exit(f"Steep rest pose missing for {missing}")
+    sp = {b: np.array(rest[b][1][12:15]) for b in model_pos}
     scale = (sp["Head"][2] - sp["LeftFoot"][2]) / (model_pos["Head"][2] - model_pos["LeftFoot"][2])
-    xf, rot = {}, {}
-    order = sorted(model_pos, key=lambda b: (b != "Reference", b))  # Reference first, then parents before children
+    rot: dict = {}
 
     def rot_of(b):
-        if b in rot:
-            return rot[b]
-        c = CHILD.get(b)
-        if c in model_pos and c in sp:
-            rot[b] = rotation(model_pos[c] - model_pos[b], sp[c] - sp[b])
-        else:  # a leaf (head, finger tips, feet): its parent's rotation
-            par = next((p for p, ch in CHILD.items() if ch == b), "Reference")
-            rot[b] = rot_of(par) if par != b else np.eye(3)
+        if b not in rot:
+            c = CHILD.get(b)
+            if c in model_pos:
+                rot[b] = rotation(model_pos[c] - model_pos[b], sp[c] - sp[b])
+            else:  # a leaf (head, finger tips, feet): its parent's rotation
+                par = next((p for p, ch in CHILD.items() if ch == b), "Reference")
+                rot[b] = rot_of(par) if par != b else np.eye(3)
         return rot[b]
-    for b in order:
+    xf = {}
+    for b in model_pos:
         A = rot_of(b) * scale
         if b.endswith("Foot"):
             A = np.diag([1.0, 1.0, sp[b][2] / ((model_pos[b][2] - sole) * scale)]) @ A
@@ -196,85 +209,120 @@ def fit(model_pos: dict, rest: dict, sole: float) -> tuple[float, dict]:
     return scale, xf
 
 
-# --- textures -------------------------------------------------------------------------------------------------------
-
-def atlas(model: str, out: str) -> dict:
-    """The 4 maps of the jacket's texture set from the model's materials, packed 2x2 (upright, as texture.py
-    takes them). Returns {map: png path}."""
-    tex = os.path.join(model, "textures")
-    half = SIZE // 2
-    img = {k: np.zeros((SIZE, SIZE, 4), np.int32) for k in ("diffuse", "normal", "specular", "mask")}
-
-    def load(name, fallback):
-        p = os.path.join(tex, name)
-        if not os.path.exists(p):
-            return np.broadcast_to(np.array(fallback, np.int32), (half, half, 4)).copy()
-        return texture.resize(texture.read_image(p), half, half)
-    for mat, (qx, qy) in ATLAS.items():
-        ys, xs = slice(qy * half, (qy + 1) * half), slice(qx * half, (qx + 1) * half)
-        img["diffuse"][ys, xs] = load(f"{mat}_baseColor.jpeg", (128, 128, 128, 255))
-        nm = load(f"{mat}_normal.png", (128, 128, 255, 255))
-        # Steep: X in R, Y in G (pointing up the image, as glTF's), B = 0, A = the jacket's average of its 4th map
-        img["normal"][ys, xs] = np.stack([nm[..., 0], nm[..., 1], np.zeros_like(nm[..., 0]),
-                                          np.full_like(nm[..., 0], 98)], -1)
-        mr = load(f"{mat}_metallicRoughness.png", (0, 128, 0, 255))  # glTF: G roughness, B metalness
-        spec = np.clip(30 + 0.55 * mr[..., 2] + 0.25 * (255 - mr[..., 1]), 0, 255)
-        img["specular"][ys, xs] = np.stack([spec, spec, spec, np.full_like(spec, 255)], -1)
-        cloth = 255 if mat == "chiefsuit" else 0  # Mask1 R: white on the jacket's fabric, black on its hard parts
-        img["mask"][ys, xs] = (cloth, 0, 255, 255)
-    paths = {}
-    for k, v in img.items():
-        paths[k] = os.path.join(out, f"chief_{k}.png")
-        texture.write_png(paths[k], v)
-    return paths
+def texture_sets(game: str) -> dict:
+    """Steep material -> {map: TextureMap id} of its TextureSet (both costumes use the same materials)."""
+    s = mesh.load_source(os.path.join(game, BASE + ".forge"), COSTUMES["M"])
+    by_name = {r.name: r for r in s.resources}
+    out = {}
+    for mat in LAYOUT:
+        payload = by_name[mat].payload
+        ts = next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload)
+        out[mat] = {SLOTS[k]: struct.unpack_from("<Q", ts.payload, 13 + 10 * k + 2)[0]
+                    for k in SLOTS if ts.payload[13 + 10 * k] == 1}
+    return out
 
 
 # --- output ---------------------------------------------------------------------------------------------------------
 
+def maps(model: str, out: str) -> dict:
+    """Per Steep material its 4 maps from the model's materials, each in its rectangle (upright, as texture.py
+    takes them). Returns {material: {map: png path}}."""
+    tex = os.path.join(model, "textures")
+    res = {}
+    for mat, parts in LAYOUT.items():
+        img = {k: np.zeros((SIZE, SIZE, 4), np.int32) for k in SLOTS.values()}
+        for name, (x, y, w, h) in parts:
+            ys, xs = slice(round(y * SIZE), round((y + h) * SIZE)), slice(round(x * SIZE), round((x + w) * SIZE))
+            pw, ph = xs.stop - xs.start, ys.stop - ys.start
+
+            def load(suffix, fallback):
+                p = os.path.join(tex, f"{name}_{suffix}")
+                if not os.path.exists(p):
+                    return np.broadcast_to(np.array(fallback, np.int32), (ph, pw, 4)).copy()
+                return texture.resize(texture.read_image(p), pw, ph)
+            img["diffuse"][ys, xs] = load("baseColor.jpeg", (128, 128, 128, 255))
+            nm = load("normal.png", (128, 128, 255, 255))
+            # X in R, Y in G (pointing up the image, as glTF's), B = 0, A = the jacket's average of its 4th map (G)
+            img["normal"][ys, xs] = np.stack([nm[..., 0], nm[..., 1], np.zeros_like(nm[..., 0]),
+                                              np.full_like(nm[..., 0], 98)], -1)
+            mr = load("metallicRoughness.png", (0, 128, 0, 255))  # glTF: G roughness, B metalness
+            spec = np.clip(30 + 0.55 * mr[..., 2] + 0.25 * (255 - mr[..., 1]), 0, 255)
+            img["specular"][ys, xs] = np.stack([spec, spec, spec, np.full_like(spec, 255)], -1)
+            # Mask1 R: the jackets have it white on fabric; in the game white turned the model's dark suit pale
+            # cream (G: frost/snow on cloth), so every part is "hard" (0)
+            img["mask"][ys, xs] = (0, 0, 255, 255)
+        res[mat] = {}
+        for k, v in img.items():
+            res[mat][k] = os.path.join(out, f"{mat}_{k}.png")
+            texture.write_png(res[mat][k], v)
+    return res
+
+
 def write_glb(parts: list, xf: dict, rest: dict, path: str) -> tuple[int, int]:
-    """The fitted body as one object with the jacket's material, skinned to Steep's bones."""
-    bones = sorted({b for p in parts for b in p["bones"]})
+    """The fitted body, skinned to Steep's bones: a primitive per Steep material (LAYOUT), with a back face for
+    every triangle, plus a speck (one 1 mm triangle inside the chest) for each COLLAPSE material."""
+    target = {name: (mat, rect) for mat, lst in LAYOUT.items() for name, rect in lst}
+    bones = sorted({b for p in parts for b in p["bones"]} | {"Spine2"})
     bi = {b: i for i, b in enumerate(bones)}
-    pos, nrm, uv, js, ws, idx = [], [], [], [], [], []
     nmat = {k: np.linalg.inv(A).T for k, (A, _) in xf.items()}  # normals: the inverse transpose
+    prims: dict[str, dict] = {}
     for p in parts:
-        base = len(pos)
-        qx, qy = ATLAS[p["material"]]
+        mat, (x, y, w, h) = target[p["material"]]
+        q = prims.setdefault(mat, {"pos": [], "nrm": [], "uv": [], "js": [], "ws": [], "idx": []})
+        base = len(q["pos"])
         for k in range(len(p["pos"])):
             v, n = p["pos"][k], p["nrm"][k]
-            infl = {}
-            for j, w in zip(p["joints"][k], p["weights"][k]):
-                if w > 0:
-                    infl[p["bones"][j]] = infl.get(p["bones"][j], 0.0) + float(w)
+            infl: dict = {}
+            for j, wt in zip(p["joints"][k], p["weights"][k]):
+                if wt > 0:
+                    infl[p["bones"][j]] = infl.get(p["bones"][j], 0.0) + float(wt)
             top = sorted(infl.items(), key=lambda kv: -kv[1])[:4]
-            tot = sum(w for _, w in top)
-            vp = sum(w * (xf[b][0] @ v + xf[b][1]) for b, w in top) / tot
-            vn = sum(w * (nmat[b] @ n) for b, w in top)
-            vn = vn / (np.linalg.norm(vn) or 1)
-            pos.append(gltf.to_gl(vp.tolist()))
-            nrm.append(gltf.to_gl(vn.tolist()))
-            u, w_ = (min(max(float(c), 0.0), 1.0) for c in p["uv"][k])  # the model's UVs stay within 0..1
-            uv.append(((qx + PAD * 2 + u * (1 - 4 * PAD)) / 2, (qy + PAD * 2 + w_ * (1 - 4 * PAD)) / 2))
-            js.append(tuple(bi[b] for b, _ in top) + (0,) * (4 - len(top)))
-            ws.append(tuple(w / tot for _, w in top) + (0.0,) * (4 - len(top)))
-        idx += [base + int(i) for i in p["tris"].reshape(-1)]
+            tot = sum(wt for _, wt in top)
+            vp = sum(wt * (xf[b][0] @ v + xf[b][1]) for b, wt in top) / tot
+            vn = sum(wt * (nmat[b] @ n) for b, wt in top)
+            q["pos"].append(vp)
+            q["nrm"].append(vn / (np.linalg.norm(vn) or 1))
+            u, t = (min(max(float(c), 0.0), 1.0) for c in p["uv"][k])  # the model's UVs stay within 0..1
+            q["uv"].append((x + PAD + u * (w - 2 * PAD), y + PAD + t * (h - 2 * PAD)))
+            q["js"].append(tuple(bi[b] for b, _ in top) + (0,) * (4 - len(top)))
+            q["ws"].append(tuple(wt / tot for _, wt in top) + (0.0,) * (4 - len(top)))
+        q["idx"] += [base + int(i) for i in p["tris"].reshape(-1)]
+    chest = np.array(rest["Spine2"][1][12:15])
+    for mat in COLLAPSE:
+        prims[mat] = {"pos": [chest, chest + [0.001, 0, 0], chest + [0, 0, 0.001]], "nrm": [np.array([0, -1.0, 0])] * 3,
+                      "uv": [(0.5, 0.5)] * 3, "js": [(bi["Spine2"], 0, 0, 0)] * 3, "ws": [(1.0, 0, 0, 0)] * 3,
+                      "idx": [0, 1, 2]}
     b = gltf.Builder("powder mods/master_chief/make_chief.py")
     root = b.add("nodes", {"name": "Steep_Rig"})
     jn = [b.add("nodes", {"name": name, **gltf.trs(gltf.mat_to_gl(rest[name][1]))}) for name in bones]
     b.doc["nodes"][root]["children"] = jn
     ibm = b.accessor([gltf.mat_to_gl(rest[name][0]) for name in bones], "MAT4", target=None)
     skin = b.add("skins", {"joints": jn, "inverseBindMatrices": ibm, "skeleton": root})
-    mat = b.add("materials", {"name": "STP_M_Jacket_001_ALL"})
-    prim = {"attributes": {"POSITION": b.accessor(pos, "VEC3", bounds=True), "NORMAL": b.accessor(nrm, "VEC3"),
-                           "TEXCOORD_0": b.accessor(uv, "VEC2"), "JOINTS_0": b.accessor(js, "VEC4", gltf.USHORT),
-                           "WEIGHTS_0": b.accessor(ws, "VEC4")},
-            "indices": b.accessor(idx, "SCALAR", gltf.UINT, target=gltf.ELEMENT_ARRAY_BUFFER), "material": mat}
-    node = b.add("nodes", {"name": "master_chief", "mesh": b.add("meshes", {"name": "master_chief",
-                                                                           "primitives": [prim]}), "skin": skin})
+    out, nv, nt = [], 0, 0
+    for mat, q in prims.items():
+        P, N, T = np.array(q["pos"]), np.array(q["nrm"]), np.array(q["idx"]).reshape(-1, 3)
+        if mat not in COLLAPSE:  # turn triangles wound against their normals, then add the back faces
+            fn = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
+            flip = (fn * N[T].sum(1)).sum(1) < 0
+            T[flip] = T[flip][:, ::-1]
+            n = len(P)
+            P, N = np.concatenate([P, P]), np.concatenate([N, -N])
+            q["uv"], q["js"], q["ws"] = q["uv"] * 2, q["js"] * 2, q["ws"] * 2
+            T = np.concatenate([T, T[:, ::-1] + n])
+        nv, nt = nv + len(P), nt + len(T)
+        at = {"POSITION": b.accessor([gltf.to_gl(x) for x in P.tolist()], "VEC3", bounds=True),
+              "NORMAL": b.accessor([gltf.to_gl(x) for x in N.tolist()], "VEC3"),
+              "TEXCOORD_0": b.accessor(q["uv"], "VEC2"), "JOINTS_0": b.accessor(q["js"], "VEC4", gltf.USHORT),
+              "WEIGHTS_0": b.accessor(q["ws"], "VEC4")}
+        out.append({"attributes": at, "material": b.add("materials", {"name": mat}),
+                    "indices": b.accessor(T.reshape(-1).tolist(), "SCALAR", gltf.UINT,
+                                          target=gltf.ELEMENT_ARRAY_BUFFER)})
+    node = b.add("nodes", {"name": "master_chief", "skin": skin,
+                           "mesh": b.add("meshes", {"name": "master_chief", "primitives": out})})
     b.doc["scenes"][0]["nodes"] += [root, node]
     with open(path, "wb") as f:
         f.write(b.glb())
-    return len(pos), len(idx) // 3
+    return nv, nt
 
 
 def holders(game: str, ids: list[int]) -> set[tuple[str, str]]:
@@ -288,50 +336,40 @@ def main():
     ap.add_argument("--game", required=True, help="the Steep folder")
     ap.add_argument("--model", default=os.path.join(HERE, "..", "..", "models", "master_chief_high_poly"))
     ap.add_argument("-o", "--out", default=os.path.join(HERE, "client", "forge"))
-    ap.add_argument("--glb", help="also keep the fitted model (for a look in Blender)")
+    ap.add_argument("--glb", help="also keep the fitted models, <this>_M.glb and <this>_F.glb (to look at in Blender)")
     a = ap.parse_args()
     g = gltf.load(os.path.join(a.model, "scene.gltf"))
     steep, skin, mpos = model_bones(g)
-    rest = steep_rest(a.game)
     parts = model_geometry(g, skin)
-    scale, xf = fit(mpos, rest, min(float(p["pos"][:, 2].min()) for p in parts))
     for p in parts:
         p["bones"] = steep
+    sole = min(float(p["pos"][:, 2].min()) for p in parts)
     tmp = tempfile.mkdtemp(prefix="powder_chief_")
     try:
-        glb = os.path.join(tmp, "chief.glb")
-        nv, nt = write_glb(parts, xf, rest, glb)
-        print(f"fitted: {nv} vertices, {nt} triangles, scale {scale:.6f} m per model unit, "
-              f"{len(set(steep) - {None})} Steep bones")
-        if a.glb:
-            shutil.copy(glb, a.glb)
         shutil.rmtree(a.out, ignore_errors=True)
-        # the body: every datafile that holds a jacket LOD
-        onb = forge.Forge(os.path.join(a.game, ONB + ".forge"))
-        jack = mesh.load_source(onb.path, JACKET)
-        lod_ids = [r.id for _, r in mesh.mesh_resources(jack, None)]
-        for base, entry in sorted(holders(a.game, lod_ids)):
-            print(run(os.path.join(TOOLS, "mesh.py"), "import", os.path.join(a.game, base + ".forge"), entry,
-                      "--glb", glb, "--to", "LOD", "--ignore-names", "-o", os.path.join(a.out, base)).strip())
-        # the textures: every copy of the jacket's 4 maps (and their Mip entries)
-        pngs = atlas(a.model, tmp)
-        tex_ids = {k: onb.find(name, exact=True)[0].id for k, name in TEX.items()}
-        where = holders(a.game, list(tex_ids.values()))
-        for k, tid in tex_ids.items():
-            for base in sorted({b for b, e in where if int(e, 16) == tid}):
-                print(run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, base + ".forge"),
-                          f"{tid:#x}", "--image", pngs[k], "-o", os.path.join(a.out, base)).strip().splitlines()[-1])
-        # the rest of the outfit, shrunk to a point
-        hide_ids = []
-        for name in HIDE:
-            for e in onb.find(name, exact=True):
-                df = forge.parse_datafile(onb.read(e))
-                hide_ids += [r.id for r in df.resources if r.type == mesh.MESH_TYPE and r.id not in lod_ids]
-        hidden = holders(a.game, hide_ids) - holders(a.game, lod_ids)
-        for base, entry in sorted(hidden):
-            run(os.path.join(TOOLS, "mesh.py"), "edit", os.path.join(a.game, base + ".forge"), entry,
-                "--scale", "0.001", "-o", os.path.join(a.out, base))
-        print(f"hidden: {len(hidden)} datafiles of the default outfit")
+        for gender, costume in COSTUMES.items():
+            rest = steep_rest(a.game, gender, set(mpos) | {"Spine2"})
+            scale, xf = fit(mpos, rest, sole)
+            glb = os.path.join(tmp, f"chief_{gender}.glb")
+            nv, nt = write_glb(parts, xf, rest, glb)
+            print(f"{costume}: {nv} vertices, {nt} triangles (with back faces), {scale:.6f} m per model unit")
+            if a.glb:
+                shutil.copy(glb, f"{a.glb}_{gender}.glb")
+            lods = [r.id for _, r in mesh.mesh_resources(mesh.load_source(os.path.join(a.game, BASE + ".forge"),
+                                                                          costume), None)]
+            for base, entry in sorted(holders(a.game, lods)):
+                res = run(os.path.join(TOOLS, "mesh.py"), "import", os.path.join(a.game, base + ".forge"), entry,
+                          "--glb", glb, "--to", "LOD", "--ignore-names", "-o", os.path.join(a.out, base))
+                print("\n".join(line for line in res.splitlines() if "submesh" in line))
+        pngs = maps(a.model, tmp)
+        sets = texture_sets(a.game)
+        where = holders(a.game, [t for m in sets.values() for t in m.values()])
+        for mat, ids in sets.items():
+            for k, tid in ids.items():
+                for base in sorted({b for b, e in where if int(e, 16) == tid}):
+                    run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, base + ".forge"),
+                        f"{tid:#x}", "--image", pngs[mat][k], "-o", os.path.join(a.out, base))
+                    print(f"  {mat} {k}: {base}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

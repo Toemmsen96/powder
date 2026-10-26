@@ -1074,7 +1074,10 @@ def import_topology(m: Mesh, items: list[tuple[Submesh, list[Vtx], list[tuple]]]
         if "uv1" in a:
             uvs += [abs(c) for v, x in zip(vs, tpl) for c in (v.uv1 if v.uv1 is not None else dec_uv(m, x, a["uv1"]))]
     X2 = max(max(uvs, default=0.0), m.X)
-    maps = {sm.index: list(sm.bone_map) for sm in m.submeshes}
+    # a submesh rebuilt only from vertices with their own weights starts with an empty bone map (its old slots are
+    # unused, and appending to a long map could pass 128); otherwise new bones are appended to the old map
+    fresh = {i for i, (vs, *_) in built.items() if vs and all(v.skin and v.row is None for v in vs)}
+    maps = {sm.index: [] if sm.index in fresh else list(sm.bone_map) for sm in m.submeshes}
     fallback: dict[int, int] = {}
 
     def skin_set(row: bytes, bm: list, off: int | None = None) -> list:
@@ -1496,6 +1499,9 @@ def import_glb(s: Source, res: list, a) -> list[str]:
         items: dict[int, tuple] = {}
         for mname, (vs, ts) in geo.items():
             sm = submesh_for(m, mname, names, len(geo) == 1)
+            if sm is None and a.to:  # e.g. a LOD without that submesh
+                print(f"  {name}: no submesh with material {mname!r}, left out", file=sys.stderr)
+                continue
             if sm is None:
                 sys.exit(f"{name}: material {mname!r} is no submesh's of {name}; the submeshes' materials are "
                          + ", ".join(material_label(x, m, names) for x in m.submeshes))
