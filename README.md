@@ -8,6 +8,14 @@ Powder is an unofficial fan preservation project. It is not affiliated with or e
 Steep and Ubisoft Connect are trademarks of Ubisoft. You need your own copy of Steep, from Steam or from
 Ubisoft Connect. The repository contains no game files and no data from Ubisoft's servers.
 
+## Goal
+
+Keeping Steep online is the first half. The end goal is something like ReSkate (the community
+revival of Skate 3): a community-run Steep that lives on, with a **real, usable modding API** - mods that add content
+(models, textures, gear, lines), change gameplay through game hooks, and talk to their server side, and that
+players enable deliberately (a server can never push code to a player). Where that stands today:
+[Modding](#modding).
+
 ## What it does
 
 - **Server** (`powder-server`): one process that answers the game and Ubisoft Connect in place of Ubisoft:
@@ -442,11 +450,12 @@ uv run powder-server admin trust status           # the local CA in Windows (als
 - **Matchmaking** policy (who meets whom) is in `services/matchmaking.py`; the game's calls and the
   notifications it expects are described there.
 
-## Rust server (work in progress)
+## Rust server
 
-The server is being ported to Rust on the `rework/rust-server` branch (`server/`), reply for reply: the
-game and Ubisoft Connect must not notice the difference. Until it is complete, **play with the Python
-server**; the Rust one is for testing and for writing mods.
+The server is ported to Rust on the `rework/rust-server` branch (`server/`), reply for reply: the game and
+Ubisoft Connect must not notice the difference. It is complete and the **default** (powder-wrap and the
+Linux launcher; the Python server stays available with `POWDER_SERVER=python` and is the reference the port
+is tested against). It builds with the pinned toolchain (`rust-toolchain.toml`: Rust 1.99.1, edition 2024).
 
 ```
 cargo build --release                              # target/release/powder-server
@@ -457,12 +466,10 @@ powder-server admin accounts                       # accounts, account-create, a
 powder-server gamedata verify                      # also build / zip / install
 ```
 
-| Ported | Not yet |
-| ------ | ------- |
-| HTTPS (TLS + local CA, CORS, game-data pack, built-in replies), sign-in (`/v3/profiles/sessions`), the CA's revocation list, Ubisoft Connect's demux | profile, friends, store, UGC, cloud-save routes; the websocket; `/_powder/` status and account API |
-| NEX transport, login, game storage, profile/leaderboard handlers | stats and matchmaking handlers |
-| Storm (peer-to-peer helpers), accounts and sessions, economy, entities, stats, leaderboards, friends, cloud saves (service) | matchmaking, channels, import |
-| server mods (Lua) and client mods | |
+Everything of the Python server is ported: HTTPS (all routes, the websocket), Ubisoft Connect's demux, NEX
+(login, stats, matchmaking, channels), Storm, accounts, the importer, the admin CLI - plus the mods (Lua
+server mods, client mods). Since the port it also grants Steep's "intro finished" item (the game kept
+replaying the Alps intro without it) and marks the DLC worlds as owned.
 
 It reads the same `config.toml`, `data/` (database, keys, local CA) and game-data pack as the Python
 server, so you can switch between them. `admin trust` also works on Linux. A Wine/Proton prefix (Lutris)
@@ -494,8 +501,13 @@ first, and don't run another Powder server on the same `config.toml`. By hand:
 (without `XDG_RUNTIME_DIR`: `~/.cache/powder/powder-wrap.log`).
 
 Steep itself needs its certificate check intercepted; on Windows the launcher injects the helper, on
-Linux powder-wrap deploys a version.dll proxy of it into the game (native/version_proxy.c, experimental),
-so for now the session gets Ubisoft Connect online, and the game reports its services unavailable.
+Linux powder-wrap deploys a version.dll proxy of it into the game (`native/version_proxy.c` + `armer.exe`,
+built by `native/build.sh`), which accepts only the Powder server's own certificate. With it Ubisoft Connect
+**and** Steep are fully online under Proton.
+
+More settings: `POWDER_OVERLAY=1` (the in-game overlay, below) and `POWDER_CLIENT_MODS=name,name` (the client
+mods of this repo to load for the session - [Modding](#modding)). After changing a game's environment in Lutris,
+restart Lutris.
 
 ### Launcher
 
@@ -517,7 +529,43 @@ Libadwaita installed (on Arch: `python-gobject gtk4 libadwaita`). `linux/powder-
 entry for a menu or launcher — edit its `Exec=` to the absolute path of `linux/powder-launcher`. The overlay
 and its admin Server tab need the Rust server (`POWDER_SERVER=rust`).
 
-## Mods
+## In-game overlay and trainer
+
+`native/overlay/` (built by `native/build.sh`, loaded with `POWDER_OVERLAY=1`) is a Dear ImGui overlay inside
+Steep, toggled with **Home**:
+
+- **Server**: the admin actions of `/_powder/admin` (players, credits/items, stats, broadcasts) - Rust server.
+- **Debug**: connection status, the broadcast feed, FPS, an HTTP log, a memory scanner.
+- **Trainer**: finds the rider's position by itself (pointer chains), **Fly** (F6) with **noclip** (the game's
+  own writes to the position are hooked out, so physics and collision can't move you), moving where the
+  camera looks (the camera is found live: turn it once while standing still), teleport spots, freezable
+  address slots.
+- **Mods**: the client mods it hosts, their hooks and panels.
+
+It also logs crashes with the faulting module+offset to `powder_overlay.log`, and carries small game fixes
+(a guard for a crash in the DLC worlds). The reverse-engineering tools behind it are in `tools/trainer/`
+(external memory scans, perf watchpoints with call stacks, a dump of the unpacked game for disassembly).
+
+## Modding
+
+A mod is a folder `mods/<name>/` with up to three parts; the full guide is
+[native/sdk/README.md](native/sdk/README.md).
+
+| Part | What | Status |
+| ---- | ---- | ------ |
+| `mod.lua` | **server mod** (Lua): events, HTTP/NEX hooks, admin tools | ✅ |
+| `client/*.dll` | **client mod** (native, hosted by the overlay): function and mid-function hooks on the game's code, per-frame logic, overlay panels, talking to its server half (`native/sdk/powder_api.h`) | ✅ (e.g. `mods/asset_trace`) |
+| `client/forge/<Base>/` | **asset mod**: entries of Steep's `.forge` archives that override the game's, loaded from a per-session `<Base>_patch_03.forge` | ✅ textures (`mods/custom_texture`), material swaps (`mods/model_swap`); 🟡 meshes (`mods/mesh_edit`, not yet seen in-game) |
+
+The asset tools: `tools/forge/forge.py` (the archives: list, extract, swap, build), `texture.py` (textures
+to and from PNG, all their formats), `mesh.py` (meshes to and from OBJ, also with a new topology),
+`tools/savegame/` (Steep's save files). What a fully new character model still needs: real skin weights from
+a modelling tool, the skeleton resource, new ids for new items.
+
+Asset mods built from the game's own data are generated from your install by each mod's `generate.sh`;
+nothing of Ubisoft's is committed.
+
+### Server and client mods
 
 The Rust server replaces the Python plugins with **mods**, in the `mods/` folder next to `config.toml`
 (`[mods]` in the config picks which; names starting with `_` are skipped, see `mods/_example/`). A mod
@@ -533,7 +581,8 @@ has a server part, a client part, or both:
   than 100 ms is aborted (logged).
 - **Client part**: files in `mods/<name>/client/` and a `mod.toml` (`version`, `description`,
   `[client] inject = ["x.dll"]`). The server lists them at `/_powder/mods`; the launcher downloads them
-  and loads the DLLs into the game. **A player's launcher only loads client mods that player approved**,
+  and loads the DLLs into the game. On Linux, powder-wrap loads the ones named in `POWDER_CLIENT_MODS` from
+  this repo (DLLs through the overlay, assets as a `_patch_03`). **A player's launcher only loads client mods that player approved**,
   pinned to their file hashes: a server cannot push code to its players (the player's side:
   [Client mods](#client-mods)).
 

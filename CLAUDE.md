@@ -45,9 +45,8 @@ client mods are `powder/launcher/mods.py` (+ the "Client mods" step in `session.
 ### State of the port
 
 Everything of the Python server is ported (2026-10-25): all HTTPS routes, the websocket (`/v2/websocket` and
-Connect's `/v2/websocket/server`), NEX stats and matchmaking, channels, the importer, the admin CLI. Played
-against the game once (2026-10-26, `POWDER_SERVER=rust powder-wrap`): Connect, demux, game start, NEX secure
-channel (the game's packets carry our signature), cloud-save upload all worked; no unrouted game requests. Known gaps: `/_powder/status`
+Connect's `/v2/websocket/server`), NEX stats and matchmaking, channels, the importer, the admin CLI. Since 2026-10-26 it is the default and has carried every session
+(Connect, demux, game start, NEX, stats, cloud saves, the overlay's admin tab, mods). Known gaps: `/_powder/status`
 lists a game's address without its port (`NexChannel` does not know its UDP peer); entity/UGC/cloud-save files
 are sent whole (no Range / If-Modified-Since); websocket permessage-deflate is declined. Each port's commit
 message lists its behaviour differences. The Rust server is the default (powder-wrap and the Linux launcher, since
@@ -141,6 +140,8 @@ git clone https://github.com/Toemmsen96/powder.git && cd powder && git checkout 
 cargo test                         # Rust (rustup/cargo needed)
 uv sync && uv run pytest           # Python (uv brings its own Python; 3.14 from the system also works)
 cp config.example.toml config.toml
+native/build.sh                    # Linux: TLS helper, overlay, client mods (MinGW-w64 cross compiler)
+mods/<name>/generate.sh            # asset mods: their entries come from your own Steep install
 ```
 
 Not in git (gitignored, per device): `config.toml`, `launcher.toml`, `data/` (database, local CA in `data/tls/`,
@@ -216,88 +217,60 @@ don't run commands against the user's real prefix or data: test on scratch copie
   folded with services/stats.rs's rules), the last good save restored locally AND in data/cloudsaves AND the
   cloudSave entity's slot sizes/hashes updated (else Connect warns "problem getting your latest save").
 
-## Next steps
+## State (2026-10-26)
 
-1. Done 2026-10-25: the game runs on Linux. The `native/` TLS helper (version.dll proxy + armer byte-patch)
-   gets Steep past the loading screen and online under Wine/Proton (confirmed on the user's PC).
-2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
-   Python server in the user's sessions. First session OK (2026-10-26). DLC worlds: the demux product list sets
-   field 20 (owned) on the "dlc" products (Steep asks via UPLAY_USER_IsOwned); CONFIRMED in-game, in both
-   servers (main e18e78f). The HTTPS entitlements endpoint stays empty (filling it did nothing). ULC keep the
-   captured flag: force-owning cosmetics broke the store / heli tickets.
-   Watch for the hardening (2026-10-25) locking out real clients: "wrong signature" in the log means the
-   game fills PRUDP's signature field differently than our vectors (`[server] nex_check_signatures`: "log", the default, only logs; "enforce" refuses; see
-   nex/connection.rs); also 401/403 "cors-refused" / "origin not allowed" for Connect's UI, 413 bodies, demux
-   frames over 1 MiB, NEX messages over 1 MiB, more than 128 HTTPS connections from one address.
-3. In-game UI from mods (asked for with the admin mod, 2026-10-25). DONE for Linux/Proton: `native/overlay/`
-   is a Dear ImGui overlay (D3D11 Present hook via MinHook; the version.dll proxy LoadLibrary's it when
-   powder-wrap runs with POWDER_OVERLAY=1). Toggle HOME. Server tab = the admin actions over
-   `/_powder/admin/api/*` (needs POWDER_SERVER=rust); Debug tab = status, the broadcast feed (new `feed`
-   action in mods/admin/mod.lua), FPS, HTTP log, and a generic in-process memory scanner. Build with
-   `native/build.sh overlay`; `native/bin/nettest.exe` checks the networking without the game. Verified
-   headless: DLL loads, Present hooked, ImGui init, auto-login + players fetched. Trainer tab (2026-10-25):
-   a generic chassis for trainer features - address slots with freeze, set, X/Y/Z assignment, Fly (hold
-   position, move with W/A/S/D + Shift/Ctrl) and Teleport (save/go-to spot).
-   WORKING 2026-10-25: character fly/teleport confirmed in-game. The player world position was found by
-   external memory analysis (tools/trainer/: findpos -> correlate (movement-delta) -> findauth2 (bisect with
-   held-out observers, gentle single writes); /proc/<pid>/mem read+write works under Proton, no ptrace). Writing
-   the authoritative X/Y/Z moves the real character. Addresses are per-launch.
-   Access-finder (2026-10-25, native/overlay/access.{h,cpp}): the overlay's Trainer tab can PAGE_GUARD a watched
-   address + VEH to capture the instruction(s) that read/write it, decode the operand with HDE64 (MinHook's
-   hde64) to recover the struct base register + value + field offset, show them (module+offset), and NOP a
-   writer to freeze/override that field. VMProtect guards its own code pages, not this data page, so the guard
-   works in-process. This is the bridge to a stable pointer path (so the position needn't be re-hunted each
-   launch) and to the hook manager / client-mod hook API (next).
-   NOCLIP WORKING 2026-10-26 (via tools/trainer/skiphook.py; the overlay port is untested in-game): the player's
-   position is a float3 at transform struct +0x50, written as a 16-byte vector by steep.exe+0x124d0ae /
-   +0x124d16b / +0x124d218 (movaps [reg+0x50]) and +0x37fd6b ([rdx+0x30], rdx = struct+0x20) - generic
-   transform writers (hundreds of objects), so the hook skips only writes into the player's range. Writing the
-   position while the hooks skip the game's writes = noclip; off = physics resumes from there (Z is up).
-   native/overlay/noclip.cpp does it in-process (caves near steep.exe in our memory, WriteProcessMemory on
-   ourselves patches the 5-byte jmp - works under Wine on read-only code), driven by
-   native/overlay/steep_trainer.json (deployed as powder_trainer.json): the writers + their bytes, and 26
-   pointer chains to the struct from one session (tools/trainer/ptrscan.py) - not yet confirmed across launches;
-   the overlay needs two chains to agree. Trainer tab: Find player (auto), Fly = F6, noclip while flying,
-   re-resolves the position every frame while flying (map change). CONFIRMED 2026-10-26: chains found the
-   player after a restart (7 of 26 agree); hooks install in-game via armer.exe --write (VMProtect blocks the
-   game's own writes to its code, also WriteProcessMemory on itself).
-   MOD API (2026-10-26, Wine-tested, not yet in-game): native/sdk/powder_api.h is the C API client mods get via
-   `powder_mod_init(api, mod)`: log, module_base, find_pattern, read/write, patch_code, hook (function detour,
-   MinHook's trampoline builder + our write_code), hook_mid (register-context callback: PowderRegs with the GPRs
-   and xmm0-5, changes are kept), unhook, add_panel (+ the overlay's ImGui context), player_position. The overlay
-   is the host (modhost.cpp loads powder_mods/*.dll, Mods tab; hooks.cpp; codepatch.cpp = code writes with the
-   armer fallback). Mods: mods/<name>/src/*.cpp -> native/build.sh mods -> mods/<name>/client/<name>.dll
-   (gitignored); powder-wrap loads only those named in POWDER_CLIENT_MODS. Example: mods/asset_trace (hooks
-   ntdll NtCreateFile/NtOpenFile/NtReadFile: per-file read stats in the Mods tab, optional read log
-   powder_asset_trace.log = "<ms> <file> <offset> <length>"). Steep's data: AnvilNext .forge archives
-   ("scimitar", v27) + _patch_01/_02 per archive, Wwise .pck, Bink .bk2, terrain .tbf (tools/forge/ for the
-   format). ASSET MODS CONFIRMED IN-GAME 2026-10-26: mods/<name>/client/forge/<Base>/ entries -> powder-wrap builds a
-   per-session <Base>_patch_03.forge; the game loads it and our entries win (mods/model_swap recolours the menu
-   rider's jacket via `forge.py swap`; its entries are Steep's data, generated locally by generate.sh, gitignored).
-   Client-mod API v2 adds on_frame and http (/_powder/ paths only, no session). Guide: native/sdk/README.md.
-   Textures (tools/forge/texture.py, TEXTURES.md; mods/custom_texture) and meshes (mesh.py, MESHES.md; OBJ
-   export/import incl. new topology; mods/mesh_edit) are decoded (2026-10-26, not yet seen in-game). A fully new
-   skinned model still needs real skin weights (Blender path), the skeleton resource, new ids. Fly is camera-
-   relative: camera.cpp calibrates the camera live per session (pointer chains to it are not stable).
-   Deferred: the Windows launcher loading mods through the
-   overlay (it injects client DLLs directly today); live POWDER_* delivery to non-admin players'
-   overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
-   `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
-   `native/build.ps1` overlay target for Windows builds.
-4. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
-5. Done: Linux launcher GUI, `linux/launcher/` (GTK4 + Libadwaita GUI + CLI) and the `linux/powder-launcher`
-   wrapper.
-6. Server management interface (asked for 2026-10-25): access control for a Powder server - whitelist /
-   blacklist mode, add/remove players, ban/kick - enforced in the accounts/sign-in + NEX/HTTPS auth paths,
-   with admin CLI commands and an entry in the admin mod (web + the new overlay). Decide storage (config vs
-   DB) and enforcement points with the user.
-7. Map / line builder mod (idea raised 2026-10-25). Feasibility (checked against routes_ugc.rs / routes_ubi.rs):
-   TIER 1 (feasible, mostly plumbed) - Steep creates custom lines/challenges, trails and challenge ghosts and
-   Powder already stores/serves them (UGC service + profile entities); a mod would curate/publish/browse/share
-   them (web + overlay UI). Next: a read-only RE pass to pin down the entity/UGC types + metadata Steep writes
-   for a custom challenge, then mod + endpoints. TIER 2 (modest RE) - an overlay "ghost line"/planning tool:
-   RE the player + camera world transform (the overlay's memory scanner is the groundwork), draw planned
-   waypoints/gates projected into the 3D view, save to Powder, show on others' overlays; visual only, no
-   collision. TIER 3 (shelved, not realistically feasible) - spawning real rideable ramps as new world
-   geometry: closed VMProtect'd proprietary engine, no SDK; scene/actor spawn + collision + physics RE is
-   research-grade and fragile. Recommendation: Tier 1, then Tier 2; skip Tier 3.
+End goal (README "Goal"): something like ReSkate for Skate 3 - a community-run Steep with a real, usable modding
+API. Everything below is on `rework/rust-server`.
+
+- **Online on Linux:** Connect + Steep online under Proton via powder-wrap (TLS helper: version.dll proxy +
+  armer byte-patch). The Rust server is the default (POWDER_SERVER=python still works).
+- **Server fixes found in play:** DLC worlds owned (demux product field 20 on "dlc" products; both servers;
+  ULC keep the captured flag - force-owning cosmetics broke the store / heli tickets; HTTPS entitlements stay
+  empty). "Intro finished" = inventory item 8d9430c2-... granted when the game looks up its offer (Rust only,
+  routes_ubi.rs ONBOARDING_TOKEN). Without a pack, unknown reward items get synthetic free offers (the game
+  ignores them; harmless). Watch for the 2026-10-25 hardening locking out real clients: "wrong signature" (see
+  `nex_check_signatures`), CORS 401/403 for Connect's UI, 413 bodies, >1 MiB demux/NEX frames, >128 HTTPS
+  connections from one address.
+- **Overlay** (`native/overlay/`, POWDER_OVERLAY=1, Home): Server tab (admin API, Rust server), Debug tab,
+  Trainer tab, Mods tab. Player position via 26 pointer chains in `steep_trainer.json` (7-11 agree after a
+  restart). Noclip: the position (transform struct +0x50) is written as a 16-byte vector by steep.exe+0x124d0ae /
+  +0x124d16b / +0x124d218 / +0x37fd6b (generic transform setters); caves skip only writes into the player's
+  range; the jmp goes in via `armer.exe --write` (VMProtect blocks the game's own code writes). Fly = F6,
+  camera-relative: camera.cpp calibrates the camera live (turn it once standing still) - pointer chains to it
+  were NOT stable across launches. fixes.cpp: a null guard at steep.exe+0x5c8f73 (Alaska crash: no record for
+  rider 0, gear key 6). crashlog.cpp logs faults with module+offset to powder_overlay.log.
+  Camera-relative fly: built, the live calibration is Wine-tested, NOT yet confirmed in-game.
+- **Client-mod API** (`native/sdk/powder_api.h` v2, guide `native/sdk/README.md`): hooks (function, mid with
+  registers), patch_code, find_pattern, read/write, add_panel (ImGui), on_frame, http to /_powder/ (no session),
+  player_position. Hosted by the overlay (modhost.cpp, hooks.cpp on MinHook's trampolines, codepatch.cpp).
+  Confirmed in-game with mods/asset_trace (ntdll file hooks).
+- **Asset mods:** `mods/<name>/client/forge/<Base>/` -> powder-wrap builds a per-session `<Base>_patch_03.forge`
+  (listed in `.powder-assets`, removed afterwards). CONFIRMED in-game: mods/model_swap (material swap) and
+  mods/custom_texture (a generated "POWDER" checkerboard on the menu rider's jacket). mods/mesh_edit (jacket
+  inflated 15 cm) is built but was never enabled in a session yet - test with
+  POWDER_CLIENT_MODS=custom_texture,mesh_edit (restart Lutris after changing its environment). Game data in
+  mods is generated locally by each mod's generate.sh and gitignored.
+- **Tools:** tools/forge (forge.py archives + swap, texture.py, mesh.py, TEXTURES.md, MESHES.md),
+  tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and
+  stackwatch.py perf watchpoints, ptrscan.py, dumpexe.py for the unpacked steep.exe, unwind.py, findcam.py,
+  skiphook.py). Dump analysis: .pdata gives ~155k functions with bounds.
+
+## Next steps (open)
+
+1. Confirm in-game: mods/mesh_edit (meshes), camera-relative Fly (live camera calibration).
+2. A fully new character model: a Blender export path with real skin weights (today weights come from the
+   nearest original vertex), the skeleton resource (not decoded), new ids (entity, template selector entry,
+   bootstrap item, prefetch).
+3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
+   unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the
+   intro back). A server admin command "roll stats back to a time" (fold stat_events) would make repairs routine.
+4. Admin teleport (asked 2026-10-25): a client+server mod pair using API v2 (on_frame + http); decide how the
+   server identifies a player's game (the client carries no session).
+5. Python parity for the intro token (and anything else marked "not yet in Python" in commit messages).
+6. Windows: the launcher loading client mods through the overlay (it injects DLLs directly today);
+   `native/build.ps1` overlay target.
+7. Server management interface (asked 2026-10-25): whitelist/blacklist, ban/kick, in accounts/sign-in + NEX/HTTPS
+   auth, admin CLI + admin mod entry. Decide storage (config vs DB) with the user.
+8. Map / line builder mod (idea 2026-10-25): Tier 1 curate/share Steep's own custom lines/challenges (UGC +
+   entities already stored); Tier 2 an overlay planning tool drawing waypoints in 3D (needs the view matrix);
+   Tier 3 (new rideable geometry) shelved.
