@@ -1,0 +1,2 @@
+version = "0.1"
+description = "Asset-mod test: the default rider's jacket (STP_M_Jacket_001 T01) gets a generated POWDER checkerboard texture (forge _patch_03 override)"
