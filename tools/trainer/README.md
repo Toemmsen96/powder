@@ -71,3 +71,20 @@ the kernel traps the write, the game sees nothing.
 - **Never sustain-freeze a large/dirty candidate set** — writing garbage to thousands of addresses every frame
   wedges the game. Use single writes (bisect) and only ever write to confirmed position copies.
 - Test on your own game only.
+
+## Reverse engineering the unpacked game (dumpexe.py, unwind.py, stackwatch.py)
+
+Steep is VMProtect-packed on disk; its code is only readable in memory.
+
+```
+python3 dumpexe.py <pid> steep.exe steep.dump.exe     # 95 MiB PE: file offsets = RVAs, loads in disassemblers
+python3 stackwatch.py <pid> steep.dump.exe --player 15 # full call stacks of every write to the player's position
+```
+
+The dump's exception directory (.pdata) is intact: ~155k functions with exact bounds and unwind info. stackwatch
+copies the writing thread's user stack at each perf watchpoint hit and unwinds it offline with that unwind info
+(unwind.py = RtlVirtualUnwind's rules), so it shows the real call chain into a write, not a guess. Turn the
+overlay's Fly/noclip off while recording (hooked writers run in caves without unwind info).
+
+The overlay's crash log (powder_overlay.log, "GAME CRASH ...") gives module+offset of a crash; look it up in the
+dump the same way (unwind.Image(dump, base).func(rva)).
