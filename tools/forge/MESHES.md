@@ -1,15 +1,18 @@
 # Steep's meshes (type 0x415D9568)
 
-`mesh.py` reads Steep's mesh resources, exports them as OBJ, moves their vertices, and imports OBJs back. It
-writes unpacked datafile folders, like `forge.py extract` and `swap` do, and `forge.py build` packs those into a
+`mesh.py` reads Steep's mesh resources, exports them as OBJ or glTF, moves their vertices, and imports OBJs or
+glTF back (glTF carries the armature and skin weights: BLENDER.md is the Blender workflow). It writes unpacked
+datafile folders, like `forge.py extract` and `swap` do, and `forge.py build` packs those into a
 `_patch_03`. It uses `forge.py` from the same folder and needs only the standard library (Python 3.10+). Archives
 are only read.
 
 ```
 mesh.py info   <src> [entry] [--mesh LOD0]                     # layout: formats, counts, bounds, submeshes, skinning
 mesh.py export <src> [entry] -o objs/ [--skin]                 # one OBJ per LOD and submesh (+ bones/weights JSON)
+mesh.py export <src> [entry] -o x.glb [--textures] [--rig ITEM]  # glTF: armature, weights, materials (BLENDER.md)
 mesh.py edit   <src> [entry] -o out/ --inflate 0.05 | --scale 1.2[,sy,sz] [--pivot x,y,z] | --translate x,y,z
 mesh.py import <src> [entry] --obj <mesh>_sm<k>.obj ... -o out/ [--topology]
+mesh.py import <src> [entry] --glb x.glb [--to LOD] [--add] [--bone B] -o out/  # any topology, real weights
 mesh.py check  <archive> [-g name] [--limit n]                 # parse every mesh, identity rewrite, sanity checks
 ```
 
@@ -57,7 +60,7 @@ All little-endian. Nested objects are serialised as `u64 id (0 here), u32 class 
 | part | contents |
 |---|---|
 | header | u64 resource id, u32 0x415D9568, u8 1, u8 flag (G: 0 on sampled static meshes, 1 or 2 on skinned ones, 2 on the Alps terrain), 9 zero bytes |
-| bones @0x17 | u32 count, then count x 81 bytes: u64 0, u32 class 0x9EF0E7A1, u32 bone name hash, f32[16] inverse bind matrix (column-major, translation in [12..14]), u8 0 |
+| bones @0x17 | u32 count, then count x 81 bytes: u64 0, u32 class 0x9EF0E7A1, u32 bone name hash (CRC-32 of the name), f32[16] inverse bind matrix (column-major, translation in [12..14]), u8 0 |
 | bounds | f32 min x,y,z, 0, max x,y,z, 0 (metres, Z up) |
 | | u8 0 |
 | compiled mesh | u64 0, u32 class 0xFC9E1595, u32 0, u8 (0 if section 1 follows, 3 if not; C on the samples) |
@@ -66,7 +69,7 @@ All little-endian. Nested objects are serialised as `u64 id (0 here), u32 class 
 | section 2 | u64 0, u32 class 0x0645ABB5, u8 32-bit indices (C on the 2 meshes with 1: the helicopter and the Alps terrain, both without section 1), u8 vertex format, u8 stride, u32 k + k draw ranges, u32 k' + k' draw ranges, **u32 bytes + vertex buffer**, **u32 bytes + index buffer** (absolute indices) |
 | draw range | u64 0, u32 class 0xA57387EF, u32 first vertex, u32 0, u32 vertex count, u32 first index, u32 triangle count, u32 1 |
 | submesh table | u32 n, then n x (u64 0, u32 class 0x0B1D34C1, 18 bytes, u16[128] bone map with unused slots 0xF7F7) |
-| submesh, 18 bytes | u8 1 (one sampled 0), u8 0/1, u8 0, u16 bone-map length, u16 draw-range index, u24 vertex count (G: matches the draw range on most, not on all), u64 material id |
+| submesh, 18 bytes | u8 1 (one sampled 0), u8 0/1, u8 0, u16 bone-map length (C: 455/455 in two archives), u16 draw-range index, u24 vertex count (G: matches the draw range on most, not on all), u64 material id. The table is not always in draw-range order (16 of 301 meshes) |
 | scales | u32 26, u32 7 (C: every mesh), **f32 S** (position scale, whole metres), **f32 X** (UV scale; 0 = no UVs) |
 | material slots | u32 n, n x (u64 0, u32 class 0x9F1640AF, u8 1, u8 0 or 4, u64 material id, u8 0, u64 material id, u64 0), then a few bytes ending in a u32 (0x15, 0x18, 0x24 seen) (G, not needed for vertex work) |
 
@@ -98,7 +101,10 @@ Sections and draw lists:
   Static (6, 8): `xyz * w / 32767`, with `w = +S` or `-S` per vertex; the sign is part of the encoding, since
   decoding without it mirrors the mesh (C: the decoded positions span the stored bounds on every mesh checked,
   and with this rule the normals agree with the face winding). S is a whole number of metres in every sampled
-  mesh (1..8003).
+  mesh (1..8003). **The sign is the tangent frame's handedness**: static formats store no binormal, and `w > 0`
+  exactly when `cross(normal, tangent)` points along `dP/d(1 - v)` (C: 99.5 % of ~149,000 vertices of
+  `DataPC_STP_WhiteRoom`'s formats 6 and 8, and a tree rebuilt from its own geometry gets all 2590 stored signs). The tangent's
+  w byte (128 or 255) is not the handedness (G: unknown).
 - **Normal, tangent, binormal**: u8x4, `(b - 127.5) / 127.5` per component. The w byte is 255 on skinned meshes;
   on static meshes the tangent's w is 128 or 255 (G: handedness). The face normal `cross(p1 - p0, p2 - p0)` agrees
   with the stored normals: the median dot product per format is 0.98-0.998, so triangles are counter-clockwise
@@ -109,7 +115,14 @@ Sections and draw lists:
   fmt 2 meshes reach it in uv1 when uv0 does not). Checked against the texture: the jacket's UV island borders,
   drawn over its decoded 512x512 BC1 diffuse map, follow the painted panels exactly (C).
 - **Skinning**: up to 4 influences. `bones` are u8 slots into the submesh's bone map, the map entry is an index
-  into the mesh's bone list, and `weights` are u8 summing to 255 (C: every sampled skinned vertex). The bone map
+  into the mesh's bone list, and `weights` are u8 summing to 255 (C: every sampled skinned vertex). Unused slots
+  trail, as bone 0 / weight 0; the used ones are in no fixed order (C: 20 % of the onboarding archive's 502,887
+  skinned vertices are not heaviest-first). A few props (helicopter, camera, parachute LOD1) use slots past their
+  submesh's bone map (G: read as bone-list indices by `export`).
+- **Bind poses are per mesh**: the same bone can have different inverse bind matrices in different meshes (C:
+  141 of the 408 bones of the male items in the onboarding archive differ by more than 0.001 in some matrix
+  element between items; the thumbs' rotation elements by up to 0.94). A mesh's own matrices are what its
+  vertices were modelled against. The matrices are rigid (orthonormal to 7e-6, C). The bone map
   matters: on jacket LOD3 the map skips bone 29. Vertices bound to a single bone sit a median of 8 cm (LOD0) or
   15 cm (LOD3) from that bone's origin when the matrix is read column-major as inverse bind. The other readings
   give 0.5-3 m (C).
@@ -144,11 +157,12 @@ Import (same topology): OBJ vertex i is submesh vertex i, and the faces must mat
 rounds to the stored value keeps its bytes. A normal that turned by more than 1 degree is stored, and the tangent
 and binormal are re-orthogonalised against it. UVs outside +-X are refused (X stays as it is).
 
-**`import --topology`** (vertex formats 0 and 2) takes OBJs with any vertex and face counts, one per submesh, and
-rebuilds the payload:
+**`import --topology`** (vertex formats 0 and 2, and the static 6 and 8) takes OBJs with any vertex and face
+counts, one per submesh, and rebuilds the payload (`import --glb` does the same from glTF, with weights):
 - one vertex per distinct `v/vt/vn` corner;
 - normals from `vn`, or area-weighted from the faces;
-- tangent and binormal from the UV gradients (the convention above);
+- tangent and binormal from the UV gradients (the convention above); static formats store the handedness as the
+  position's w sign instead of a binormal;
 - everything an OBJ cannot carry is taken from the **nearest original vertex of the same submesh**: bone slots and
   weights, uv1, the position's w, and the unknown bytes.
 
@@ -159,21 +173,36 @@ payload passes `check`. Tested on the jacket: LOD0 subdivided (5854 -> 21165 ver
 LOD0 replaced by LOD3's geometry (226 vertices), and the unchanged OBJ (the same triangles, positions, UVs and
 skinning; only the normals' bytes differ, because they are renormalised). Also tested on a goggle submesh (empty
 section 2) and a ski-box submesh (subset draw list). The archives built from these pass `forge.py verify
---decompress`. **The game has loaded none of this yet.**
+--decompress`. The game has not loaded a rebuilt topology yet (`mods/shoulder_pads` is that test).
+
+A vertex that is an original vertex (the same position, UV and normal; at seams the best match among the vertices
+at that position) keeps that vertex's bytes, so an unchanged file gives back every position, UV, normal and
+weight it was exported with. The
+submesh table is rewritten through each entry's own offset, since its order is not always the draw-range order.
+
+## glTF (Blender)
+
+`export -o x.glb` writes an armature (`Steep_Rig`, bones at the inverse bind matrices' rest poses, named by
+`BONE_NAMES` where the hash is known, else `0x<hash>`), one node per LOD with a primitive per submesh, the
+weights (JOINTS_0/WEIGHTS_0 through the bone map), UVs as stored (glTF's v points down too) and the materials.
+`import --glb` rebuilds meshes from it with `import_topology` (vertex formats 0, 2, 6, 8), taking weights from
+the file and appending bones the mesh lacks. BLENDER.md has the workflow, the rules and what was tested.
+
+Bone names: the hash is CRC-32 of the name (C). Names come from the strings of the skeleton add-on resources
+(type 0x24AECB7C, `STP_SkelAddon_*`, e.g. `L_LeftArm_NoRoll`, `RFX_LeftPectoral`) and Mixamo-style guesses
+(`Hips`, `Spine2`, `LeftHandThumb2`). 94 of the 711 bones in the onboarding archive are named this way. They
+cover 1159 of its 4291 bone uses and every main body bone. `LeftLeg`/`RightLeg` are not among the archive's
+hashes; `L_LeftLeg` is.
 
 ## What a fully new model still needs
 
-The geometry side works: `import --topology` produces a structurally valid mesh with any topology. Still to do:
+The geometry side works: `import --topology` and `import --glb` produce structurally valid meshes with any
+topology, and `--glb` carries real skin weights. Still to do:
 
-1. **Real skin weights.** Nearest-vertex transfer is right for shapes close to the original surface (a reshaped
-   jacket, a hood) and wrong for anything else, such as a cape far from the body. A new model needs its own
-   weights for the skeleton's bones. `export --skin` writes the bones (name hash, inverse bind matrix), the bone
-   map and the per-vertex slots and weights. The missing parts are a Blender-side importer/exporter (an armature
-   from the inverse bind matrices, vertex groups named by hash) and an `import` that reads weights instead of
-   transferring them.
-2. **The rider skeleton.** Bones are known only by u32 name hashes and their bind poses inside each mesh. The
-   skeleton resource with the hierarchy and names is not decoded. Reusing an existing garment's bone list (the
-   jacket's 62 bones cover the torso, arms and head) is the practical route.
+1. ~~Real skin weights~~: done with glTF (BLENDER.md). Not yet seen in-game: a grown bone map, added bones.
+2. **The rider skeleton.** Bones are known by u32 name hashes (CRC-32 of the names, 94 named), with bind poses
+   inside each mesh. The skeleton resource with the hierarchy is not decoded. The armature in Blender uses a
+   guessed (Mixamo) hierarchy for posing only. `export --rig ITEM` brings in bones from another item.
 3. **Materials and textures.** New UVs need a texture painted for them. TextureMap/Mip writing is
    `tools/forge/texture.py`'s job. A new material means a new Material + TextureSet, or a `swap` of an existing
    one.
@@ -189,7 +218,8 @@ The geometry side works: `import --topology` produces a structurally valid mesh 
    - draw lists of the "other" form;
    - whether the engine checks section 2 against section 1. Section 2 is written as a plain copy, not
      reordered.
-7. **An in-game test** of a changed mesh (`mods/mesh_edit`), first with the same topology, then a rebuilt one.
+7. **An in-game test** of a rebuilt topology: same-topology edits are confirmed (`mods/mesh_edit`); new geometry
+   with explicit weights is `mods/shoulder_pads`.
 
 ## Results of `mesh.py check` (all 27 archives, 2026-10-26)
 

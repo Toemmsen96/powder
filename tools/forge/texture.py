@@ -475,7 +475,7 @@ def encode_level(fmt: int, img: np.ndarray) -> bytes:
 
 # --- images: PNG in/out without Pillow, resize, mips, patterns ---------------------------------------------------
 
-def write_png(path: str, img: np.ndarray):
+def png_bytes(img: np.ndarray) -> bytes:
     img = np.clip(img, 0, 255).astype(np.uint8)
     h, w, c = img.shape
     ctype = {1: 0, 2: 4, 3: 2, 4: 6}[c]
@@ -483,10 +483,14 @@ def write_png(path: str, img: np.ndarray):
 
     def chunk(tag, body):
         return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def write_png(path: str, img: np.ndarray):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+        f.write(png_bytes(img))
 
 
 def read_png(path: str) -> np.ndarray:

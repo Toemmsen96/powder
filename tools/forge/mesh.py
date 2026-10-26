@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Steep's meshes (resource type 0x415D9568): layout, OBJ export, vertex edits and OBJ import.
+"""Steep's meshes (resource type 0x415D9568): layout, OBJ/glTF export, vertex edits and OBJ/glTF import.
 
 A mesh resource is self-contained: bones (name hash + 4x4 matrix), bounds, the vertex and index buffers (twice:
 a per-submesh section and a reordered copy), the submesh table (material, bone map) and the position/UV scales.
 `edit` and `import` change vertices and write an unpacked datafile folder (ids kept) that `forge.py build` turns
-into an archive, like `forge.py extract`/`swap` output. The format, and what is confirmed vs guessed, is in
-MESHES.md next to this file.
+into an archive, like `forge.py extract`/`swap` output. glTF (.glb) carries the armature and skin weights to and
+from Blender (BLENDER.md). The format, and what is confirmed vs guessed, is in MESHES.md next to this file.
 
 Sources: an unpacked folder (datafile.json), a .datafile, a bare .payload, or `ARCHIVE.forge ENTRY` (the entry
 from the newest archive of the stack, as the game loads it). Archives are only read. Python 3.10+, stdlib only.
@@ -20,10 +20,12 @@ import os
 import re
 import struct
 import sys
+import zlib
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forge  # noqa: E402  (next to this file)
+import gltf  # noqa: E402
 
 MESH_TYPE = 0x415D9568
 CLS_BONE = 0x9EF0E7A1
@@ -49,7 +51,42 @@ FORMATS = {
     8: (20, {"normal": 8, "tangent": 12, "uv0": 16}),
 }
 SKINNED = {0, 1, 2, 3}       # position = xyz * S / 32767, w = an unrelated per-vertex value
-# static formats (6, 8):       position = xyz * w / 32767, w = +-S (the sign is part of the encoding)
+# static formats (6, 8):       position = xyz * w / 32767, w = +-S (the sign is the tangent frame's handedness)
+
+# Bone name hashes are CRC-32 of the names (C). These names were found in the skeleton add-ons' strings or guessed
+# (Mixamo-style); the other bones go by their hash, written 0x<8 hex digits>.
+_SIDED = ["{}Arm", "{}ForeArm", "{}Hand", "{}Shoulder", "{}UpLeg", "{}Foot", "{}ToeBase", "L_{}Arm_NoRoll",
+          "L_{}ForeArm", "L_{}Leg", "L_{}Scapula", "L_{}ShirtBend", "L_{}UpLeg_NoRoll", "L_{}Wrist", "O_{}Arm",
+          "O_{}ForeArm", "O_{}Knee", "O_{}UpLegRoll", "P_{}Clavicle", "P_{}Trapezius", "RFX_{}Acromion", "RFX_{}Coat",
+          "RFX_{}GMaximus", "RFX_{}KneeBack", "RFX_{}Pectoral"]
+_SIDED += [f"{{}}Hand{f}{i}" for f in ("Thumb", "Index", "Middle", "Ring", "Pinky") for i in (1, 2, 3)]
+BONE_NAMES = ["Reference", "Hips", "Spine", "Spine1", "Spine2", "Neck", "Neck1", "Head", "Fx_Head", "Fx_L_Ear",
+              "Fx_L_Jaw", "Fx_R_Ear", "Fx_R_Jaw", "RFX_RightUpLeg_Upnode"] + [f.format(s) for s in ("Left", "Right")
+                                                                              for f in _SIDED]
+BONE_BY_HASH = {zlib.crc32(n.encode()): n for n in BONE_NAMES}
+# The skeleton resource is not decoded: this hierarchy (Mixamo's) is a guess, only used to pose the armature in
+# Blender. Bones without an entry hang off the nearest bone that has one.
+PARENTS = {"Hips": "Reference", "Spine": "Hips", "Spine1": "Spine", "Spine2": "Spine1", "Neck": "Spine2",
+           "Neck1": "Neck", "Head": "Neck1"}
+for _s in ("Left", "Right"):
+    PARENTS.update({f"{_s}Shoulder": "Spine2", f"{_s}Arm": f"{_s}Shoulder", f"{_s}ForeArm": f"{_s}Arm",
+                    f"{_s}Hand": f"{_s}ForeArm", f"{_s}UpLeg": "Hips", f"{_s}Foot": f"{_s}UpLeg",
+                    f"{_s}ToeBase": f"{_s}Foot"})
+    for _f in ("Thumb", "Index", "Middle", "Ring", "Pinky"):
+        PARENTS.update({f"{_s}Hand{_f}1": f"{_s}Hand", f"{_s}Hand{_f}2": f"{_s}Hand{_f}1",
+                        f"{_s}Hand{_f}3": f"{_s}Hand{_f}2"})
+
+
+def bone_name(h: int) -> str:
+    return BONE_BY_HASH.get(h, f"0x{h:08x}")
+
+
+def bone_hash(name: str) -> int:
+    """A bone's hash from its name as Blender writes it back (a `.001` suffix from a duplicate is dropped)."""
+    name = re.sub(r"\.\d{3}$", "", name)
+    if re.fullmatch(r"0x[0-9a-fA-F]{8}", name):
+        return int(name, 16)
+    return zlib.crc32(name.encode())
 
 
 class MeshError(ValueError):
@@ -88,6 +125,7 @@ class Submesh:
     triangles: int
     material: int = 0
     bone_map: list = field(default_factory=list)
+    table_off: int | None = None  # payload offset of its 18-byte submesh-table body
 
 
 @dataclass
@@ -201,9 +239,9 @@ def parse_mesh(p: bytes) -> Mesh:
         prim = struct.unpack_from("<H", body, 5)[0]
         mat = struct.unpack_from("<Q", body, 10)[0]
         bm = [b for b in struct.unpack_from("<128H", p, r.o + 18) if b != 0xF7F7]
-        r.o += 18 + 256
         fv, _, vc, fi, tc, _ = prims[0][prim] if prim < len(prims[0]) else (0, 0, 0, 0, 0, 0)
-        subs.append(Submesh(prim, fv, vc, fi, tc, mat, bm))
+        subs.append(Submesh(prim, fv, vc, fi, tc, mat, bm, r.o))
+        r.o += 18 + 256
     known = {s.index for s in subs}
     for i, (fv, _, vc, fi, tc, _) in enumerate(prims[0]):  # draw ranges without a table entry (not seen)
         if i not in known:
@@ -476,6 +514,23 @@ def skin_json(m: Mesh, sm: Submesh) -> dict:
 
 def cmd_export(a):
     s = load_source(a.src, a.entry)
+    if a.out.lower().endswith(".glb"):
+        res = mesh_resources(s, a.mesh)
+        extra: dict[int, list] = {}
+        for spec in a.rig or []:
+            if ".forge:" in spec:
+                arch, ent = spec.split(".forge:", 1)
+                arch += ".forge"
+            elif a.src.endswith(".forge"):
+                arch, ent = a.src, spec
+            else:
+                sys.exit(f"--rig {spec}: give ARCHIVE.forge:ENTRY (the source is not an archive)")
+            for _, r in mesh_resources(load_source(arch, ent), None):
+                skinned_rest(parse_mesh(r.payload), extra)
+        archive = a.textures if isinstance(a.textures, str) else a.src if a.src.endswith(".forge") else None
+        n, nb = export_glb(s, res, a.out, bool(a.textures), archive, extra)
+        print(f"{a.out}: {n} mesh(es)" + (f", armature of {nb} bones" if nb else ""))
+        return
     names = names_by_id(s)
     os.makedirs(a.out, exist_ok=True)
     for _, r in mesh_resources(s, a.mesh):
@@ -759,67 +814,128 @@ class Nearest:
         return best
 
 
-def topology_rows(m: Mesh, sm: Submesh, obj: dict, all_rows: list[bytes]) -> tuple[list, list, list]:
-    """New vertices for a submesh from an OBJ of any topology: one per distinct (v, vt, vn) corner. Position,
-    UV and normal come from the OBJ; tangent and binormal from the UV gradients; everything the OBJ cannot carry
-    (bone slots and weights, uv1, the position's w and the other bytes) from the nearest stored vertex of the same
-    submesh. Returns (template rows, per-vertex (pos, uv, normal, tangent, binormal), local triangles)."""
-    a = m.attrs()
-    own = all_rows[sm.first_vertex:sm.first_vertex + sm.vertex_count]
-    if not own:
-        raise MeshError(f"submesh {sm.index} has no vertices to take skinning from")
-    near = Nearest([dec_pos(m, x) for x in own])
+@dataclass
+class Vtx:
+    """A vertex of a rebuilt submesh. What it leaves as None comes from the nearest original vertex."""
+    pos: tuple
+    uv: tuple = (0.0, 0.0)          # as stored: v pointing down
+    normal: tuple | None = None
+    uv1: tuple | None = None
+    skin: list | None = None        # [(index into the mesh's bone list, weight)]: any number, any scale
+    color: bytes | None = None      # format 6's u8x4
+    row: bytes | None = None        # the stored vertex this one is (`--add`): its bytes are kept
+
+
+def obj_geometry(obj: dict) -> tuple[list[Vtx], list[tuple]]:
+    """One vertex per distinct (v, vt, vn) corner of an OBJ, and the triangles over them."""
     corner: dict[tuple, int] = {}
-    tris, verts = [], []
-    fnorm = {}
+    verts, tris = [], []
     for f in obj["f"]:
-        p0, p1, p2 = (obj["v"][c[0]] for c in f)
-        e1 = [p1[k] - p0[k] for k in range(3)]
-        e2 = [p2[k] - p0[k] for k in range(3)]
-        fn = (e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0])
         t = []
         for c in f:
             if c not in corner:
                 corner[c] = len(verts)
                 uv = obj["vt"][c[1]] if c[1] is not None else (0.0, 0.0)
-                verts.append([obj["v"][c[0]], (uv[0], 1 - uv[1]),
-                              obj["vn"][c[2]] if c[2] is not None else None, [0.0] * 3, [0.0] * 3])
+                verts.append(Vtx(obj["v"][c[0]], (uv[0], 1 - uv[1]), obj["vn"][c[2]] if c[2] is not None else None))
             t.append(corner[c])
-            acc = fnorm.setdefault(c[0], [0.0, 0.0, 0.0])
-            for k in range(3):
-                acc[k] += fn[k]
         tris.append(tuple(t))
-    for c, i in corner.items():  # no vn: area-weighted face normals at that position
-        if verts[i][2] is None:
-            verts[i][2] = fnorm[c[0]]
-        verts[i][2] = norm(verts[i][2])
-    for t in tris:  # tangent = dP/du, binormal = dP/d(1 - v) (what the shipped data holds, v pointing down)
-        (P0, U0, *_), (P1, U1, *_), (P2, U2, *_) = (verts[i] for i in t)
+    return verts, tris
+
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def frames(verts: list[Vtx], tris: list[tuple]) -> list[tuple]:
+    """Per vertex (normal, tangent, binormal): the normal given, or area-weighted from the faces at that position;
+    tangent = dP/du, binormal = dP/d(1 - v) (what the shipped data holds, v pointing down), summed over the faces
+    (zero where the UVs give none)."""
+    fn: dict[tuple, list[float]] = {}
+    tg = [[0.0] * 3 for _ in verts]
+    bn = [[0.0] * 3 for _ in verts]
+    for t in tris:
+        (P0, U0), (P1, U1), (P2, U2) = ((verts[i].pos, verts[i].uv) for i in t)
+        e1 = [P1[k] - P0[k] for k in range(3)]
+        e2 = [P2[k] - P0[k] for k in range(3)]
+        f = cross(e1, e2)
+        for i in t:
+            acc = fn.setdefault(verts[i].pos, [0.0, 0.0, 0.0])
+            for k in range(3):
+                acc[k] += f[k]
         du1, dv1, du2, dv2 = U1[0] - U0[0], U1[1] - U0[1], U2[0] - U0[0], U2[1] - U0[1]
         det = du1 * dv2 - du2 * dv1
         if abs(det) < 1e-12:
             continue
-        e1 = [P1[k] - P0[k] for k in range(3)]
-        e2 = [P2[k] - P0[k] for k in range(3)]
-        tg = [(e1[k] * dv2 - e2[k] * dv1) / det for k in range(3)]
-        bn = [-(e2[k] * du1 - e1[k] * du2) / det for k in range(3)]
         for i in t:
             for k in range(3):
-                verts[i][3][k] += tg[k]
-                verts[i][4][k] += bn[k]
+                tg[i][k] += (e1[k] * dv2 - e2[k] * dv1) / det
+                bn[i][k] += -(e2[k] * du1 - e1[k] * du2) / det
+    return [(norm(v.normal if v.normal is not None else fn.get(v.pos, (0.0, 0.0, 1.0))), tg[k], bn[k])
+            for k, v in enumerate(verts)]
+
+
+def topology_rows(m: Mesh, sm: Submesh, verts: list[Vtx], tris: list[tuple], all_rows: list[bytes]
+                  ) -> tuple[list, list]:
+    """For new vertices of a submesh: the nearest stored vertex of the same submesh, which lends what a vertex does
+    not carry (skinning, uv1, the position's w, the other bytes), and each vertex's tangent frame (n, t, b) with t
+    and b made perpendicular to n (where the UVs give no gradient: the nearest vertex's)."""
+    a = m.attrs()
+    own = all_rows[sm.first_vertex:sm.first_vertex + sm.vertex_count]
+    if not own:
+        raise MeshError(f"submesh {sm.index} has no vertices to take the other attributes from")
+    near = Nearest([dec_pos(m, x) for x in own])
+    step = (m.S if m.fmt in SKINNED else abs(struct.unpack_from("<h", own[0], 6)[0])) / Q
+    at_pos: dict[tuple, list[bytes]] = {}  # seams: several vertices share a position; take the one that matches
+    for x in own:
+        at_pos.setdefault(tuple(round(c / step) for c in dec_pos(m, x)), []).append(x)
     templates, out = [], []
-    for pos, uv, n, tg, bn in verts:
-        tpl = own[near(pos)]
-        for vec, name in ((tg, "tangent"), (bn, "binormal")):
-            if dot(vec, vec) < 1e-20:  # no UV gradient: the template's, made perpendicular
-                vec[:] = dec_vec(tpl, a[name])
+    for v, (n, tg, bn) in zip(verts, frames(verts, tris)):
+        cand = at_pos.get(tuple(round(c / step) for c in v.pos))
+        if v.row is not None:
+            tpl = v.row
+        elif cand:
+            tn = norm(tg) if dot(tg, tg) > 1e-20 else (0.0, 0.0, 0.0)
+            tpl = min(cand, key=lambda x: sum(abs(c - d) for c, d in zip(v.uv, dec_uv(m, x, a["uv0"])))
+                      - dot(n, norm(dec_vec(x, a["normal"]))) - 0.1 * dot(tn, norm(dec_vec(x, a["tangent"]))))
+        else:
+            tpl = own[near(v.pos)]
+        if dot(tg, tg) < 1e-20:
+            tg = dec_vec(tpl, a["tangent"])
+        if dot(bn, bn) < 1e-20:
+            bn = dec_vec(tpl, a["binormal"]) if "binormal" in a else cross(n, tg)
         t2 = norm(tuple(c - n[j] * dot(tg, n) for j, c in enumerate(tg)))
         b2 = tuple(c - n[j] * dot(bn, n) - t2[j] * dot(bn, t2) for j, c in enumerate(bn))
-        b2 = norm(b2) if dot(b2, b2) > 1e-20 else norm(tuple(n[(j + 1) % 3] * t2[(j + 2) % 3]
-                                                             - n[(j + 2) % 3] * t2[(j + 1) % 3] for j in range(3)))
+        b2 = norm(b2) if dot(b2, b2) > 1e-20 else norm(cross(n, t2))
         templates.append(tpl)
-        out.append((pos, uv, n, t2, b2))
-    return templates, out, tris
+        out.append((n, t2, b2))
+    return templates, out
+
+
+def quantise_skin(skin: list, bone_map: list) -> tuple[bytes, bytes] | None:
+    """Up to 4 influences, heaviest first, as u8 slots into `bone_map` (bones it lacks are appended) and u8 weights
+    summing to 255. Unused slots are 0 / 0, as in the shipped data. None if no weight is left."""
+    tot: dict[int, float] = {}
+    for b, w in skin:
+        if w > 0:
+            tot[b] = tot.get(b, 0.0) + w
+    top = sorted(tot.items(), key=lambda kv: -kv[1])[:4]
+    s = sum(w for _, w in top)
+    if not top or s <= 0:
+        return None
+    raw = [w * 255 / s for _, w in top]
+    q = [int(x) for x in raw]
+    for i in sorted(range(len(q)), key=lambda i: q[i] - raw[i])[:255 - sum(q)]:  # largest remainders
+        q[i] += 1
+    pairs = [(b, w) for (b, _), w in zip(top, q) if w]
+    slots = []
+    for b, _ in pairs:
+        if b not in bone_map:
+            if len(bone_map) >= 128:
+                raise MeshError("a submesh's bone map holds at most 128 bones")
+            bone_map.append(b)
+        slots.append(bone_map.index(b))
+    pad = [0] * (4 - len(pairs))
+    return bytes(slots + pad), bytes([w for _, w in pairs] + pad)
 
 
 def splice(p: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:
@@ -832,10 +948,12 @@ def splice(p: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:
     return b"".join(out + [p[pos:]])
 
 
-def rebuild(m: Mesh, subs: dict[int, tuple[list[bytes], list[tuple]]]) -> bytes:
+def rebuild(m: Mesh, subs: dict[int, tuple[list[bytes], list[tuple]]], bone_maps: dict[int, list] | None = None
+            ) -> bytes:
     """A payload with new vertex/index buffers: `subs` maps each submesh to (rows, local triangles). Rewrites
     section 1 (offsets, buffers, per-submesh bounds and index ranges), section 2's draw ranges (and its copy of
-    the buffers when it has one), the submesh table's vertex counts and the bounds; everything else is kept."""
+    the buffers when it has one), the submesh table's vertex counts and bone maps (`bone_maps`) and the bounds;
+    everything else is kept."""
     order = [sm.index for sm in m.submeshes]
     if sorted(order) != list(range(len(m.prims[0]))):
         raise MeshError("the submesh table does not cover the draw ranges 0..n-1")
@@ -898,66 +1016,519 @@ def rebuild(m: Mesh, subs: dict[int, tuple[list[bytes], list[tuple]]]) -> bytes:
     for lst, offs in ((new0, m.prims_off[0]), (new1, m.prims_off[1])):
         for rec, off in zip(lst, offs):
             edits.append((off, off + 24, struct.pack("<6I", *rec)))
-    q = m.sub_off + 4
-    for sm in m.submeshes:  # u24 at +7 of each table entry: the vertex count where it held the old one (G)
-        body = q + 12
-        old = int.from_bytes(p[body + 7:body + 10], "little")
+    for sm in m.submeshes:
+        body = sm.table_off
+        if body is None:
+            continue
+        old = int.from_bytes(p[body + 7:body + 10], "little")  # u24: the vertex count where it held the old one (G)
         if old == sm.vertex_count:
             edits.append((body + 7, body + 10, ranges[sm.index][1].to_bytes(3, "little")))
-        q += SUBMESH_SIZE
+        bm = (bone_maps or {}).get(sm.index)
+        if bm is not None and bm != sm.bone_map:  # u16 length at +3, u16[128] at +18 (unused 0xF7F7)
+            edits.append((body + 3, body + 5, struct.pack("<H", len(bm))))
+            edits.append((body + 18, body + 18 + 256, struct.pack("<128H", *bm, *[0xF7F7] * (128 - len(bm)))))
     return splice(p, edits)
 
 
-def import_topology(m: Mesh, items: list[tuple[Submesh, dict]]) -> bytes:
-    """Submeshes replaced by OBJs of any topology (formats 0 and 2: explicit binormals, skinned)."""
-    if m.fmt not in (0, 2):
-        raise MeshError(f"--topology supports vertex formats 0 and 2 (skinned), not {m.fmt}")
+def add_bones(p: bytes, bones: list[tuple[int, list]]) -> bytes:
+    """The payload with (name hash, inverse bind matrix) bones appended to its bone list."""
+    n = struct.unpack_from("<I", p, 0x17)[0]
+    end = 0x17 + 4 + BONE_SIZE * n
+    recs = b"".join(struct.pack("<QII16fB", 0, CLS_BONE, h, *mat, 0) for h, mat in bones)
+    return p[:0x17] + struct.pack("<I", n + len(bones)) + p[0x1B:end] + recs + p[end:]
+
+
+TOPOLOGY_FORMATS = (0, 2, 6, 8)
+
+
+def import_topology(m: Mesh, items: list[tuple[Submesh, list[Vtx], list[tuple]]]) -> tuple[bytes, dict]:
+    """Submeshes replaced by new geometry of any topology: skinned formats 0 and 2 (explicit binormal), static 6 and
+    8 (the position's w sign is the frame's handedness). Returns the payload and per submesh how many vertices took
+    their skinning from the nearest original vertex."""
+    if m.fmt not in TOPOLOGY_FORMATS:
+        raise MeshError(f"new topology supports vertex formats {TOPOLOGY_FORMATS}, not {m.fmt}")
     a = m.attrs()
+    skinned = m.fmt in SKINNED
     vb, _, _ = m.main
     allr = rows(m, vb)
     built = {}
-    for sm, obj in items:
-        built[sm.index] = topology_rows(m, sm, obj, allr)
-    # scales: positions and UVs (uv0 and uv1 share X) of every vertex, kept and new
+    for sm, verts, tris in items:
+        built[sm.index] = (verts, tris, *topology_rows(m, sm, verts, tris, allr))
     keep = {sm.index: (allr[sm.first_vertex:sm.first_vertex + sm.vertex_count], triangles(m, sm))
             for sm in m.submeshes if sm.index not in built}
-    pts = [dec_pos(m, x) for r, _ in keep.values() for x in r] + [v[0] for _, vs, _ in built.values() for v in vs]
-    S2 = scale_for(m, pts) or m.S
+    pts = [dec_pos(m, x) for r, _ in keep.values() for x in r] + [v.pos for vs, *_ in built.values() for v in vs]
+    cur = m.S if skinned else abs(struct.unpack_from("<h", allr[0], 6)[0]) if allr else m.S
+    S2 = scale_for(m, pts) or cur
+    if not skinned and S2 > Q:
+        raise MeshError("positions too large for a static mesh's scale")
     uvk = [k for k in ("uv0", "uv1") if k in a]
     uvs = [abs(c) for r, _ in keep.values() for x in r for k in uvk for c in dec_uv(m, x, a[k])]
-    uvs += [abs(c) for _, vs, _ in built.values() for v in vs for c in v[1]]
-    uvs += [abs(c) for tpl, _, _ in built.values() for x in tpl for k in uvk[1:] for c in dec_uv(m, x, a[k])]
+    for vs, _, tpl, _ in built.values():
+        uvs += [abs(c) for v in vs for c in v.uv]
+        if "uv1" in a:
+            uvs += [abs(c) for v, x in zip(vs, tpl) for c in (v.uv1 if v.uv1 is not None else dec_uv(m, x, a["uv1"]))]
     X2 = max(max(uvs, default=0.0), m.X)
+    maps = {sm.index: list(sm.bone_map) for sm in m.submeshes}
+    fallback: dict[int, int] = {}
 
-    def enc(row: bytes, pos=None, uv=None, n=None, t=None, b=None) -> bytes:
-        row = bytearray(enc_pos(m, row, pos if pos is not None else dec_pos(m, row), S2))
-        for k in uvk:
-            u = uv if (k == "uv0" and uv is not None) else dec_uv(m, bytes(row), a[k])
+    def skin_set(row: bytes, bm: list, off: int | None = None) -> list:
+        """(bone, weight) pairs of a row's bones/weights bytes (or of 8 bytes slots + weights at `off`)."""
+        o_b, o_w = (a["bones"], a["weights"]) if off is None else (off, off + 4)
+        return sorted((bm[row[o_b + i]] if row[o_b + i] < len(bm) else -1 - row[o_b + i], row[o_w + i])
+                      for i in range(4) if row[o_w + i])
+
+    def same_as(row: bytes, v: Vtx) -> bool:
+        """`v` is the template vertex itself (as exported): it keeps the template's frame and skin bytes."""
+        if max(abs(c - d) for c, d in zip(v.pos, dec_pos(m, row))) > 0.5 * cur / Q:
+            return False
+        if max(abs(c - d) for c, d in zip(v.uv, dec_uv(m, row, a["uv0"]))) > 0.5 * m.X / Q:
+            return False
+        return v.normal is not None and dot(norm(v.normal), norm(dec_vec(row, a["normal"]))) > 1 - 1e-6
+
+    def enc(row: bytes, sub: int, v: Vtx | None = None, fr=None) -> bytes:
+        tpl = row
+        row = bytearray(row)
+        same = v is not None and (v.row is not None or same_as(tpl, v))
+        if v is not None and not skinned and not same:  # handedness: w > 0 when cross(n, t) points along b
+            n, t, b = fr
+            row[6:8] = struct.pack("<h", 1 if dot(cross(n, t), b) > 0 else -1)
+        row = bytearray(enc_pos(m, bytes(row), v.pos if v is not None else dec_pos(m, bytes(row)), S2))
+        for k in uvk if X2 > 0 else ():  # X = 0: the mesh has no UVs
+            if v is not None and k == "uv0":
+                u = v.uv
+            elif v is not None and v.uv1 is not None:
+                u = v.uv1
+            else:
+                u = dec_uv(m, bytes(row), a[k])
             struct.pack_into("<2h", row, a[k], *[max(-Q, min(Q, round(c * Q / X2))) for c in u])
-        for vec, k in ((n, "normal"), (t, "tangent"), (b, "binormal")):
-            if vec is not None:
-                row[a[k]:a[k] + 3] = enc_vec(vec)
+        if v is not None:
+            for vec, k in zip(fr, ("normal", "tangent", "binormal")):
+                if k in a and not same:
+                    row[a[k]:a[k] + 3] = enc_vec(vec)
+            if v.color is not None and "color" in a:
+                row[a["color"]:a["color"] + 4] = v.color
+            if "weights" in a:
+                q = quantise_skin(v.skin, maps[sub]) if v.skin else None
+                if q is None:
+                    fallback[sub] = fallback.get(sub, 0) + 1
+                elif not (same and skin_set(tpl, maps[sub]) == skin_set(q[0] + q[1], maps[sub], 0)):
+                    row[a["bones"]:a["bones"] + 4], row[a["weights"]:a["weights"] + 4] = q
         return bytes(row)
 
-    rescale = S2 != m.S or X2 != m.X
+    rescale = S2 != cur or X2 != m.X
     subs = {}
     for sm in m.submeshes:
         if sm.index in built:
-            tpl, vs, tris = built[sm.index]
-            subs[sm.index] = ([enc(row, *v) for row, v in zip(tpl, vs)], tris)
+            verts, tris, tpl, frs = built[sm.index]
+            subs[sm.index] = ([enc(row, sm.index, v, fr) for row, v, fr in zip(tpl, verts, frs)], tris)
         else:
             r, t = keep[sm.index]
-            subs[sm.index] = ([enc(x) for x in r] if rescale else r,
+            subs[sm.index] = ([enc(x, sm.index) for x in r] if rescale else r,
                               [tuple(i - sm.first_vertex for i in tri) for tri in t])
     m2 = Mesh(**{**m.__dict__, "S": S2, "X": X2})
-    p = bytearray(rebuild(m2, subs))
-    struct.pack_into("<2f", p, parse_mesh(bytes(p)).scale_off, S2, X2)
-    return bytes(p)
+    p = bytearray(rebuild(m2, subs, maps))
+    struct.pack_into("<2f", p, parse_mesh(bytes(p)).scale_off, m.S if S2 == cur else S2, X2)
+    return bytes(p), fallback
+
+
+# --- glTF ---------------------------------------------------------------------------------------------------------
+
+def material_label(sm: Submesh, m: Mesh, names: dict[int, str]) -> str:
+    """The glTF material name of a submesh: its material's name, plus `#sm<k>` where several submeshes share it."""
+    base = names.get(sm.material) or f"0x{sm.material:x}"
+    if sum(1 for x in m.submeshes if x.material == sm.material) > 1:
+        base += f"#sm{sm.index}"
+    return base
+
+
+def guess_parents(rest: dict[int, list]) -> dict[int, int | None]:
+    """A parent per bone, for posing in Blender only: PARENTS where both are present (walking up past missing
+    bones), else the nearest bone that has a place in PARENTS (by bind-pose origin)."""
+    present = set(rest)
+    ref = zlib.crc32(b"Reference")
+
+    def up(name: str) -> int | None:
+        while name in PARENTS:
+            name = PARENTS[name]
+            if zlib.crc32(name.encode()) in present:
+                return zlib.crc32(name.encode())
+        return None
+    anchors = [h for h in present if bone_name(h) in PARENTS or h == ref]
+    out = {}
+    for h in present:
+        if bone_name(h) in PARENTS:
+            out[h] = up(bone_name(h))
+        elif h == ref or not anchors:
+            out[h] = None
+        else:
+            o = rest[h][12:15]
+            out[h] = min((x for x in anchors if x != h),
+                         key=lambda x: sum((c - d) ** 2 for c, d in zip(rest[x][12:15], o)), default=None)
+    return out
+
+
+def diffuse_png(s: Source, mat_id: int, archive: str | None, cache: dict) -> tuple[bytes, str] | None:
+    """The material's diffuse texture (TextureSet slot 0) as PNG, upright as texture.py exports it: the top level
+    stored inline in its TextureMap (Mip levels are not fetched). Needs numpy; None where it cannot be found."""
+    try:
+        import texture
+    except ImportError:
+        print("  (textures need numpy: left out)", file=sys.stderr)
+        return None
+    by_id = {r.id: r for r in s.resources}
+    mat = by_id.get(mat_id)
+    if mat is None:
+        return None
+    tex_id = None
+    for r in s.resources:
+        if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in mat.payload and r.payload[13] == 1:
+            tex_id = struct.unpack_from("<Q", r.payload, 15)[0]
+            break
+    if not tex_id:
+        return None
+    res = by_id.get(tex_id)
+    if res is None and archive:
+        hit = texture.find_mip_entry(tex_id, archive, cache, anywhere=True)
+        if hit:
+            res = next((r for r in forge.parse_datafile(hit[0].read(hit[1])).resources if r.id == tex_id), None)
+    if res is None:
+        return None
+    t = texture.parse_texture(res.payload)
+    if t.fmt not in texture.FORMATS or t.dim != 1:
+        return None
+    w, h, _ = texture.level_dims(t.width, t.height, t.depth, t.first_level)
+    img = texture.decode_level(t.fmt, t.data, w, h)[::-1]  # rows are stored bottom-up
+    return texture.png_bytes(img[:, :, :3]), res.name
+
+
+def skinned_rest(m: Mesh, rest: dict[int, list]):
+    """Each bone's rest pose (glTF space) from a skinned mesh's inverse bind matrices, where `rest` has none yet."""
+    if "weights" in m.attrs():
+        for h, M in m.bones:
+            rest.setdefault(h, gltf.mat_to_gl(gltf.mat_inv_rigid(M)))
+
+
+def export_glb(s: Source, res: list, path: str, textures: bool, archive: str | None, extra: dict | None = None):
+    """One .glb: a node per mesh (LOD) with a primitive per submesh, and for skinned meshes an armature
+    (Steep_Rig) whose bones sit at the inverse bind matrices' rest poses, with the per-vertex weights. `extra`
+    (hash -> rest pose) adds bones that no exported mesh has, in a skin of their own (Steep_Rig_extra) so that
+    Blender makes them bones of the same armature."""
+    names = names_by_id(s)
+    b = gltf.Builder("powder tools/forge/mesh.py")
+    doc = b.doc
+    meshes = [(r, parse_mesh(r.payload)) for _, r in res]
+    rest: dict[int, list] = {}
+    for _, m in meshes:
+        skinned_rest(m, rest)
+    only_extra = [h for h in (extra or {}) if h not in rest]
+    for h in only_extra:
+        rest[h] = extra[h]
+    joint, rig = {}, None
+    if rest:
+        rig = b.add("nodes", {"name": "Steep_Rig"})
+        doc["scenes"][0]["nodes"].append(rig)
+        parent = guess_parents(rest)
+        for h in rest:
+            joint[h] = b.add("nodes", {"name": bone_name(h)})
+        for h, M in rest.items():
+            p = parent[h]
+            local = M if p is None else gltf.mat_mul(gltf.mat_inv_rigid(rest[p]), M)
+            doc["nodes"][joint[h]].update(gltf.trs(local))
+            doc["nodes"][joint[p] if p is not None else rig].setdefault("children", []).append(joint[h])
+        if only_extra:
+            ibm = b.accessor([gltf.mat_inv_rigid(rest[h]) for h in only_extra], "MAT4", target=None)
+            b.add("skins", {"name": "Steep_Rig_extra", "joints": [joint[h] for h in only_extra],
+                            "inverseBindMatrices": ibm, "skeleton": rig})
+    mats: dict[str, int] = {}
+    images: dict[int, int | None] = {}
+    cache: dict = {}
+    for r, m in meshes:
+        a = m.attrs()
+        allr = rows(m, m.main[0])
+        skin = None
+        if "weights" in a and m.bones:
+            ibm = b.accessor([gltf.mat_to_gl(M) for _, M in m.bones], "MAT4", target=None)
+            skin = b.add("skins", {"name": r.name, "joints": [joint[h] for h, _ in m.bones],
+                                   "inverseBindMatrices": ibm, "skeleton": rig})
+        prims = []
+        for sm in m.submeshes:
+            rr = allr[sm.first_vertex:sm.first_vertex + sm.vertex_count]
+            if not rr or not sm.triangles:
+                continue
+            at = {"POSITION": b.accessor([gltf.to_gl(dec_pos(m, x)) for x in rr], "VEC3", bounds=True)}
+            if "normal" in a:
+                at["NORMAL"] = b.accessor([gltf.to_gl(norm(dec_vec(x, a["normal"]))) for x in rr], "VEC3")
+            for k, key in (("uv0", "TEXCOORD_0"), ("uv1", "TEXCOORD_1")):
+                if k in a and m.X:
+                    at[key] = b.accessor([dec_uv(m, x, a[k]) for x in rr], "VEC2")
+            if "color" in a:
+                at["COLOR_0"] = b.accessor([tuple(x[a["color"]:a["color"] + 4]) for x in rr], "VEC4", gltf.UBYTE,
+                                           normalized=True)
+            if skin is not None:
+                js, ws, past = [], [], 0
+                for x in rr:
+                    sl, w = x[a["bones"]:a["bones"] + 4], x[a["weights"]:a["weights"] + 4]
+                    j = []
+                    for si, wi in zip(sl, w):  # a few props use slots past their bone map: read as bone indices (G)
+                        past += bool(wi) and si >= len(sm.bone_map)
+                        j.append(0 if not wi else sm.bone_map[si] if si < len(sm.bone_map) else
+                                 si if si < len(m.bones) else 0)
+                    js.append(tuple(j))
+                    ws.append(tuple(wi / 255 for wi in w))
+                if past:
+                    print(f"  {r.name} submesh {sm.index}: {past} weights use slots past the bone map "
+                          f"({len(sm.bone_map)}); read as bone indices", file=sys.stderr)
+                at["JOINTS_0"] = b.accessor(js, "VEC4", gltf.USHORT)
+                at["WEIGHTS_0"] = b.accessor(ws, "VEC4")
+            idx = [i - sm.first_vertex for t in triangles(m, sm) for i in t]
+            label = material_label(sm, m, names)
+            if label not in mats:
+                md = {"name": label, "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 0.8}}
+                if textures:
+                    if sm.material not in images:
+                        png = diffuse_png(s, sm.material, archive, cache)
+                        images[sm.material] = b.image(*png) if png else None
+                    if images[sm.material] is not None:
+                        md["pbrMetallicRoughness"]["baseColorTexture"] = {"index": images[sm.material]}
+                mats[label] = b.add("materials", md)
+            prims.append({"attributes": at, "material": mats[label],
+                          "indices": b.accessor(idx, "SCALAR", gltf.UINT if len(rr) > 0xFFFF else gltf.USHORT,
+                                                target=gltf.ELEMENT_ARRAY_BUFFER)})
+        node = {"name": r.name, "mesh": b.add("meshes", {"name": r.name, "primitives": prims})}
+        if skin is not None:
+            node["skin"] = skin
+        doc["scenes"][0]["nodes"].append(b.add("nodes", node))
+    with open(path, "wb") as f:
+        f.write(b.glb())
+    return len(meshes), len(rest)
+
+
+def match_name(label: str | None, meshes: dict) -> str | None:
+    label = re.sub(r"\.\d{3}$", "", label or "")
+    for name in meshes:
+        if label in (name, forge.safe_name(name)):
+            return name
+    return None
+
+
+def glb_vertices(g: gltf.Gltf, ni: int, worlds: dict, m: Mesh, bones: dict[int, int], new_bones: list,
+                 rigid: int | None, label: str) -> dict[str, tuple[list[Vtx], list[tuple]]]:
+    """A glTF mesh node's triangles in Steep's space, per material name. A skinned node's positions are its bind
+    pose (where its armature sits as the mesh's bones do: an armature moved as a whole is undone); joints are
+    matched to bones by name hash, and joints the mesh lacks are appended to `new_bones` (rest pose from the
+    skin). Other nodes are placed by their world transform and bound to `rigid` (a bone index) if given."""
+    doc = g.doc
+    nodes = doc["nodes"]
+    node = nodes[ni]
+    skin = doc["skins"][node["skin"]] if "skin" in node else None
+    xform = worlds[ni]
+    joint_bone = []
+    if skin:
+        ibms = (g.values(skin["inverseBindMatrices"]) if "inverseBindMatrices" in skin
+                else [gltf.IDENTITY] * len(skin["joints"]))
+        hashes = [bone_hash(nodes[j].get("name", f"joint{j}")) for j in skin["joints"]]
+        steep = {h: gltf.mat_to_gl(gltf.mat_inv_rigid(M)) for h, M in m.bones}
+        places = [gltf.mat_mul(gltf.mat_inv(list(ib)), gltf.mat_inv_rigid(steep[h]))
+                  for h, ib in zip(hashes, ibms) if h in steep]
+        A = places[0] if places else gltf.IDENTITY
+        if not places:
+            print(f"  {label}: no joint of the armature is a bone of this mesh; positions taken as they are",
+                  file=sys.stderr)
+        elif max(max(abs(x - y) for x, y in zip(A, P)) for P in places) > 1e-3:
+            print(f"  {label}: the armature's bones do not sit where this mesh's bones do (moved in edit mode?); "
+                  "positions taken relative to the first matching bone", file=sys.stderr)
+        xform = gltf.mat_inv(A)
+        for h, ib in zip(hashes, ibms):
+            if h not in bones:
+                joint_bone.append(None)  # appended to the mesh only if a vertex uses it
+            else:
+                joint_bone.append(bones[h])
+        pending = {k: (h, gltf.mat_from_gl(gltf.mat_mul(list(ib), A))) for k, (h, ib) in enumerate(zip(hashes, ibms))
+                   if h not in bones}
+    nm = gltf.normal_matrix(xform)
+    out: dict[str, tuple[list[Vtx], list[tuple]]] = {}
+    for pi, prim in enumerate(doc["meshes"][node["mesh"]]["primitives"]):
+        if prim.get("mode", 4) != 4:
+            print(f"  {label}: primitive {pi} is not triangles, left out", file=sys.stderr)
+            continue
+        at = prim["attributes"]
+        P = g.values(at["POSITION"])
+        N = g.values(at["NORMAL"]) if "NORMAL" in at else None
+        T0 = g.values(at["TEXCOORD_0"]) if "TEXCOORD_0" in at else None
+        T1 = g.values(at["TEXCOORD_1"]) if "TEXCOORD_1" in at else None
+        C0 = g.values(at["COLOR_0"]) if "COLOR_0" in at else None
+        sets = []
+        k = 0
+        while skin and f"JOINTS_{k}" in at and f"WEIGHTS_{k}" in at:
+            sets.append((g.values(at[f"JOINTS_{k}"]), g.values(at[f"WEIGHTS_{k}"])))
+            k += 1
+        verts = []
+        for i, p in enumerate(P):
+            v = Vtx(gltf.from_gl(gltf.mat_apply(xform, p)))
+            if N is not None:
+                v.normal = norm(gltf.from_gl(gltf.mat_apply(nm, N[i], 0.0)))
+            if T0 is not None:
+                v.uv = tuple(T0[i])
+            if T1 is not None:
+                v.uv1 = tuple(T1[i])
+            if C0 is not None:
+                c = list(C0[i]) + [1.0] * (4 - len(C0[i]))
+                v.color = bytes(max(0, min(255, round(x * 255))) for x in c)
+            if sets:
+                skin_ = []
+                for js, ws in sets:
+                    for j, w in zip(js[i], ws[i]):
+                        if w <= 0:
+                            continue
+                        if joint_bone[j] is None:
+                            h, M = pending[j]
+                            new_bones.append((h, M))
+                            bones[h] = len(m.bones) + len(new_bones) - 1
+                            joint_bone[j] = bones[h]
+                        skin_.append((joint_bone[j], w))
+                v.skin = skin_
+            elif rigid is not None:
+                v.skin = [(rigid, 1.0)]
+            verts.append(v)
+        idx = g.values(prim["indices"]) if "indices" in prim else list(range(len(P)))
+        tris = [(idx[i], idx[i + 1], idx[i + 2]) for i in range(0, len(idx) - 2, 3)]
+        mi = prim.get("material")
+        mname = doc["materials"][mi].get("name", f"material{mi}") if mi is not None else ""
+        vs, ts = out.setdefault(re.sub(r"\.\d{3}$", "", mname), ([], []))
+        ts += [tuple(len(vs) + c for c in t) for t in tris]
+        vs += verts
+    return out
+
+
+def stored_geometry(m: Mesh, sm: Submesh) -> tuple[list[Vtx], list[tuple]]:
+    """A submesh's own vertices and triangles as import input (`--add`): they come out with their bytes kept."""
+    a = m.attrs()
+    rr = rows(m, m.main[0])[sm.first_vertex:sm.first_vertex + sm.vertex_count]
+    verts = []
+    for x in rr:
+        v = Vtx(dec_pos(m, x), dec_uv(m, x, a["uv0"]), dec_vec(x, a["normal"]), row=x)
+        if "weights" in a:
+            v.skin = [(sm.bone_map[x[a["bones"] + i]], x[a["weights"] + i]) for i in range(4) if x[a["weights"] + i]]
+        verts.append(v)
+    return verts, [tuple(i - sm.first_vertex for i in t) for t in triangles(m, sm)]
+
+
+def submesh_for(m: Mesh, mname: str, names: dict[int, str], only_one: bool) -> Submesh | None:
+    mm = re.fullmatch(r"(.*)#sm(\d+)", mname)
+    if mm:
+        return next((sm for sm in m.submeshes if sm.index == int(mm[2])), None)
+    cand = [sm for sm in m.submeshes if (names.get(sm.material) or f"0x{sm.material:x}") == mname]
+    if len(cand) == 1:
+        return cand[0]
+    if only_one and len(m.submeshes) == 1:
+        return m.submeshes[0]
+    return None
+
+
+def rigid_bone(g: gltf.Gltf, ni: int, bones: dict[int, int], default: str | None, label: str) -> int | None:
+    """The bone an unskinned object is bound to: its name's `@Bone` suffix, else the joint it hangs under
+    (Blender's Parent to Bone), else `default` (--bone)."""
+    nodes = g.doc["nodes"]
+    joints = {j for sk in g.doc.get("skins", []) for j in sk["joints"]}
+    parent = {c: i for i, nd in enumerate(nodes) for c in nd.get("children", [])}
+    name = nodes[ni].get("name", "")
+    want = name.rsplit("@", 1)[1] if "@" in name else None
+    p = parent.get(ni)
+    while want is None and p is not None:
+        if p in joints:
+            want = nodes[p].get("name", "")
+        p = parent.get(p)
+    want = want or default
+    if not want:
+        return None
+    if bone_hash(want) not in bones:
+        sys.exit(f"{label}: object {name!r} is bound to {want}, which is not a bone of this mesh "
+                 f"({', '.join(bone_name(x) for x in bones)})")
+    return bones[bone_hash(want)]
+
+
+def import_glb(s: Source, res: list, a) -> list[str]:
+    """`import --glb`: rebuild the meshes that the files' objects are named after (objects named after none go
+    into the `--to` meshes) from them; several objects for one mesh are merged."""
+    names = names_by_id(s)
+    meshes = {r.name: (k, r) for k, r in mesh_resources(s, None)}
+    to = [r.name for _, r in mesh_resources(s, a.to)] if a.to else []
+    targets: dict[str, list[tuple]] = {}
+    for path in a.glb:
+        g = gltf.load(path)
+        worlds = g.world_matrices()
+        nodes = g.doc.get("nodes", [])
+        for i, nd in enumerate(nodes):
+            if "mesh" not in nd:
+                continue
+            name = match_name(nd.get("name", "").split("@")[0], meshes) or match_name(
+                g.doc["meshes"][nd["mesh"]].get("name"), meshes)
+            for t in [name] if name else to:
+                targets.setdefault(t, []).append((g, i, worlds))
+            if not name and not to:
+                print(f"  {os.path.basename(path)}: object {nd.get('name')!r} is named after no mesh here, left out "
+                      "(see --to)", file=sys.stderr)
+    if not targets:
+        sys.exit(f"no object is named after a mesh of {s.name} ({', '.join(meshes)}); name it so, or give --to")
+    done = []
+    for name, objs in targets.items():
+        k, r = meshes[name]
+        m = parse_mesh(r.payload)
+        bones = {h: i for i, (h, _) in enumerate(m.bones)}
+        new_bones: list = []
+        geo: dict[str, tuple[list, list]] = {}
+        for g, ni, worlds in objs:
+            rigid = None if "skin" in g.doc["nodes"][ni] else rigid_bone(g, ni, bones, a.bone, name)
+            for mname, (vs, ts) in glb_vertices(g, ni, worlds, m, bones, new_bones, rigid, name).items():
+                gv, gt = geo.setdefault(mname, ([], []))
+                gt += [tuple(len(gv) + c for c in t) for t in ts]
+                gv += vs
+        items: dict[int, tuple] = {}
+        for mname, (vs, ts) in geo.items():
+            sm = submesh_for(m, mname, names, len(geo) == 1)
+            if sm is None:
+                sys.exit(f"{name}: material {mname!r} is no submesh's of {name}; the submeshes' materials are "
+                         + ", ".join(material_label(x, m, names) for x in m.submeshes))
+            if sm.index not in items:
+                items[sm.index] = (sm, *stored_geometry(m, sm)) if a.add else (sm, [], [])
+            iv, it = items[sm.index][1:]
+            it += [tuple(len(iv) + c for c in t) for t in ts]
+            iv += vs
+        payload = add_bones(r.payload, new_bones) if new_bones else r.payload
+        m = parse_mesh(payload)
+        subs = {sm.index: sm for sm in m.submeshes}
+        new, fallback = import_topology(m, [(subs[i], vs, ts) for i, (_, vs, ts) in items.items()])
+        m2 = parse_mesh(new)
+        for i, (_, vs, ts) in sorted(items.items()):
+            s2 = next(x for x in m2.submeshes if x.index == i)
+            fb = fallback.get(i, 0)
+            print(f"  {name} submesh {i}: {subs[i].vertex_count} -> {s2.vertex_count} vertices, {subs[i].triangles} "
+                  f"-> {s2.triangles} triangles" + (f", bone map {len(subs[i].bone_map)} -> {len(s2.bone_map)}"
+                                                    if s2.bone_map != subs[i].bone_map else "")
+                  + (f"; {fb} vertices without weights took the nearest original vertex's" if fb else ""))
+        kept = [x.index for x in m2.submeshes if x.index not in items]
+        if kept:
+            print(f"  {name}: submesh(es) {kept} not in the file, kept as they are")
+        if new_bones:
+            print(f"  {name}: bones added: {', '.join(bone_name(h) for h, _ in new_bones)}")
+        probs = check_mesh(new)
+        if probs:
+            raise MeshError(f"{name}: the rebuilt mesh fails its check: {'; '.join(probs)}")
+        res[k] = forge.Resource(r.id, r.type, r.name, new, r.flag, r.pre, r.extra)
+        done.append(name)
+    return done
 
 
 def cmd_import(a):
     s = load_source(a.src, a.entry)
     res = list(s.resources)
+    if bool(a.glb) == bool(a.obj):
+        sys.exit("import: give --glb or --obj")
+    if a.glb:
+        done = import_glb(s, res, a)
+        base = save(s, res, a.out, {"mesh_import": {"meshes": done, "glb": [os.path.basename(p) for p in a.glb]}})
+        print(f"{base}/: {s.name} with {len(done)} imported mesh(es)")
+        return
     meshes = {r.name: (k, r) for k, r in mesh_resources(s, None)}
     plan: dict[str, list] = {}
     for path in a.obj:
@@ -973,7 +1544,7 @@ def cmd_import(a):
             if sub not in subs:
                 sys.exit(f"{path}: {name} has no submesh {sub}")
         if a.topology:
-            new = import_topology(m, [(subs[sub], obj) for sub, obj, _ in items])
+            new, _ = import_topology(m, [(subs[sub], *obj_geometry(obj)) for sub, obj, _ in items])
             m2 = parse_mesh(new)
             for sub, _, path in items:
                 s2 = next(x for x in m2.submeshes if x.index == sub)
@@ -1074,8 +1645,14 @@ def main(argv=None):
     p.set_defaults(fn=cmd_info)
     p = sp.add_parser("export", help="OBJ per mesh (LOD) and submesh")
     src(p)
-    p.add_argument("-o", "--out", required=True)
-    p.add_argument("--skin", action="store_true", help="also write <obj>.skin.json (bones, bone map, weights)")
+    p.add_argument("-o", "--out", required=True, help="a folder for OBJs, or a .glb file (armature + weights, "
+                   "for Blender)")
+    p.add_argument("--skin", action="store_true", help="OBJ: also write <obj>.skin.json (bones, bone map, weights)")
+    p.add_argument("--textures", nargs="?", const=True, metavar="ARCHIVE", help=".glb: embed each material's "
+                   "diffuse texture (numpy); give an archive to search when the source is not one")
+    p.add_argument("--rig", action="append", help=".glb: add the bones of this entry's meshes to the armature (an "
+                   "entry of the source archive's stack, or ARCHIVE.forge:ENTRY; repeatable), to weight to bones the "
+                   "mesh lacks")
     p.set_defaults(fn=cmd_export)
     p = sp.add_parser("edit", help="move vertices (inflate/scale/translate) and write an unpacked datafile folder")
     src(p)
@@ -1086,11 +1663,19 @@ def main(argv=None):
     p.add_argument("--pivot", help="x,y,z")
     p.add_argument("--translate", help="x,y,z metres")
     p.set_defaults(fn=cmd_edit)
-    p = sp.add_parser("import", help="OBJs (as export writes them, same topology) replace positions/normals/UVs")
+    p = sp.add_parser("import", help="a .glb (any topology, with weights) or OBJs (as export writes them) replace "
+                      "meshes")
     src(p)
-    p.add_argument("--obj", action="append", required=True, help="an OBJ named <mesh>_sm<k>; repeatable")
-    p.add_argument("--topology", action="store_true", help="the OBJs may have other vertices/faces (formats 0 and 2: "
-                   "skinning, uv1 and the other bytes are taken from the nearest original vertex)")
+    p.add_argument("--glb", action="append", help="a .glb/.gltf (e.g. from Blender; repeatable): objects named after "
+                   "meshes, materials after the submeshes' materials; any topology (formats 0, 2, 6, 8)")
+    p.add_argument("--to", action="append", help="--glb: objects named after no mesh go into these meshes (name "
+                   "contains or id; repeatable), e.g. --to LOD for all LODs")
+    p.add_argument("--bone", help="--glb: bind unskinned objects without `@Bone` or a parent bone to this bone")
+    p.add_argument("--add", action="store_true", help="--glb: add the file's geometry to the submeshes instead of "
+                   "replacing them (for add-on pieces)")
+    p.add_argument("--obj", action="append", help="an OBJ named <mesh>_sm<k>; repeatable")
+    p.add_argument("--topology", action="store_true", help="the OBJs may have other vertices/faces (skinning, uv1 "
+                   "and the other bytes are taken from the nearest original vertex)")
     p.add_argument("-o", "--out", required=True)
     p.set_defaults(fn=cmd_import)
     p = sp.add_parser("check", help="parse every mesh of an archive, check it and its identity rewrite")
@@ -1101,7 +1686,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         return a.fn(a) or 0
-    except MeshError as ex:
+    except (MeshError, gltf.GltfError) as ex:
         sys.exit(f"mesh: {ex}")
 
 
