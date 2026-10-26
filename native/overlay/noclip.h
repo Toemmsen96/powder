@@ -19,6 +19,8 @@ bool trainer_loaded();
 
 // The player's position (address of a float3) through the chains; 0 if none resolves. `why` says which.
 uintptr_t find_player_pos(std::string &why);
+// The third-person camera's position (float3) through the "camera" chains, checked against the player's; 0 if none.
+uintptr_t find_camera_pos(uintptr_t player_pos, std::string &why);
 
 bool noclip_install(std::string &err);     // hook every writer (once); idle until a range is set
 bool noclip_installed();

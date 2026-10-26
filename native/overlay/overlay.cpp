@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -315,6 +316,23 @@ static DWORD g_player_checked = 0;
 
 static void set_fly(bool on);
 
+// The third-person camera (powder_trainer.json's "camera" chains): it looks at the rider, so camera -> rider is the
+// view direction - Fly moves along it. Looked up again every second while flying.
+static uintptr_t g_cam_pos = 0;
+static std::string g_cam_why = "not looked up yet";
+static DWORD g_cam_checked = 0;
+static bool g_cam_relative = true;
+static double g_cam_fwd[2] = {0, 1};      // the last horizontal view direction (kept while the camera is overhead)
+
+static bool read3(uintptr_t a, double out[3]) {
+    pw::Value v;
+    for (int i = 0; i < 3; i++) {
+        if (!pw::peek(a + 4 * i, pw::ValType::F32, v)) return false;
+        out[i] = v.f32;
+    }
+    return true;
+}
+
 static void drop_player_slots() {
     for (int i = (int)g_slots.size() - 1; i >= 0; --i)
         if (strncmp(g_slots[i].label, "player ", 7) == 0) erase_slot(i);
@@ -393,15 +411,21 @@ static void trainer_apply() {
                    g_axis[2] < (int)g_slots.size();
     if (!g_fly || !axes_ok) return;
     auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    double mv[3] = {0, 0, 0};
-    // Steep's world: Z is up. WASD = horizontal (X = A/D, Y = W/S), Shift/Ctrl = up/down (Z). World axes, not
-    // the camera's - camera-relative needs the view matrix (later).
-    if (held('D')) mv[0] += 1;
-    if (held('A')) mv[0] -= 1;
-    if (held('W')) mv[1] += 1;
-    if (held('S')) mv[1] -= 1;
-    if (held(VK_SHIFT)) mv[2] += 1;
-    if (held(VK_CONTROL)) mv[2] -= 1;
+    double fwd = (held('W') ? 1 : 0) - (held('S') ? 1 : 0), side = (held('D') ? 1 : 0) - (held('A') ? 1 : 0);
+    double mv[3] = {side, fwd, (held(VK_SHIFT) ? 1.0 : 0.0) - (held(VK_CONTROL) ? 1.0 : 0.0)};   // Steep: Z is up
+    if (g_cam_relative && g_player_pos && pw::trainer_loaded()) {
+        if (!g_cam_pos || now - g_cam_checked > 1000) { g_cam_checked = now; g_cam_pos = pw::find_camera_pos(g_player_pos, g_cam_why); }
+        double cam[3], me[3];
+        if (g_cam_pos && read3(g_cam_pos, cam) && read3(g_player_pos, me)) {
+            double fx = me[0] - cam[0], fy = me[1] - cam[1], len = std::sqrt(fx * fx + fy * fy);
+            if (len > 0.1) { g_cam_fwd[0] = fx / len; g_cam_fwd[1] = fy / len; }
+            // W/S along the view direction, D/A to its right (Z up: right of (x, y) is (y, -x))
+            mv[0] = fwd * g_cam_fwd[0] + side * g_cam_fwd[1];
+            mv[1] = fwd * g_cam_fwd[1] - side * g_cam_fwd[0];
+            double h = std::sqrt(mv[0] * mv[0] + mv[1] * mv[1]);
+            if (h > 1.0) { mv[0] /= h; mv[1] /= h; }      // diagonals no faster
+        }
+    }
     for (int k = 0; k < 3; ++k) {
         Slot &s = g_slots[g_axis[k]];
         pw::Value cur;
@@ -923,6 +947,11 @@ static void draw_trainer_tab() {
     ImGui::BeginDisabled(!pw::trainer_loaded());
     if (ImGui::Checkbox("Noclip while flying (the game can't move or block you)", &g_noclip_with_fly) && g_fly)
         set_fly(true);
+    ImGui::Checkbox("Move where the camera looks", &g_cam_relative);
+    if (g_cam_relative) {
+        if (g_cam_pos) ImGui::TextDisabled("camera found (%s)", g_cam_why.c_str());
+        else ImGui::TextDisabled("camera: %s - moving along world axes", g_cam_why.c_str());
+    }
     ImGui::EndDisabled();
     if (!g_noclip_err.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "noclip: %s", g_noclip_err.c_str());
     else if (pw::noclip_active()) ImGui::TextDisabled("noclip on: physics and collision are off for you");

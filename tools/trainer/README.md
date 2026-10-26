@@ -88,3 +88,11 @@ overlay's Fly/noclip off while recording (hooked writers run in caves without un
 
 The overlay's crash log (powder_overlay.log, "GAME CRASH ...") gives module+offset of a crash; look it up in the
 dump the same way (unwind.Image(dump, base).func(rva)).
+
+## The camera (findcam.py)
+
+The third-person camera looks at the rider, so its position alone gives the view direction (camera -> rider).
+`findcam.py <pid> snap A` (standing still), turn the camera, `snap B`, turn again, `snap C`, then
+`findcam.py <pid> orbit A B C`: points that moved each time at a constant 1.5-15 m from the unmoved player. The
+camera position showed as ~10 copies 4.7 m away (2026-10-26); `ptrscan.py` at depth 4 on five copies gave 228
+chains, 182 of which landed on it - they are the "camera" block of native/overlay/steep_trainer.json.
