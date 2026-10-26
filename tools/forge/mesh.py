@@ -1303,7 +1303,8 @@ def export_glb(s: Source, res: list, path: str, textures: bool, archive: str | N
             prims.append({"attributes": at, "material": mats[label],
                           "indices": b.accessor(idx, "SCALAR", gltf.UINT if len(rr) > 0xFFFF else gltf.USHORT,
                                                 target=gltf.ELEMENT_ARRAY_BUFFER)})
-        node = {"name": r.name, "mesh": b.add("meshes", {"name": r.name, "primitives": prims})}
+        node = {"name": r.name, "mesh": b.add("meshes", {"name": r.name, "primitives": prims}),
+                "extras": {"steep_mesh_id": f"{r.id:#x}", "steep_entry": f"{s.entry:#x}"}}  # Blender keeps these
         if skin is not None:
             node["skin"] = skin
         doc["scenes"][0]["nodes"].append(b.add("nodes", node))
@@ -1470,7 +1471,7 @@ def import_glb(s: Source, res: list, a) -> list[str]:
         for i, nd in enumerate(nodes):
             if "mesh" not in nd:
                 continue
-            name = match_name(nd.get("name", "").split("@")[0], meshes) or match_name(
+            name = None if a.ignore_names else match_name(nd.get("name", "").split("@")[0], meshes) or match_name(
                 g.doc["meshes"][nd["mesh"]].get("name"), meshes)
             for t in [name] if name else to:
                 targets.setdefault(t, []).append((g, i, worlds))
@@ -1680,6 +1681,8 @@ def main(argv=None):
     p.add_argument("--to", action="append", help="--glb: objects named after no mesh go into these meshes (name "
                    "contains or id; repeatable), e.g. --to LOD for all LODs")
     p.add_argument("--bone", help="--glb: bind unskinned objects without `@Bone` or a parent bone to this bone")
+    p.add_argument("--ignore-names", action="store_true", help="--glb: every object goes into the --to meshes, "
+                   "also one named after a mesh (e.g. LOD0's geometry into every LOD)")
     p.add_argument("--add", action="store_true", help="--glb: add the file's geometry to the submeshes instead of "
                    "replacing them (for add-on pieces)")
     p.add_argument("--obj", action="append", help="an OBJ named <mesh>_sm<k>; repeatable")

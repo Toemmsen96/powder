@@ -30,6 +30,31 @@ Then add a `mod.toml` and enable the mod (`POWDER_CLIENT_MODS=my_jacket` with po
 `<Base>_patch_03.forge` from `client/forge/<Base>/`, and the game loads the newest copy of each entry
 (`native/sdk/README.md`, "Asset mods"). `mods/shoulder_pads` is a worked example.
 
+## The Blender add-on (no terminal needed)
+
+`tools/forge/powder_blender.py` does the steps above from inside Blender. Install it with Edit > Preferences >
+Add-ons > (menu) Install from Disk, enable it, and set the Powder repository and the Steep folder in its
+preferences. The defaults are `~/Documents/GitHub/powder` and the Lutris path. The 3D view's sidebar (N) gets a
+**Powder** tab:
+
+- **Import item**: pick the archive and the item (name or `0x` id), and optionally LOD0 only, textures, or
+  extra bones from other items (e.g. `STP_M_Pants_001` for the legs). The item comes in tidied up: stick bones,
+  LOD1..3 hidden.
+- **Write mod**: give it a mod name, then choose:
+  - *Replace the item*: the item's visible LOD objects replace their meshes; hidden LODs stay as they are.
+  - *Add selected pieces*: the selected objects are added, and the item keeps its own geometry.
+  - *Into*: each LOD by its name, every LOD, or LOD0 only.
+
+  It writes `mods/<name>/client/forge/<Base>/` for **every** datafile that holds the item's meshes (found with
+  `forge.py where`), plus a `mod.toml`. Enable the mod with `POWDER_CLIENT_MODS=<name>`.
+
+The tools run in Blender's own Python, which has zstandard and numpy, so this also works in the Steam build of
+Blender inside its container. Everything they print goes to the *Powder log* text (Text Editor). Tested on Blender
+5.2.2 (headless) and 5.2.3 (Steam):
+- import, then *Add selected pieces* with a box named `box@Spine2` into every LOD: 24 vertices at Spine2 = 255
+  in the entity's 4 LODs and the Alps copy;
+- *Replace* by name, with LOD0 moved up 3 cm: both datafiles' LOD0 is 3.0 cm higher and passes `check`.
+
 ## What you get in Blender
 
 - **`Steep_Rig`**, an armature with the bones of every exported skinned mesh. Bones are named as the game names
