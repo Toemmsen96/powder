@@ -555,12 +555,15 @@ A mod is a folder `mods/<name>/` with up to three parts; the full guide is
 | ---- | ---- | ------ |
 | `mod.lua` | **server mod** (Lua): events, HTTP/NEX hooks, admin tools | ✅ |
 | `client/*.dll` | **client mod** (native, hosted by the overlay): function and mid-function hooks on the game's code, per-frame logic, overlay panels, talking to its server half (`native/sdk/powder_api.h`) | ✅ (e.g. `mods/asset_trace`) |
-| `client/forge/<Base>/` | **asset mod**: entries of Steep's `.forge` archives that override the game's, loaded from a per-session `<Base>_patch_03.forge` | ✅ textures (`mods/custom_texture`), meshes (`mods/mesh_edit`), material swaps (`mods/model_swap`) |
+| `client/forge/<Base>/` | **asset mod**: entries of Steep's `.forge` archives that override the game's, loaded from a per-session `<Base>_patch_03.forge` | ✅ textures (`mods/custom_texture`), meshes (`mods/mesh_edit`), material swaps (`mods/model_swap`); new geometry from Blender (`mods/shoulder_pads`, to be confirmed) |
 
 The asset tools: `tools/forge/forge.py` (the archives: list, extract, swap, build), `texture.py` (textures
-to and from PNG, all their formats), `mesh.py` (meshes to and from OBJ, also with a new topology),
-`tools/savegame/` (Steep's save files). What a fully new character model still needs: real skin weights from
-a modelling tool, the skeleton resource, new ids for new items.
+to and from PNG, all their formats), `mesh.py` (meshes to and from OBJ and glTF, also with a new topology),
+`tools/savegame/` (Steep's save files). **Blender**: `mesh.py export ... -o item.glb` gives the item with its
+armature, weights and texture; model, weight-paint or attach parts to bones in Blender, and `mesh.py import
+--glb` turns the result back into the game's mesh ([tools/forge/BLENDER.md](tools/forge/BLENDER.md)). What a
+fully new character item still needs: new ids for new items (today a model replaces an existing one) and the
+skeleton resource.
 
 Asset mods built from the game's own data are generated from your install by each mod's `generate.sh`;
 nothing of Ubisoft's is committed.

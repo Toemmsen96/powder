@@ -34,4 +34,6 @@ folder) in `mods/<name>/client/forge/<Base>/`. powder-wrap builds `<Base>_patch_
 entries for the session and removes it afterwards (confirmed in-game: mods/model_swap). Textures are decoded
 and re-encoded by `tools/forge/texture.py` (format: `tools/forge/TEXTURES.md`; example: mods/custom_texture);
 meshes by `tools/forge/mesh.py` (both confirmed in-game 2026-10-26) (OBJ export/import, also with a new topology; `tools/forge/MESHES.md`; example:
-mods/mesh_edit). Swapping whole entries/resources: `forge.py swap` (mods/model_swap).
+mods/mesh_edit). Models from Blender: `mesh.py export -o x.glb` / `import --glb` with armature and weights
+(`tools/forge/BLENDER.md`; example: mods/shoulder_pads). Which datafiles hold a mesh or texture:
+`forge.py where <game folder> --id <resource id>`. Swapping whole entries/resources: `forge.py swap` (mods/model_swap).

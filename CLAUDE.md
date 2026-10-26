@@ -250,17 +250,26 @@ API. Everything below is on `rework/rust-server`.
   jacket inflated 15 cm along its normals, all 4 LODs: it renders skinned and textured). Restart Lutris after
   changing POWDER_CLIENT_MODS in its environment. Game data in
   mods is generated locally by each mod's generate.sh and gitignored.
-- **Tools:** tools/forge (forge.py archives + swap, texture.py, mesh.py, TEXTURES.md, MESHES.md),
+- **Blender path (2026-10-26, tools/forge/BLENDER.md):** `mesh.py export -o x.glb [--textures] [--rig ITEM]` /
+  `import --glb x.glb [--to LOD] [--add] [--bone B]` (gltf.py, stdlib). Armature from the inverse bind matrices,
+  bone names = CRC-32 (94 known: SkelAddon strings + Mixamo names; others `0x<hash>`; hierarchy guessed), real
+  weights, bones the mesh lacks appended, rigid parts via Parent to Bone or `name@Bone`, static formats 6/8
+  (handedness = position w sign, confirmed). Round trips exact (also through headless Blender 5.0.1: `uv venv
+  --python 3.11` + `uv pip install bpy` in the scratchpad). mods/shoulder_pads = first in-game test of new
+  geometry with explicit weights (NOT yet confirmed in-game). `forge.py where <game> --id X` lists the datafiles
+  holding a resource.
+- **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
+  BLENDER.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and
   stackwatch.py perf watchpoints, ptrscan.py, dumpexe.py for the unpacked steep.exe, unwind.py, findcam.py,
   skiphook.py). Dump analysis: .pdata gives ~155k functions with bounds.
 
 ## Next steps (open)
 
-1. Confirm in-game: camera-relative Fly (live camera calibration).
-2. A fully new character model: a Blender export path with real skin weights (today weights come from the
-   nearest original vertex), the skeleton resource (not decoded), new ids (entity, template selector entry,
-   bootstrap item, prefetch).
+1. Confirm in-game: camera-relative Fly (live camera calibration); mods/shoulder_pads (rebuilt topology +
+   explicit weights); then a mod that adds a bone / grows a bone map (export --rig).
+2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch). The
+   skeleton resource (hierarchy) is still not decoded; the Blender path itself is done.
 3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
    unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the
    intro back). A server admin command "roll stats back to a time" (fold stat_events) would make repairs routine.
@@ -271,6 +280,9 @@ API. Everything below is on `rework/rust-server`.
    `native/build.ps1` overlay target.
 7. Server management interface (asked 2026-10-25): whitelist/blacklist, ban/kick, in accounts/sign-in + NEX/HTTPS
    auth, admin CLI + admin mod entry. Decide storage (config vs DB) with the user.
-8. Map / line builder mod (idea 2026-10-25): Tier 1 curate/share Steep's own custom lines/challenges (UGC +
-   entities already stored); Tier 2 an overlay planning tool drawing waypoints in 3D (needs the view matrix);
-   Tier 3 (new rideable geometry) shelved.
+8. Map / line builder mod (idea 2026-10-25, asked again 2026-10-26): Tier 1 curate/share Steep's own custom
+   lines/challenges (UGC + entities already stored); Tier 2 an overlay planning tool drawing waypoints in 3D
+   (needs the view matrix); Tier 3 new rideable geometry: static meshes (formats 6/8) now round-trip through
+   Blender, so the steps are (a) replace a prop's mesh in-game (every placement changes), (b) decode the
+   collision shapes (0xB22B3E61 `MeshShape`/`Merged Shape`; a visual mesh alone is not rideable), (c) decode the
+   world cells (0xAC2BBF68 DataBlocks) to place new instances.
