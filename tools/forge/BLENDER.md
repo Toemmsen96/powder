@@ -5,7 +5,8 @@ bone weights, the UVs and the materials, with the diffuse texture embedded if yo
 glTF importer and exporter read and write it, so no add-on is needed. You can reshape an item, model a new one
 over the rider's skeleton, weight-paint it, and turn the result back into a mesh resource for an asset mod.
 
-Tested with Blender 5.0.1 (headless, the `bpy` module). Blender 4.x writes the same glTF.
+Tested with Blender 4.5.9 LTS, 5.0.1 (the `bpy` module) and 5.2.2, all headless (`blender --factory-startup -b
+--python script.py -- args`): the results below are the same in all three.
 
 ```
 G=~/Games/ubisoft-connect/drive_c/Program\ Files\ \(x86\)/Ubisoft/Ubisoft\ Game\ Launcher/games/Steep

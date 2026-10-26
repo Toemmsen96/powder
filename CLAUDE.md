@@ -254,8 +254,8 @@ API. Everything below is on `rework/rust-server`.
   `import --glb x.glb [--to LOD] [--add] [--bone B]` (gltf.py, stdlib). Armature from the inverse bind matrices,
   bone names = CRC-32 (94 known: SkelAddon strings + Mixamo names; others `0x<hash>`; hierarchy guessed), real
   weights, bones the mesh lacks appended, rigid parts via Parent to Bone or `name@Bone`, static formats 6/8
-  (handedness = position w sign, confirmed). Round trips exact (also through headless Blender 5.0.1: `uv venv
-  --python 3.11` + `uv pip install bpy` in the scratchpad). mods/shoulder_pads = first in-game test of new
+  (handedness = position w sign, confirmed). Round trips exact (also through headless Blender 4.5.9/5.0.1/5.2.2:
+  `blender --factory-startup -b --python s.py -- args`, or `uv pip install bpy` under Python 3.11). mods/shoulder_pads = first in-game test of new
   geometry with explicit weights (NOT yet confirmed in-game). `forge.py where <game> --id X` lists the datafiles
   holding a resource.
 - **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
