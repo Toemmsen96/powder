@@ -287,8 +287,8 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
                             if compgen -G "$REPO/mods/$m/client/*.dll" >/dev/null; then
                                 cp -f "$REPO/mods/$m/client/"*.dll "$sdir/powder_mods/"
                                 say "client mod $m loads with the overlay"
-                            else
-                                say "client mod $m has no mods/$m/client/*.dll (native/build.sh mods): skipped"
+                            elif [ ! -d "$REPO/mods/$m/client/forge" ]; then
+                                say "client mod $m has no mods/$m/client/*.dll (native/build.sh mods) nor assets: skipped"
                             fi
                         done
                     fi
