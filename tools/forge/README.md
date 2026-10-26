@@ -206,7 +206,7 @@ The game has never loaded any of this. To get a modded entry in, in order of pre
 What a modder must watch:
 - Resources are duplicated inline. To retexture something, replace the resource in **every datafile that
   embeds it**. `show` lists a datafile's resources; search by resource id.
-- Payload formats: textures are decoded (TEXTURES.md, texture.py); meshes are not yet. Same-size, same-format swaps are the safe start.
+- Payload formats: textures (TEXTURES.md, texture.py) and meshes (MESHES.md, mesh.py) are decoded.
 - The name-record hash is unknown; if the engine checks it, our archives fail. Ubisoft Connect's "verify
   files" would flag a replaced file, but a bind mount in the session namespace never touches the real one.
 
@@ -243,7 +243,7 @@ yet.
 - The meaning of the datafile header's `extra` u16s, the resource `pre` section (flag 1), and the prefetch
   blobs' leading u16 and 3 bytes per dependency.
 - The rest of the GlobalMetaFile (the type list?), and whether a copied one with a new GUID is accepted.
-- Payload formats: TextureMap + Mip are decoded (TEXTURES.md); Mesh is not. They are needed for real
+- Payload formats: TextureMap + Mip (TEXTURES.md) and Mesh (MESHES.md) are decoded; skeletons are not. They are needed for real
   asset replacement (e.g. a DDS to TextureMap converter).
 - The folder table's fields, and the 5 u32s at name record +0xAC.
 - The writer handles a single table (≤ 4998 modded entries). Chained tables are read but not written.

@@ -275,7 +275,11 @@ don't run commands against the user's real prefix or data: test on scratch copie
    per-session <Base>_patch_03.forge; the game loads it and our entries win (mods/model_swap recolours the menu
    rider's jacket via `forge.py swap`; its entries are Steep's data, generated locally by generate.sh, gitignored).
    Client-mod API v2 adds on_frame and http (/_powder/ paths only, no session). Guide: native/sdk/README.md.
-   Deferred: decoding mesh/texture payloads (a new model needs that); camera-relative fly (needs the view matrix); the Windows launcher loading mods through the
+   Textures (tools/forge/texture.py, TEXTURES.md; mods/custom_texture) and meshes (mesh.py, MESHES.md; OBJ
+   export/import incl. new topology; mods/mesh_edit) are decoded (2026-10-26, not yet seen in-game). A fully new
+   skinned model still needs real skin weights (Blender path), the skeleton resource, new ids. Fly is camera-
+   relative: camera.cpp calibrates the camera live per session (pointer chains to it are not stable).
+   Deferred: the Windows launcher loading mods through the
    overlay (it injects client DLLs directly today); live POWDER_* delivery to non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
