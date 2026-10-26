@@ -181,15 +181,30 @@ above). After closing, the wrapper's cleanup was verified: CA gone from the pref
 Never run `admin trust install/remove` without `--wine-prefix` yourself (it changes the system trust store), and
 don't run commands against the user's real prefix or data: test on scratch copies; the game is tested by the user.
 
+## Dead ends (don't repeat)
+
+- Access-finder (page-guard + VEH) on the player's position CRASHES the game: the page is hot (written by many
+  threads per frame), the fault flood and single-step re-arm break. Make it safe (refuse hot pages, auto-disarm
+  after a short burst) before using it again.
+- Hardware/debug-register breakpoints: VMProtect detects/clears them.
+- So "capture the position's writer instruction -> stable anchor" is blocked for now; left: an external
+  multi-level pointer scan over /proc/<pid>/mem (0 direct static pointers to the struct found so far), or the
+  ~2-minute per-launch re-find with tools/trainer (findauth2 needs the player MOVING).
+- Save migration from a live account: Steep checksums the save against the account id (32-hex id at offset 8);
+  a patched copy failed. A Powder save is separate from the live one.
+- MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
+  game's OpenSSL is pinned. Real entitlement/offer formats can't be recorded that way.
+- Imported stats (level) without a matching save make the game replay the intro ("progress, but at the start").
+
 ## Next steps
 
 1. Done 2026-10-25: the game runs on Linux. The `native/` TLS helper (version.dll proxy + armer byte-patch)
    gets Steep past the loading screen and online under Wine/Proton (confirmed on the user's PC).
 2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
-   Python server in the user's sessions. First session OK (2026-10-26). DLC worlds showed as "to buy": the
-   HTTPS entitlements guess did not help (reverted); the demux product list now sets field 20 (owned) on the
-   "dlc" products (ulc keep the captured flag: force-owning cosmetics broke the store / heli tickets). Python's
-   products.py does not have this yet (port once the user confirms the worlds unlock).
+   Python server in the user's sessions. First session OK (2026-10-26). DLC worlds: the demux product list sets
+   field 20 (owned) on the "dlc" products (Steep asks via UPLAY_USER_IsOwned); CONFIRMED in-game, in both
+   servers (main e18e78f). The HTTPS entitlements endpoint stays empty (filling it did nothing). ULC keep the
+   captured flag: force-owning cosmetics broke the store / heli tickets.
    Watch for the hardening (2026-10-25) locking out real clients: "wrong signature" in the log means the
    game fills PRUDP's signature field differently than our vectors (`[server] nex_check_signatures`: "log", the default, only logs; "enforce" refuses; see
    nex/connection.rs); also 401/403 "cors-refused" / "origin not allowed" for Connect's UI, 413 bodies, demux
@@ -219,10 +234,8 @@ don't run commands against the user's real prefix or data: test on scratch copie
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
    `native/build.ps1` overlay target for Windows builds.
 4. Done 2026-10-25: Connect's `/v2/websocket/server` is routed (Python on main, and the Rust port).
-5. Linux launcher GUI (asked for 2026-10-25): a desktop app to pick/enable server mods, add/remove servers
-   (Join addresses with their pinned `host#<fingerprint>`), choose POWDER_SERVER python|rust and
-   POWDER_OVERLAY, and launch Steep via powder-wrap. Today the Linux "launcher" is only the powder-wrap
-   shell script set as Lutris' Command prefix; the Python launcher GUI is Windows-oriented.
+5. Done: Linux launcher GUI, `linux/launcher/` (GTK4 + Libadwaita GUI + CLI) and the `linux/powder-launcher`
+   wrapper.
 6. Server management interface (asked for 2026-10-25): access control for a Powder server - whitelist /
    blacklist mode, add/remove players, ban/kick - enforced in the accounts/sign-in + NEX/HTTPS auth paths,
    with admin CLI commands and an entry in the admin mod (web + the new overlay). Decide storage (config vs
