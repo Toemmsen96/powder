@@ -414,7 +414,17 @@ static void trainer_apply() {
     double fwd = (held('W') ? 1 : 0) - (held('S') ? 1 : 0), side = (held('D') ? 1 : 0) - (held('A') ? 1 : 0);
     double mv[3] = {side, fwd, (held(VK_SHIFT) ? 1.0 : 0.0) - (held(VK_CONTROL) ? 1.0 : 0.0)};   // Steep: Z is up
     if (g_cam_relative && g_player_pos && pw::trainer_loaded()) {
-        if (!g_cam_pos || now - g_cam_checked > 1000) { g_cam_checked = now; g_cam_pos = pw::find_camera_pos(g_player_pos, g_cam_why); }
+        if (!g_cam_pos || now - g_cam_checked > 1000) {
+            g_cam_checked = now;
+            uintptr_t was = g_cam_pos;
+            g_cam_pos = pw::find_camera_pos(g_player_pos, g_cam_why);
+            static std::string logged;
+            if (g_cam_pos != was && (g_cam_pos || logged != g_cam_why)) {     // changes only, not every second
+                logged = g_cam_why;
+                if (g_cam_pos) olog("camera at %p (%s)", (void *)g_cam_pos, g_cam_why.c_str());
+                else olog("camera not found: %s", g_cam_why.c_str());
+            }
+        }
         double cam[3], me[3];
         if (g_cam_pos && read3(g_cam_pos, cam) && read3(g_player_pos, me)) {
             double fx = me[0] - cam[0], fy = me[1] - cam[1], len = std::sqrt(fx * fx + fy * fy);

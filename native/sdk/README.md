@@ -31,5 +31,6 @@ Example: `mods/asset_trace` (hooks ntdll's file calls, a panel, a log). Finding 
 
 Extract an entry (`tools/forge/forge.py extract <archive> <id>`), change it, put the `.datafile` (or unpacked
 folder) in `mods/<name>/client/forge/<Base>/`. powder-wrap builds `<Base>_patch_03.forge` from all named mods'
-entries for the session and removes it afterwards. Payload formats (textures, meshes) are not decoded yet:
-swapping whole entries/resources works, editing pixels or vertices needs that work first.
+entries for the session and removes it afterwards (confirmed in-game: mods/model_swap). Textures are decoded
+and re-encoded by `tools/forge/texture.py` (format: `tools/forge/TEXTURES.md`; example: mods/custom_texture);
+meshes are not decoded yet - swapping whole entries/resources (`forge.py swap`) works.
