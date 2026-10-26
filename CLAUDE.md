@@ -191,8 +191,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
   invisible to the game and to VMProtect. Wine holds the main thread's four debug slots (skipped).
 - Bisect writes into stale snapshot addresses corrupt the game (the player got stuck floating, 2026-10-26):
   findauth2 now writes only live copies and undoes each nudge.
-- Save migration from a live account: Steep checksums the save against the account id (32-hex id at offset 8);
-  a patched copy failed. A Powder save is separate from the live one.
+- Save migration from a live account: NOT a dead end after all (2026-10-26). The 32-hex at offset 8 is a
+  per-session save-instance id; the account binding is a 16-byte XOR key per account over the body (aligned to its
+  end). tools/savegame/savegame.py decodes saves (sections of AnvilNext LZO blocks) and re-keys them between
+  accounts; no account id is inside. Not yet loaded by the game.
 - MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
   game's OpenSSL is pinned. Real entitlement/offer formats can't be recorded that way.
 - Imported stats (level) without a matching save make the game replay the intro ("progress, but at the start").
