@@ -76,8 +76,17 @@ impl EconomyService {
     /// Purchase / reward. -> (reply body, changes).
     pub fn apply_offer(&self, profile_id: &str, offer_id: &str, revision: Option<i64>)
                        -> anyhow::Result<Result<(Value, Vec<Change>), EconomyError>> {
-        let Some(offer) = self.assets.catalog.get(offer_id) else {
-            return Ok(Err(EconomyError::new(404, 1001, format!("offer {offer_id} not found"))));
+        let synthetic;
+        let offer = match self.assets.catalog.get(offer_id) {
+            Some(o) => o,
+            None => match crate::assets::synthetic_item(offer_id).filter(|_| self.assets.synthesizes_offers()) {
+                Some(item) => {
+                    log::info!(target: "powder.economy", "{profile_id} acquires item {item} (synthetic offer {offer_id})");
+                    synthetic = crate::assets::synthetic_offer(&item).expect("a UUID");
+                    &synthetic
+                }
+                None => return Ok(Err(EconomyError::new(404, 1001, format!("offer {offer_id} not found")))),
+            },
         };
         let offer_revision = offer.get("revision").and_then(Value::as_i64);
         if revision.is_some() && revision != offer_revision {

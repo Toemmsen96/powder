@@ -274,6 +274,31 @@ impl OfferCatalog {
     }
 }
 
+/// Without a game-data pack the store is empty, so the game cannot acquire anything - not even the rewards it
+/// grants itself (after a mission step or a challenge it looks up `offers?itemIds=<reward item>` and buys that
+/// offer). For an item no offer grants, a synthetic free offer gives +1 of it. Its id is the item's UUID with every
+/// byte XOR 0xA5: still a UUID, and reversible, so a purchase knows the item without stored state.
+pub fn synthetic_offer(item_id: &str) -> Option<Value> {
+    let offer_id = xor_uuid(item_id)?;
+    Some(serde_json::json!({"offerId": offer_id, "type": "progression", "revision": 1, "tags": ["REWARDS"],
+                            "items": [{"itemId": item_id, "quantity": 1}]}))
+}
+
+/// The item of a synthetic offer id (see synthetic_offer).
+pub fn synthetic_item(offer_id: &str) -> Option<String> {
+    xor_uuid(offer_id)
+}
+
+fn xor_uuid(id: &str) -> Option<String> {
+    let hex: String = id.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) || id.len() != 36 {
+        return None;
+    }
+    let b: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap() ^ 0xA5).collect();
+    let h = hex::encode(b);
+    Some(format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]))
+}
+
 /// Steep's entries in Ubisoft Connect's owned-games reply: the server's own entries (builtin/products.rs) for the
 /// products the pack lists, with cloud saves on (demux/ownership.rs switches them off unless configured). Nothing
 /// of the pack's product entries but their ids reaches Connect.
@@ -308,6 +333,11 @@ pub struct Assets {
 }
 
 impl Assets {
+    /// Synthetic offers (synthetic_offer) are made when there is no game-data pack.
+    pub fn synthesizes_offers(&self) -> bool {
+        self.manifest.is_none()
+    }
+
     /// The pack at `root`, or empty assets (logged) when there is none or it can't be used.
     pub fn load(root: &Path) -> Assets {
         if !root.join("MANIFEST.json").exists() {

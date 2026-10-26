@@ -338,7 +338,19 @@ fn get_offers(c: &Ctx) -> Reply {
         (Ok(o), Ok(l)) => (o, l),
         (Err(e), _) | (_, Err(e)) => return Reply::internal_error(&format!("offers: offset/limit: {e}")),
     };
-    let all = c.state.assets.catalog.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX);
+    let mut all = c.state.assets.catalog.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX);
+    if c.state.assets.synthesizes_offers() && q.get("tags").is_none() && q.get("type").is_none() {
+        for item in q.get("itemIds").unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+            let granted = all.iter().any(|o| o.get("items").and_then(Value::as_array).is_some_and(|items| {
+                items.iter().any(|i| i.get("itemId").and_then(Value::as_str).is_some_and(|x| x.eq_ignore_ascii_case(item)))
+            }));
+            if let (false, Some(offer)) = (granted, crate::assets::synthetic_offer(item)) {
+                log::info!(target: "powder.economy", "no offer grants item {item}: synthetic free offer {}",
+                           offer["offerId"].as_str().unwrap_or_default());
+                all.push(offer);
+            }
+        }
+    }
     let offers = py_slice(all, offset, limit);
     let how = format!("catalog({})", offers.len());
     Reply::json(&json!({"offers": offers}), &how, 200)
@@ -1139,6 +1151,41 @@ mod tests {
         let r = handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?type=shop"), &[]));
         assert_eq!(r.how, "catalog(2)");
         assert_eq!(handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?limit=x"), &[])).status, 500);
+    }
+
+    #[test]
+    fn synthetic_offers_without_a_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, pid) = files_state(tmp.path(), None);
+        let reward = "8d9430c2-d08f-493e-8028-2fc2d448fdb0";
+        let offers = |q: &str| body(&handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?{q}"), &[])))
+            ["offers"].as_array().unwrap().clone();
+        // an item no offer grants: one free synthetic offer for it
+        let got = offers(&format!("itemIds={reward}&offset=0&limit=100"));
+        assert_eq!(got.len(), 1);
+        let offer_id = got[0]["offerId"].as_str().unwrap().to_string();
+        assert_eq!(offer_id, "28319567-752a-ec9b-258d-8a6771ed5815", "the item's UUID, every byte XOR 0xA5");
+        assert_eq!(got[0]["items"], json!([{"itemId": reward, "quantity": 1}]));
+        // an item the catalogue has: its real offer only; tag/type queries never synthesize
+        let real = offers(&format!("itemIds={}", SKI_A_ITEM.to_uppercase()));
+        assert_eq!(real.iter().map(|o| o["offerId"].as_str().unwrap()).collect::<Vec<_>>(), [SKI_A]);
+        assert_eq!(offers("tags=REWARDS").len(), 0);
+        // buying it grants +1 of exactly that item
+        let auth = auth_for(&st, &pid);
+        let auth = [("Authorization", auth.as_str())];
+        let inv = format!("/v1/profiles/{pid}/inventory");
+        let r = send_json(&st, "POST", &inv, &auth, &json!({"spaceId": SPACE_ID, "offerId": offer_id, "offerRevision": 1}));
+        assert_eq!((r.status, r.how.as_str()), (200, "economy"));
+        assert_eq!(st.repos.quantity(&pid, reward).unwrap(), 1);
+        assert_eq!(st.repos.quantity(&pid, CREDITS_ITEM).unwrap(), CREDITS, "free");
+        // not a synthetic id (not a UUID): still unknown
+        let r = send_json(&st, "POST", &inv, &auth, &json!({"spaceId": SPACE_ID, "offerId": "nope"}));
+        assert_eq!(r.status, 404);
+        // with a pack: no synthesis
+        let mut assets = Assets { catalog: OfferCatalog::new(offers()), ..Default::default() };
+        assets.manifest = Some(Default::default());
+        assert!(!assets.synthesizes_offers());
+        assert!(crate::assets::synthetic_item(&offer_id).as_deref() == Some(reward));
     }
 
     #[test]
