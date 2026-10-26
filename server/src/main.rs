@@ -373,8 +373,8 @@ async fn run(config: Config) -> Result<()> {
     mods.lock().attach(&services);
     let accounts = services.accounts.clone();
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
-    log::warn!(target: "powder", "the Rust server is not tested with the game yet: if something fails, try the \
-                                  Python server");
+    log::warn!(target: "powder", "the Rust server is new (one session played with the game): if something \
+                                  fails, try the Python server");
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {
         format!("{}:{port}", s.bind).parse().with_context(|| format!("[server] bind {:?}", s.bind))

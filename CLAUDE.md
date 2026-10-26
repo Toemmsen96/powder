@@ -45,8 +45,9 @@ client mods are `powder/launcher/mods.py` (+ the "Client mods" step in `session.
 ### State of the port
 
 Everything of the Python server is ported (2026-10-25): all HTTPS routes, the websocket (`/v2/websocket` and
-Connect's `/v2/websocket/server`), NEX stats and matchmaking, channels, the importer, the admin CLI. Not yet
-played against the game: that is the next test (`POWDER_SERVER=rust powder-wrap`). Known gaps: `/_powder/status`
+Connect's `/v2/websocket/server`), NEX stats and matchmaking, channels, the importer, the admin CLI. Played
+against the game once (2026-10-26, `POWDER_SERVER=rust powder-wrap`): Connect, demux, game start, NEX secure
+channel (the game's packets carry our signature), cloud-save upload all worked; no unrouted game requests. Known gaps: `/_powder/status`
 lists a game's address without its port (`NexChannel` does not know its UDP peer); entity/UGC/cloud-save files
 are sent whole (no Range / If-Modified-Since); websocket permessage-deflate is declined. Each port's commit
 message lists its behaviour differences. `run` logs a warning while the Rust server is untested; keep it accurate.
@@ -185,7 +186,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
 1. Done 2026-10-25: the game runs on Linux. The `native/` TLS helper (version.dll proxy + armer byte-patch)
    gets Steep past the loading screen and online under Wine/Proton (confirmed on the user's PC).
 2. Play against the Rust server (`POWDER_SERVER=rust powder-wrap`) and fix what differs; then it can replace the
-   Python server in the user's sessions.
+   Python server in the user's sessions. First session OK (2026-10-26). DLC worlds showed as "to buy": the
+   HTTPS entitlements guess did not help (reverted); the demux product list now sets field 20 (owned) on the
+   "dlc" products (ulc keep the captured flag: force-owning cosmetics broke the store / heli tickets). Python's
+   products.py does not have this yet (port once the user confirms the worlds unlock).
    Watch for the hardening (2026-10-25) locking out real clients: "wrong signature" in the log means the
    game fills PRUDP's signature field differently than our vectors (`[server] nex_check_signatures`: "log", the default, only logs; "enforce" refuses; see
    nex/connection.rs); also 401/403 "cors-refused" / "origin not allowed" for Connect's UI, 413 bodies, demux
