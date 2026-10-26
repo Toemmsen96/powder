@@ -88,5 +88,11 @@ def entries(cloud_saves: bool = False, achievements_file: str | None = None,
         if only is not None and pid not in only:
             continue
         config = _yaml(pid, fields, cloud_saves, achievements_file)
-        out.append(pb.encode([(n, config if n == PRODUCT_CONFIG else v) for n, v in fields]))
+        fields = [(n, config if n == PRODUCT_CONFIG else v) for n, v in fields]
+        # field 20 = owned. The captured table has it on the games and the first ULCs, not on the DLC worlds,
+        # which then showed as "to buy". Not forced on ulc/none: force-owning cosmetics/consumables makes the
+        # store say "already bought" with nothing usable, and blocks heli tickets.
+        if KINDS.get(pid) == "dlc":
+            fields = pb.replace(fields, 20, 1)
+        out.append(pb.encode(fields))
     return out
