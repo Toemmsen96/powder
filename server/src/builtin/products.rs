@@ -93,6 +93,10 @@ pub fn entries_of(cloud_saves: bool, achievements_file: Option<&str>, only: Opti
                 .into_iter()
                 .map(|f| if f.0 == PRODUCT_CONFIG { F(f.0, V::Bytes(config.clone())) } else { f })
                 .collect();
+            // field 20 = owned. The captured table has it on the games only; the DLC worlds lacked it and
+            // showed as "to buy", so add it for them. NOT for ulc/none: force-owning cosmetics/consumables
+            // makes the store say "already bought" with nothing usable, and blocks heli tickets.
+            let fields = if kind(pid) == "dlc" { pb::replace(&fields, 20, V::Int(1)) } else { fields };
             pb::encode(&fields)
         })
         .collect()
@@ -103,7 +107,8 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    /// sha256 of the entries, each with a 4-byte length prefix, as the Python server (products.py) writes them.
+    /// sha256 of the entries, each with a 4-byte length prefix, as the Python server (products.py) writes them
+    /// plus field 20 (owned) on the DLC entries.
     fn framed_sha(entries: Vec<Vec<u8>>) -> String {
         let all: Vec<u8> = entries.iter().flat_map(|e| pb::frame(e)).collect();
         hex::encode(Sha256::digest(all))
@@ -113,9 +118,20 @@ mod tests {
     fn entries_match_the_python_server() {
         assert_eq!(PRODUCTS.len(), 62);
         assert_eq!(framed_sha(entries(false, None)),
-                   "f9bb825d28deb475caf0dbd3b89f4a8024ee2fa1213bf1cfac0c8bdb87c7f869");
+                   "6daad70d0aab4157b044c3812fcea8ab859179d85e74bb145016e3236dcdf61a");
         assert_eq!(framed_sha(entries(true, Some("achievements.xml"))),
-                   "6878ad79c03ce30b623de79be57ead5974496303bae08a60d2b884eeb9d30731");
+                   "6f20ee604adb131d50564d7050e6b19a019ae444479539b24493be251a90d7ee");
+    }
+
+    #[test]
+    fn dlc_entries_are_owned_and_the_others_as_captured() {
+        for (entry, table) in entries(false, None).iter().zip(PRODUCTS) {
+            let fields = pb::decode(entry).unwrap();
+            let pid = pb::int(&fields, 1).unwrap();
+            let owned = pb::int(&fields, 20);
+            let captured = if kind(pid) == "dlc" { Some(1) } else { pb::int(&to_fields(table), 20) };
+            assert_eq!(owned, captured, "product {pid}");
+        }
     }
 
     #[test]
