@@ -25,8 +25,6 @@ struct Writer { uint64_t rva; std::vector<uint8_t> bytes; };
 std::string g_module;
 uint64_t g_pos_offset = 0;
 std::vector<Chain> g_chains;
-uint64_t g_cam_offset = 0;
-std::vector<Chain> g_cam_chains;
 std::vector<Writer> g_writers;
 bool g_loaded = false;
 
@@ -134,15 +132,6 @@ bool trainer_load(const wchar_t *path, std::string &err) {
             for (auto &o : c["offsets"]) ch.offsets.push_back((int64_t)parse_hex(o));
             g_chains.push_back(ch);
         }
-        g_cam_chains.clear();
-        if (j.contains("camera")) {
-            g_cam_offset = parse_hex(j["camera"]["offset"]);
-            for (auto &c : j["camera"]["chains"]) {
-                Chain ch{parse_hex(c["root"]), {}};
-                for (auto &o : c["offsets"]) ch.offsets.push_back((int64_t)parse_hex(o));
-                g_cam_chains.push_back(ch);
-            }
-        }
         g_writers.clear();
         for (auto &w : j["writers"]) g_writers.push_back({parse_hex(w["rva"]), parse_bytes(w["bytes"].get<std::string>())});
     } catch (const std::exception &e) {
@@ -196,19 +185,6 @@ uintptr_t resolve(const std::vector<Chain> &chains, uint64_t offset, Accept acce
 uintptr_t find_player_pos(std::string &why) {
     return resolve(g_chains, g_pos_offset, [](const float *v) {
         return std::fabs(v[0]) > 1.0f || std::fabs(v[1]) > 1.0f || std::fabs(v[2]) > 1.0f;
-    }, why);
-}
-
-uintptr_t find_camera_pos(uintptr_t player_pos, std::string &why) {
-    if (g_cam_chains.empty()) { why = "no camera chains in powder_trainer.json"; return 0; }
-    Value px, py, pz;
-    if (!player_pos || !peek(player_pos, ValType::F32, px) || !peek(player_pos + 4, ValType::F32, py) ||
-        !peek(player_pos + 8, ValType::F32, pz)) { why = "no player position"; return 0; }
-    float p[3] = {px.f32, py.f32, pz.f32};
-    return resolve(g_cam_chains, g_cam_offset, [&](const float *v) {    // a third-person camera: 1.5-20 m away
-        float d2 = 0;
-        for (int i = 0; i < 3; i++) d2 += (v[i] - p[i]) * (v[i] - p[i]);
-        return d2 > 1.5f * 1.5f && d2 < 20.0f * 20.0f;
     }, why);
 }
 

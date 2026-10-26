@@ -50,6 +50,7 @@
 #include "modhost.h"
 #include "crashlog.h"
 #include "fixes.h"
+#include "camera.h"
 
 using json = nlohmann::json;
 
@@ -316,11 +317,8 @@ static DWORD g_player_checked = 0;
 
 static void set_fly(bool on);
 
-// The third-person camera (powder_trainer.json's "camera" chains): it looks at the rider, so camera -> rider is the
-// view direction - Fly moves along it. Looked up again every second while flying.
-static uintptr_t g_cam_pos = 0;
-static std::string g_cam_why = "not looked up yet";
-static DWORD g_cam_checked = 0;
+// The third-person camera (camera.cpp: calibrated live, it looks at the rider, so camera -> rider is the view
+// direction - Fly moves along it).
 static bool g_cam_relative = true;
 static double g_cam_fwd[2] = {0, 1};      // the last horizontal view direction (kept while the camera is overhead)
 
@@ -356,6 +354,7 @@ static void track_player() {
 
 static void set_fly(bool on) {
     g_fly = on;
+    if (on && g_cam_relative && g_player_pos && !pw::camera_pos(g_player_pos)) pw::camera_calibrate(g_player_pos);
     if (!pw::trainer_loaded()) return;
     if (on && g_noclip_with_fly && g_axis[0] >= 0) {
         if (!pw::noclip_installed()) {
@@ -414,19 +413,9 @@ static void trainer_apply() {
     double fwd = (held('W') ? 1 : 0) - (held('S') ? 1 : 0), side = (held('D') ? 1 : 0) - (held('A') ? 1 : 0);
     double mv[3] = {side, fwd, (held(VK_SHIFT) ? 1.0 : 0.0) - (held(VK_CONTROL) ? 1.0 : 0.0)};   // Steep: Z is up
     if (g_cam_relative && g_player_pos && pw::trainer_loaded()) {
-        if (!g_cam_pos || now - g_cam_checked > 1000) {
-            g_cam_checked = now;
-            uintptr_t was = g_cam_pos;
-            g_cam_pos = pw::find_camera_pos(g_player_pos, g_cam_why);
-            static std::string logged;
-            if (g_cam_pos != was && (g_cam_pos || logged != g_cam_why)) {     // changes only, not every second
-                logged = g_cam_why;
-                if (g_cam_pos) olog("camera at %p (%s)", (void *)g_cam_pos, g_cam_why.c_str());
-                else olog("camera not found: %s", g_cam_why.c_str());
-            }
-        }
+        uintptr_t cam_addr = pw::camera_pos(g_player_pos);
         double cam[3], me[3];
-        if (g_cam_pos && read3(g_cam_pos, cam) && read3(g_player_pos, me)) {
+        if (cam_addr && read3(cam_addr, cam) && read3(g_player_pos, me)) {
             double fx = me[0] - cam[0], fy = me[1] - cam[1], len = std::sqrt(fx * fx + fy * fy);
             if (len > 0.1) { g_cam_fwd[0] = fx / len; g_cam_fwd[1] = fy / len; }
             // W/S along the view direction, D/A to its right (Z up: right of (x, y) is (y, -x))
@@ -959,8 +948,10 @@ static void draw_trainer_tab() {
         set_fly(true);
     ImGui::Checkbox("Move where the camera looks", &g_cam_relative);
     if (g_cam_relative) {
-        if (g_cam_pos) ImGui::TextDisabled("camera found (%s)", g_cam_why.c_str());
-        else ImGui::TextDisabled("camera: %s - moving along world axes", g_cam_why.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Find camera") && g_player_pos) pw::camera_calibrate(g_player_pos);
+        ImGui::TextDisabled("camera: %s%s", pw::camera_status(),
+                            pw::camera_pos(g_player_pos) ? "" : " (until then: world axes)");
     }
     ImGui::EndDisabled();
     if (!g_noclip_err.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "noclip: %s", g_noclip_err.c_str());
