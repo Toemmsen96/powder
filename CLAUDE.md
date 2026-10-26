@@ -257,7 +257,9 @@ API. Everything below is on `rework/rust-server`.
   (handedness = position w sign, confirmed). Round trips exact (also through headless Blender 4.5.9/5.0.1/5.2.2:
   `blender --factory-startup -b --python s.py -- args`, or `uv pip install bpy` under Python 3.11). mods/shoulder_pads = first in-game test of new
   geometry with explicit weights (NOT yet confirmed in-game). `forge.py where <game> --id X` lists the datafiles
-  holding a resource.
+  holding a resource. Blender add-on `tools/forge/powder_blender.py` (sidebar tab Powder: Import item / Write mod,
+  runs the tools in Blender's Python). The user's Blender 5.2.3 (Steam) has Blender Lab's MCP add-on; with the
+  `blender` MCP server connected, Claude can drive it (execute_blender_code, screenshots).
 - **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
   BLENDER.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and
