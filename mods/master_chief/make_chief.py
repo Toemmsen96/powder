@@ -210,15 +210,29 @@ def fit(model_pos: dict, rest: dict, sole: float) -> tuple[float, dict]:
 
 
 def texture_sets(game: str) -> dict:
-    """Steep material -> {map: TextureMap id} of its TextureSet (both costumes use the same materials)."""
-    s = mesh.load_source(os.path.join(game, BASE + ".forge"), COSTUMES["M"])
+    """Steep material -> [{map: TextureMap id}] of every colourway's TextureSet: the costume's default (embedded in
+    its entity) and the colourway materials (`STP_MF_Costume_016_<part>_T01..T03`, entries of their own), which the
+    costume's items pick from. Both costumes use the same materials."""
+    arch = os.path.join(game, BASE + ".forge")
+    s = mesh.load_source(arch, COSTUMES["M"])
     by_name = {r.name: r for r in s.resources}
+
+    def slots(ts):
+        return {SLOTS[k]: struct.unpack_from("<Q", ts.payload, 13 + 10 * k + 2)[0]
+                for k in SLOTS if ts.payload[13 + 10 * k] == 1}
+    fg = forge.Forge(arch)
     out = {}
     for mat in LAYOUT:
         payload = by_name[mat].payload
-        ts = next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload)
-        out[mat] = {SLOTS[k]: struct.unpack_from("<Q", ts.payload, 13 + 10 * k + 2)[0]
-                    for k in SLOTS if ts.payload[13 + 10 * k] == 1}
+        sets = [slots(next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload))]
+        part = mat.rsplit("_", 1)[0]  # STP_MF_Costume_016_Jacket
+        for e in fg.entries:
+            if e.type == 0x85C817C3 and re.fullmatch(re.escape(part) + r"_T\d+", e.name):
+                newest, entry = mesh.game_entry(arch, f"{e.id:#x}")
+                for r in forge.parse_datafile(newest.read(entry)).resources:
+                    if r.type == 0xD70E6670 and slots(r) not in sets:
+                        sets.append(slots(r))
+        out[mat] = sets
     return out
 
 
@@ -363,13 +377,14 @@ def main():
                 print("\n".join(line for line in res.splitlines() if "submesh" in line))
         pngs = maps(a.model, tmp)
         sets = texture_sets(a.game)
-        where = holders(a.game, [t for m in sets.values() for t in m.values()])
-        for mat, ids in sets.items():
-            for k, tid in ids.items():
-                for base in sorted({b for b, e in where if int(e, 16) == tid}):
-                    run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, base + ".forge"),
-                        f"{tid:#x}", "--image", pngs[mat][k], "-o", os.path.join(a.out, base))
-                    print(f"  {mat} {k}: {base}")
+        where = holders(a.game, [t for lst in sets.values() for m in lst for t in m.values()])
+        for mat, lst in sets.items():
+            for n, ids in enumerate(lst):
+                for k, tid in ids.items():
+                    for base in sorted({b for b, e in where if int(e, 16) == tid}):
+                        run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, base + ".forge"),
+                            f"{tid:#x}", "--image", pngs[mat][k], "-o", os.path.join(a.out, base))
+                print(f"  {mat}: colourway {n + 1} of {len(lst)}, {len(ids)} maps")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

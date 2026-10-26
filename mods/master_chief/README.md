@@ -25,7 +25,7 @@ Most of those formats are not decoded.
 |---|---|---|
 | the male costume | `STP_M_Costume_016` (entity) with LOD0..3 | `mesh.py import --glb`: armor -> the jacket submesh, undersuit -> the pants submesh, helmet and visor -> the helmet submesh, the glass submesh shrunk to one 1 mm triangle; 63,203 vertices, 56,075 triangles in every LOD |
 | the female costume | `STP_F_Costume_016` with LOD0..3 | the same, fitted to the female skeleton |
-| the textures | the 12 maps of `STP_MF_Costume_016_{Jacket,Pants,Helmet}_T01_Set` and their `_Mip0`/`_Mip1` | `texture.py replace`: armor and suit at 2048, helmet and visor side by side |
+| the textures | all 3 colourways (the costume's items pick `_T01`..`_T03` materials): 9 texture sets x 4 maps, and their `_Mip0`/`_Mip1` | `texture.py replace`: armor and suit at 2048, helmet and visor side by side; every colourway the same |
 
 The glass material (`STP_MF_Glass_ALL`) is shared with goggles and other gear, so its textures stay as they are and
 only the costume's glass geometry goes. Every costume 016 a rider wears becomes Master Chief.
@@ -35,7 +35,8 @@ run alongside this mod.
 
 ## What you should see
 
-Equip costume 016 under Costumes & Equipments. The rider becomes Master Chief: green armour, black undersuit and the
+Equip costume 016 under Costumes & Equipments: the camo soldier with gas mask and helmet, most likely the items
+`COSTUME_M_MILITARY_GREY_94` / `_RED_95` (in the game: a military costume; every colourway shows Chief). The rider becomes Master Chief: green armour, black undersuit and the
 gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the rider's animations (arms, legs,
 fingers), because his own skin weights were renamed to Steep's bones.
 
