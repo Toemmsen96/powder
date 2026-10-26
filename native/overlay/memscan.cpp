@@ -63,22 +63,21 @@ bool MemScan::readable(const void *p, size_t n) const {
 
 static const size_t MAX_MATCHES = 2'000'000;   // cap so a first scan can't blow up memory
 
+// ReadProcessMemory on ourselves: a page the game frees between a check and a copy (it streams the world in and
+// out while you ride) makes it fail instead of faulting, which a VirtualQuery + memcpy would.
 bool peek(uintptr_t addr, ValType t, Value &out) {
     size_t n = (t == ValType::I64 || t == ValType::F64) ? 8 : 4;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((void *)addr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
-        return false;
-    DWORD prot = mbi.Protect & 0xFF;
-    if (prot == PAGE_NOACCESS) return false;
-    if ((uintptr_t)mbi.BaseAddress + mbi.RegionSize < addr + n) return false;
+    SIZE_T got = 0;
     out.type = t;
-    memcpy(&out.i64, (void *)addr, n);
-    return true;
+    out.i64 = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (void *)addr, &out.i64, n, &got) && got == n;
 }
 
 void poke(uintptr_t addr, const Value &v) {
     void *p = (void *)addr;
     size_t n = v.size();
+    SIZE_T done = 0;
+    if (WriteProcessMemory(GetCurrentProcess(), p, &v.i64, n, &done) && done == n) return;
     DWORD old;
     if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) return;
     memcpy(p, &v.i64, n);

@@ -1,5 +1,6 @@
 #include "hooks.h"
 #include "codepatch.h"
+#include "crashlog.h"
 #include "powder_api.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -117,6 +118,7 @@ bool prepare(uintptr_t target, void *detour, TRAMPOLINE &ct, std::string &err) {
     ct.pTarget = (LPVOID)target;
     ct.pDetour = detour;
     ct.pTrampoline = buf;
+    crashlog_add_range((uintptr_t)buf, (uintptr_t)buf + 64);    // MinHook's slot: trampoline + relay
     if (!CreateTrampolineFunction(&ct)) {
         FreeBuffer(buf);
         err = "cannot relocate the target's first instructions (too short, or jumps into them)";
@@ -173,6 +175,7 @@ int hook_mid(const std::string &owner, uintptr_t at, void (*fn)(PowderRegs *, vo
     uint8_t *stub = (uint8_t *)VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!stub) { err = "no memory for the stub"; return 0; }
     memcpy(stub, pw_mid_tpl_start, size);
+    crashlog_add_range((uintptr_t)stub, (uintptr_t)stub + size);
     TRAMPOLINE ct;
     if (!prepare(at, stub, ct, err)) { VirtualFree(stub, 0, MEM_RELEASE); return 0; }
     uint64_t slots[3] = {(uint64_t)ct.pTrampoline, (uint64_t)fn, (uint64_t)user};

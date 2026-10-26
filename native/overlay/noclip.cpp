@@ -1,6 +1,7 @@
 #include "noclip.h"
 #include "memscan.h"
 #include "codepatch.h"
+#include "crashlog.h"
 #include "json.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -187,6 +188,7 @@ bool noclip_install(std::string &err) {
     if (!g_block) {
         g_block = alloc_near(base, 0x1000);
         if (!g_block) { err = "no free memory near the module for the caves"; return false; }
+        crashlog_add_range((uintptr_t)g_block, (uintptr_t)g_block + 0x1000);
         g_lo = (volatile uint64_t *)g_block;
         g_hi = (volatile uint64_t *)(g_block + 8);
         *g_lo = 0; *g_hi = 0;

@@ -47,6 +47,7 @@
 #include "noclip.h"
 #include "codepatch.h"
 #include "modhost.h"
+#include "crashlog.h"
 
 using json = nlohmann::json;
 
@@ -461,7 +462,11 @@ static void init_imgui(IDXGISwapChain *sc) {
 static HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     if (!g_init) init_imgui(sc);
     static bool mods_loaded = false;
-    if (g_init && !mods_loaded) { mods_loaded = true; pw::mods_load(g_dir, g_base_url, olog_line); }
+    if (g_init && !mods_loaded) {
+        mods_loaded = true;
+        pw::crashlog_install(g_logpath);      // after the game's own handlers, so ours chains to them
+        pw::mods_load(g_dir, g_base_url, olog_line);
+    }
     if (g_init && g_rtv) {
         // harness: auto sign-in + load players once, so a headless run can verify the whole path
         if (!g_autologin_done && !g_cfg_login_email.empty() && g_net && g_net->valid()) {

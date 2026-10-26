@@ -51,19 +51,6 @@ bool image_range(const char *module, uintptr_t &lo, uintptr_t &hi) {
     return true;
 }
 
-bool readable(uintptr_t a, size_t n) {
-    while (n) {
-        MEMORY_BASIC_INFORMATION m;
-        if (!VirtualQuery((void *)a, &m, sizeof(m)) || m.State != MEM_COMMIT || (m.Protect & PAGE_GUARD) ||
-            (m.Protect & 0xFF) == PAGE_NOACCESS)
-            return false;
-        uintptr_t end = (uintptr_t)m.BaseAddress + m.RegionSize;
-        size_t chunk = end - a < n ? end - a : n;
-        a += chunk; n -= chunk;
-    }
-    return true;
-}
-
 // ---- the API ----------------------------------------------------------------------------------------------
 
 void api_log(const PowderMod *mod, const char *fmt, ...) {
@@ -109,9 +96,8 @@ uintptr_t api_find_pattern(const char *module, const char *pattern) {
 }
 
 int api_read(uintptr_t addr, void *out, size_t n) {
-    if (!readable(addr, n)) return 1;
-    memcpy(out, (void *)addr, n);
-    return 0;
+    SIZE_T got = 0;                    // fails instead of faulting on a page freed meanwhile
+    return ReadProcessMemory(GetCurrentProcess(), (void *)addr, out, n, &got) && got == n ? 0 : 1;
 }
 
 int api_write(uintptr_t addr, const void *src, size_t n) {
