@@ -301,6 +301,49 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         fi
     fi
 
+    # ---- asset mods: mods/<name>/client/forge/<Base>/ hold .forge entries (tools/forge/forge.py extract's
+    # files or unpacked folders) that override the game's. For the mods named in POWDER_CLIENT_MODS, build one
+    # <Base>_patch_03.forge per base archive (the game probes _patch_03 after _patch_02; the newest copy of an
+    # entry wins) and put it beside the game for this session. What we put there is listed in .powder-assets,
+    # so cleanup (or the next session, after a killed one) removes exactly that and never a file of the game's.
+    asset_dir=${sdir:-$(steep_dir)}
+    asset_list="$asset_dir/.powder-assets"
+    if [ -n "$asset_dir" ] && [ -f "$asset_list" ]; then
+        while IFS= read -r f; do case $f in */*|*[!A-Za-z0-9_.-]*) ;; *_patch_03.forge) rm -f "$asset_dir/$f" ;; esac; done < "$asset_list"
+        rm -f "$asset_list"
+    fi
+    if [ -n "${POWDER_CLIENT_MODS:-}" ] && [ -n "$asset_dir" ] && [ -d "$asset_dir" ]; then
+        declare -A asset_parts=()
+        for m in ${POWDER_CLIENT_MODS//,/ }; do
+            case $m in */*|.*|'') continue ;; esac
+            for d in "$REPO/mods/$m/client/forge"/*/; do
+                [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+            done
+        done
+        for base in "${!asset_parts[@]}"; do
+            out="${base}_patch_03.forge"
+            if [ ! -f "$asset_dir/$base.forge" ]; then
+                say "asset mod for $base: no $base.forge in the game folder: skipped"; continue
+            elif [ -e "$asset_dir/$out" ]; then
+                say "asset mods for $base: $out exists and is not ours: skipped"; continue
+            fi
+            entries=()
+            while IFS= read -r d; do
+                [ -n "$d" ] && for e in "$d"*; do [ -e "$e" ] && entries+=("$e"); done
+            done <<< "${asset_parts[$base]}"
+            tmp_forge=$(mktemp -d)
+            if python3 "$REPO/tools/forge/forge.py" build "$tmp_forge/$out" --like "$asset_dir/$base.forge" \
+                    "${entries[@]}" >> "$LOG" 2>&1 \
+                    && cp -f "$tmp_forge/$out" "$asset_dir/$out"; then
+                printf '%s\n' "$out" >> "$asset_list"
+                say "asset mods: $out (${#entries[@]} entries) for this session"
+            else
+                say "asset mods for $base: building $out failed (see $LOG)"
+            fi
+            rm -rf "$tmp_forge"
+        done
+    fi
+
     cleanup() {
         "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
         # powder_tls.log is kept (it is the helper's diagnostic; the next session resets it)
@@ -310,6 +353,10 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
             rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg" "$helper/powder_trainer.json"
             rm -rf "$helper/powder_mods"
             winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
+        fi
+        if [ -n "${asset_dir:-}" ] && [ -f "$asset_list" ]; then   # the asset mods' _patch_03 archives
+            while IFS= read -r f; do case $f in */*|*[!A-Za-z0-9_.-]*) ;; *_patch_03.forge) rm -f "$asset_dir/$f" ;; esac; done < "$asset_list"
+            rm -f "$asset_list"
         fi
         if winereg delete "$key" /f; then
             rm -f "$marker"
