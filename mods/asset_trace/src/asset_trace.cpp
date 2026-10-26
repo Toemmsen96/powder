@@ -2,7 +2,9 @@
 // analysis (tools/forge/ maps a .forge offset to its entry). Also the example of a client mod: it hooks ntdll's
 // NtCreateFile/NtOpenFile (handle -> path) and NtReadFile (offset, length) through the Powder API, shows
 // per-file totals in the overlay's Mods tab, and with "log reads" appends each read of a .forge/.pck/.tbf/.bk2 to
-// powder_asset_trace.log beside the overlay: "<ms> <file> <offset> <length>".
+// powder_asset_trace.log beside the overlay: "<ms> <file> <offset> <length>". Probes go to the overlay log once
+// each: failed opens and existence checks (NtQuery[Full]AttributesFile) of such files, and directory searches
+// for them - which files the engine would load if they existed (e.g. a _patch_03.forge).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
@@ -22,6 +24,9 @@ typedef NTSTATUS(NTAPI *NtOpenFile_t)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, 
 typedef NTSTATUS(NTAPI *NtReadFile_t)(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER,
                                       PULONG);
 typedef NTSTATUS(NTAPI *NtQueryInformationFile_t)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+typedef NTSTATUS(NTAPI *NtQueryAttributesFile_t)(POBJECT_ATTRIBUTES, PVOID);
+typedef NTSTATUS(NTAPI *NtQueryDirectoryFile_t)(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG,
+                                                BOOLEAN, PUNICODE_STRING, BOOLEAN);
 
 static const PowderApi *g_api;
 static PowderMod *g_mod;
@@ -29,6 +34,8 @@ static NtCreateFile_t o_create;
 static NtOpenFile_t o_open;
 static NtReadFile_t o_read;
 static NtQueryInformationFile_t g_query;
+static NtQueryAttributesFile_t o_attr, o_fullattr;
+static NtQueryDirectoryFile_t o_dir;
 
 struct FileStat { std::string path, name; uint64_t reads = 0, bytes = 0, opens = 0; };
 
@@ -41,6 +48,7 @@ static std::atomic<bool> g_logging{false};
 static std::string g_logbuf;
 static std::wstring g_logpath;
 static thread_local bool t_inside = false;               // our own file work must not be traced
+static std::unordered_map<std::string, bool> g_probes;   // probe lines already logged
 
 static bool tracked(const std::string &p) {
     std::string l = p;
@@ -89,10 +97,48 @@ static void opened(HANDLE h, POBJECT_ATTRIBUTES oa) {
     }
 }
 
+// Log a probe line once (outside the lock, untraced: the log's own file open comes through the hooks).
+static void probe(const char *what, const std::string &path, NTSTATUS st) {
+    char line[700];
+    snprintf(line, sizeof(line), "%s %s -> 0x%08lx", what, path.c_str(), (unsigned long)st);
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        if (!g_probes.emplace(line, true).second) return;
+    }
+    t_inside = true;
+    g_api->log(g_mod, "%s", line);
+    t_inside = false;
+}
+
+static NTSTATUS NTAPI hk_attr(POBJECT_ATTRIBUTES oa, PVOID info) {
+    NTSTATUS st = o_attr(oa, info);
+    if (!t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName))) probe("exists?", utf8(oa->ObjectName), st);
+    return st;
+}
+
+static NTSTATUS NTAPI hk_fullattr(POBJECT_ATTRIBUTES oa, PVOID info) {
+    NTSTATUS st = o_fullattr(oa, info);
+    if (!t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName))) probe("exists?", utf8(oa->ObjectName), st);
+    return st;
+}
+
+static NTSTATUS NTAPI hk_dir(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, PIO_STATUS_BLOCK io, PVOID info, ULONG len,
+                             ULONG cls, BOOLEAN single, PUNICODE_STRING mask, BOOLEAN restart) {
+    NTSTATUS st = o_dir(h, ev, apc, ctx, io, info, len, cls, single, mask, restart);
+    if (!t_inside && mask && restart) {
+        std::string m = utf8(mask), l = m;
+        std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+        if (l.find("forge") != std::string::npos || l.find("patch") != std::string::npos) probe("search", m, st);
+    }
+    return st;
+}
+
 static NTSTATUS NTAPI hk_create(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io, PLARGE_INTEGER sz,
                                 ULONG attr, ULONG share, ULONG disp, ULONG opt, PVOID ea, ULONG eal) {
     NTSTATUS st = o_create(h, a, oa, io, sz, attr, share, disp, opt, ea, eal);
     if (st >= 0 && h && !t_inside) opened(*h, oa);
+    else if (st < 0 && !t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName)))
+        probe("open failed", utf8(oa->ObjectName), st);
     return st;
 }
 
@@ -100,6 +146,8 @@ static NTSTATUS NTAPI hk_open(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES oa, P
                               ULONG opt) {
     NTSTATUS st = o_open(h, a, oa, io, share, opt);
     if (st >= 0 && h && !t_inside) opened(*h, oa);
+    else if (st < 0 && !t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName)))
+        probe("open failed", utf8(oa->ObjectName), st);
     return st;
 }
 
@@ -210,6 +258,12 @@ extern "C" POWDER_EXPORT int powder_mod_init(const PowderApi *api, PowderMod *mo
     fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtCreateFile"), (void *)hk_create, (void **)&o_create, nullptr);
     fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtOpenFile"), (void *)hk_open, (void **)&o_open, nullptr);
     fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtReadFile"), (void *)hk_read, (void **)&o_read, nullptr);
+    fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtQueryAttributesFile"), (void *)hk_attr, (void **)&o_attr,
+                       nullptr);
+    fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtQueryFullAttributesFile"), (void *)hk_fullattr,
+                       (void **)&o_fullattr, nullptr);
+    fails += api->hook(mod, (uintptr_t)GetProcAddress(nt, "NtQueryDirectoryFile"), (void *)hk_dir, (void **)&o_dir,
+                       nullptr);
     CreateThread(nullptr, 0, flusher, nullptr, 0, nullptr);
     api->log(mod, "tracing file reads (%d hook(s) failed)", fails);
     return 0;
