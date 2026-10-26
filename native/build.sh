@@ -55,7 +55,8 @@ build_overlay() {
     local cxxflags=(-O2 -std=c++17 -Wall "${inc[@]}")
     local srcs=("$img/imgui" "$img/imgui_draw" "$img/imgui_tables" "$img/imgui_widgets"
                 "$img/backends/imgui_impl_dx11" "$img/backends/imgui_impl_win32"
-                "$here/overlay/overlay" "$here/overlay/http" "$here/overlay/memscan" "$here/overlay/access")
+                "$here/overlay/overlay" "$here/overlay/http" "$here/overlay/memscan" "$here/overlay/access"
+                "$here/overlay/noclip")
     for s in "${srcs[@]}"; do
         cxx "${cxxflags[@]}" -c "$s.cpp" -o "$obj/$(basename "$s").o"
     done

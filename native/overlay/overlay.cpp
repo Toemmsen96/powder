@@ -11,6 +11,8 @@
 //                (http.cpp); needs the Rust server (the admin mod is Lua -> Rust only).
 //   Debug tab  - connection status, the broadcast feed, FPS, an HTTP activity log, and a generic in-process
 //                memory scanner (memscan.cpp) - no Steep reverse-engineering needed.
+//   Trainer tab- address slots (freeze/set), Fly, Teleport; the player's position found through
+//                powder_trainer.json's pointer chains, and noclip while flying (noclip.cpp).
 //
 // All network calls run on a worker thread; the Present/UI thread never blocks on I/O. Diagnostics go to
 // powder_overlay.log beside the DLL.
@@ -40,6 +42,7 @@
 #include "http.h"
 #include "memscan.h"
 #include "access.h"
+#include "noclip.h"
 
 using json = nlohmann::json;
 
@@ -291,6 +294,57 @@ static void add_slot(const char *label, uintptr_t addr, pw::ValType type) {
     g_slots.push_back(s);
 }
 
+static void erase_slot(int i) {
+    for (int k = 0; k < 3; ++k) { if (g_axis[k] == i) g_axis[k] = -1; else if (g_axis[k] > i) --g_axis[k]; }
+    g_slots.erase(g_slots.begin() + i);
+}
+
+// ---- the player's position (powder_trainer.json's chains) and noclip while flying (noclip.cpp) -------------
+// The position moves to new memory on a map change, a respawn and every launch, so it is looked up again
+// every frame while flying (Fly must never write into memory the game has freed) and every second otherwise.
+static uintptr_t g_player_pos = 0;      // the position the "player X/Y/Z" slots point at; 0 = none
+static std::string g_player_why = "not looked up yet", g_noclip_err;
+static bool g_noclip_with_fly = true;
+static DWORD g_player_checked = 0;
+
+static void set_fly(bool on);
+
+static void drop_player_slots() {
+    for (int i = (int)g_slots.size() - 1; i >= 0; --i)
+        if (strncmp(g_slots[i].label, "player ", 7) == 0) erase_slot(i);
+    g_player_pos = 0;
+}
+
+static void track_player() {
+    if (!pw::trainer_loaded()) return;
+    uintptr_t pos = pw::find_player_pos(g_player_why);
+    if (pos == g_player_pos) return;
+    bool flying = g_fly;
+    if (flying) set_fly(false);
+    drop_player_slots();
+    if (!pos) { olog("player position lost (%s)", g_player_why.c_str()); return; }
+    static const char *names[3] = {"player X", "player Y", "player Z"};
+    for (int k = 0; k < 3; ++k) { add_slot(names[k], pos + 4 * k, pw::ValType::F32); g_axis[k] = (int)g_slots.size() - 1; }
+    g_player_pos = pos;
+    olog("player position at %p (%s)", (void *)pos, g_player_why.c_str());
+    if (flying) set_fly(true);
+}
+
+static void set_fly(bool on) {
+    g_fly = on;
+    if (!pw::trainer_loaded()) return;
+    if (on && g_noclip_with_fly && g_axis[0] >= 0) {
+        if (!pw::noclip_installed()) {
+            if (pw::noclip_install(g_noclip_err)) { g_noclip_err.clear(); olog("noclip hooks installed"); }
+            else { olog("noclip: %s", g_noclip_err.c_str()); return; }
+        }
+        uintptr_t x = g_slots[g_axis[0]].addr;
+        pw::noclip_set_range(x, x + 16);    // the position is written as one 16-byte vector
+    } else {
+        pw::noclip_set_range(0, 0);
+    }
+}
+
 static double slot_as_double(const pw::Value &v) {
     switch (v.type) {
         case pw::ValType::F32: return v.f32;
@@ -311,9 +365,20 @@ static pw::Value double_as(pw::ValType t, double d) {
     return v;
 }
 
-// Run every frame: hold frozen slots, and (when fly is on) move the X/Y/Z slots with the numpad, overwriting
-// the game's physics for those addresses. Numpad 4/6 = X-, X+; 8/2 = Z+, Z-; 9/3 = Y up, down.
+// Run every frame: keep the player's position current, hold frozen slots, and (when fly is on) move the X/Y/Z
+// slots with W/A/S/D + Shift/Ctrl, overwriting the game's physics for those addresses. F6 toggles Fly.
 static void trainer_apply() {
+    DWORD now = GetTickCount();
+    bool due = g_player_pos ? (g_fly || now - g_player_checked > 1000)          // follow it (map change, respawn)
+                            : (g_axis[0] < 0 && now - g_player_checked > 2000);  // find it, unless slots are manual
+    if (due && pw::trainer_loaded()) { g_player_checked = now; track_player(); }
+    static bool f6_was = false;
+    bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (f6 && !f6_was) {
+        if (!g_player_pos && pw::trainer_loaded()) track_player();
+        if (g_axis[0] >= 0 && g_axis[1] >= 0 && g_axis[2] >= 0) set_fly(!g_fly);
+    }
+    f6_was = f6;
     for (auto &s : g_slots)
         if (s.freeze) pw::poke(s.addr, s.frozen);
 
@@ -323,14 +388,14 @@ static void trainer_apply() {
     if (!g_fly || !axes_ok) return;
     auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     double mv[3] = {0, 0, 0};
-    // WASD = horizontal (X = A/D, Z = W/S), Shift/Ctrl = up/down (Y). World-axis for now; which key maps to
-    // which world axis depends on how X/Y/Z are tagged - camera-relative needs the view matrix (later).
+    // Steep's world: Z is up. WASD = horizontal (X = A/D, Y = W/S), Shift/Ctrl = up/down (Z). World axes, not
+    // the camera's - camera-relative needs the view matrix (later).
     if (held('D')) mv[0] += 1;
     if (held('A')) mv[0] -= 1;
-    if (held(VK_SHIFT)) mv[1] += 1;
-    if (held(VK_CONTROL)) mv[1] -= 1;
-    if (held('W')) mv[2] += 1;
-    if (held('S')) mv[2] -= 1;
+    if (held('W')) mv[1] += 1;
+    if (held('S')) mv[1] -= 1;
+    if (held(VK_SHIFT)) mv[2] += 1;
+    if (held(VK_CONTROL)) mv[2] -= 1;
     for (int k = 0; k < 3; ++k) {
         Slot &s = g_slots[g_axis[k]];
         pw::Value cur;
@@ -762,8 +827,19 @@ static void draw_debug_tab() {
 static const char *TYPE_NAMES[] = {"int32", "int64", "float", "double"};
 
 static void draw_trainer_tab() {
-    ImGui::TextWrapped("Addresses you found (Debug tab's scanner -> \"-> Trainer\"). Freeze a value, or set three "
-                       "slots as X/Y/Z and enable Fly to move with the numpad.");
+    ImGui::SeparatorText("Player");
+    if (!pw::trainer_loaded()) {
+        ImGui::TextDisabled("no powder_trainer.json beside the overlay (powder-wrap deploys it)");
+    } else {
+        if (ImGui::Button("Find player")) track_player();
+        ImGui::SameLine();
+        if (g_player_pos) ImGui::Text("position at %p (%s)", (void *)g_player_pos, g_player_why.c_str());
+        else ImGui::TextDisabled("%s", g_player_why.c_str());
+    }
+
+    ImGui::SeparatorText("Slots");
+    ImGui::TextWrapped("Addresses you found (Debug tab's scanner -> \"-> Trainer\") or the player's. Freeze a value, "
+                       "or set three slots as X/Y/Z and enable Fly.");
 
     // manual add
     static char maddr[32] = "";
@@ -815,17 +891,24 @@ static void draw_trainer_tab() {
         }
         ImGui::EndTable();
         if (remove >= 0) {
-            for (int k = 0; k < 3; ++k) { if (g_axis[k] == remove) g_axis[k] = -1; else if (g_axis[k] > remove) --g_axis[k]; }
-            g_slots.erase(g_slots.begin() + remove);
+            if (g_fly) set_fly(false);
+            erase_slot(remove);
         }
     }
 
-    ImGui::SeparatorText("Fly / noclip-lite");
+    ImGui::SeparatorText("Fly / noclip");
     bool axes_ok = g_axis[0] >= 0 && g_axis[1] >= 0 && g_axis[2] >= 0;
     ImGui::BeginDisabled(!axes_ok);
-    ImGui::Checkbox("Fly (hold position; move with W/A/S/D, Shift = up, Ctrl = down)", &g_fly);
+    bool fly = g_fly;
+    if (ImGui::Checkbox("Fly (F6; W/A/S/D, Shift = up, Ctrl = down)", &fly)) set_fly(fly);
     ImGui::EndDisabled();
-    if (!axes_ok) ImGui::TextDisabled("assign X, Y and Z first (the buttons in each row)");
+    if (!axes_ok) ImGui::TextDisabled("find the player, or assign X, Y and Z (the buttons in each row)");
+    ImGui::BeginDisabled(!pw::trainer_loaded());
+    if (ImGui::Checkbox("Noclip while flying (the game can't move or block you)", &g_noclip_with_fly) && g_fly)
+        set_fly(true);
+    ImGui::EndDisabled();
+    if (!g_noclip_err.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "noclip: %s", g_noclip_err.c_str());
+    else if (pw::noclip_active()) ImGui::TextDisabled("noclip on: physics and collision are off for you");
     ImGui::SetNextItemWidth(120); ImGui::InputFloat("speed (units/frame)", &g_fly_speed);
 
     ImGui::SeparatorText("Teleport");
@@ -844,6 +927,8 @@ static void draw_trainer_tab() {
 
     // ---- access-finder: what code writes a slot (the bridge to real hooks / a stable pointer) ----
     ImGui::SeparatorText("Find what writes an address (RE)");
+    ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Crashes the game on hot data like the position: use "
+                       "tools/trainer/watch.py (outside the game) for that.");
     static char afaddr[32] = "";
     ImGui::SetNextItemWidth(160);
     ImGui::InputText("addr (hex)##af", afaddr, sizeof(afaddr));
@@ -921,6 +1006,11 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
     _snwprintf(g_logpath, MAX_PATH, L"%spowder_overlay.log", g_dir);
     _snwprintf(g_cfgpath, MAX_PATH, L"%spowder_overlay.cfg", g_dir);
     read_cfg();
+    wchar_t trainer[MAX_PATH];
+    _snwprintf(trainer, MAX_PATH, L"%spowder_trainer.json", g_dir);
+    std::string terr;
+    if (pw::trainer_load(trainer, terr)) olog("trainer data loaded (powder_trainer.json)");
+    else olog("trainer: %s", terr.c_str());
     olog("overlay DLL loaded pid=%lu, server=%s%s", GetCurrentProcessId(), g_base_url.c_str(),
          g_cfg_show ? " [force-show]" : "");
     g_net = new Net(g_base_url);

@@ -187,9 +187,10 @@ don't run commands against the user's real prefix or data: test on scratch copie
   threads per frame), the fault flood and single-step re-arm break. Make it safe (refuse hot pages, auto-disarm
   after a short burst) before using it again.
 - Hardware/debug-register breakpoints: VMProtect detects/clears them.
-- So "capture the position's writer instruction -> stable anchor" is blocked for now; left: an external
-  multi-level pointer scan over /proc/<pid>/mem (0 direct static pointers to the struct found so far), or the
-  ~2-minute per-launch re-find with tools/trainer (findauth2 needs the player MOVING).
+- Both are replaced by Linux perf hardware watchpoints from outside the game (tools/trainer/watch.py, 2026-10-26):
+  invisible to the game and to VMProtect. Wine holds the main thread's four debug slots (skipped).
+- Bisect writes into stale snapshot addresses corrupt the game (the player got stuck floating, 2026-10-26):
+  findauth2 now writes only live copies and undoes each nudge.
 - Save migration from a live account: Steep checksums the save against the account id (32-hex id at offset 8);
   a patched copy failed. A Powder save is separate from the live one.
 - MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
@@ -227,9 +228,19 @@ don't run commands against the user's real prefix or data: test on scratch copie
    hde64) to recover the struct base register + value + field offset, show them (module+offset), and NOP a
    writer to freeze/override that field. VMProtect guards its own code pages, not this data page, so the guard
    works in-process. This is the bridge to a stable pointer path (so the position needn't be re-hunted each
-   launch) and to the hook manager / client-mod hook API (next). Deferred: derive the stable pointer path from
-   the captured base; MinHook-based function hooking with arg logging + a hook API for client mods; real noclip
-   (collision off) and camera-relative fly (needs the view matrix); live POWDER_* delivery to non-admin players'
+   launch) and to the hook manager / client-mod hook API (next).
+   NOCLIP WORKING 2026-10-26 (via tools/trainer/skiphook.py; the overlay port is untested in-game): the player's
+   position is a float3 at transform struct +0x50, written as a 16-byte vector by steep.exe+0x124d0ae /
+   +0x124d16b / +0x124d218 (movaps [reg+0x50]) and +0x37fd6b ([rdx+0x30], rdx = struct+0x20) - generic
+   transform writers (hundreds of objects), so the hook skips only writes into the player's range. Writing the
+   position while the hooks skip the game's writes = noclip; off = physics resumes from there (Z is up).
+   native/overlay/noclip.cpp does it in-process (caves near steep.exe in our memory, WriteProcessMemory on
+   ourselves patches the 5-byte jmp - works under Wine on read-only code), driven by
+   native/overlay/steep_trainer.json (deployed as powder_trainer.json): the writers + their bytes, and 26
+   pointer chains to the struct from one session (tools/trainer/ptrscan.py) - not yet confirmed across launches;
+   the overlay needs two chains to agree. Trainer tab: Find player (auto), Fly = F6, noclip while flying,
+   re-resolves the position every frame while flying (map change). Deferred: MinHook-based function hooking
+   with arg logging + a hook API for client mods; camera-relative fly (needs the view matrix); live POWDER_* delivery to non-admin players'
    overlays (needs a websocket client + player-ticket auth); the Windows launcher path (ship the DLL as
    `mods/admin/client/` + `mod.toml [client] inject` so `inject_mods` loads it with per-player approval);
    `native/build.ps1` overlay target for Windows builds.

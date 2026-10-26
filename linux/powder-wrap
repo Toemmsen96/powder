@@ -269,6 +269,8 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
                 ov="$REPO/native/bin/powder_overlay.dll"
                 if [ -f "$ov" ]; then
                     cp -f "$ov" "$sdir/powder_overlay.dll"
+                    # the Trainer tab's data for this game build (player position chains, noclip writers)
+                    cp -f "$REPO/native/overlay/steep_trainer.json" "$sdir/powder_trainer.json" 2>/dev/null || true
                     rm -f "$sdir/powder_overlay.log"
                     p=$(https_port)
                     url="https://public-ubiservices.ubi.com"
@@ -288,7 +290,7 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
         if [ -n "$helper" ]; then
             rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/armer.exe" "$helper/powder_tls.pin"
             # the overlay (if it was deployed); powder_overlay.log is kept, like powder_tls.log
-            rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg"
+            rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg" "$helper/powder_trainer.json"
             winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
         fi
         if winereg delete "$key" /f; then
