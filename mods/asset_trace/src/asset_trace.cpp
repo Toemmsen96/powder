@@ -4,7 +4,8 @@
 // per-file totals in the overlay's Mods tab, and with "log reads" appends each read of a .forge/.pck/.tbf/.bk2 to
 // powder_asset_trace.log beside the overlay: "<ms> <file> <offset> <length>". Probes go to the overlay log once
 // each: failed opens and existence checks (NtQuery[Full]AttributesFile) of such files, and directory searches
-// for them - which files the engine would load if they existed (e.g. a _patch_03.forge).
+// for them - which files the engine would load if they existed (e.g. a _patch_03.forge) - and every open of a
+// save file (savegames\...), with its access.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
@@ -133,9 +134,23 @@ static NTSTATUS NTAPI hk_dir(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, PIO_STAT
     return st;
 }
 
+// Every open of a save file (savegames\<profile>\<product>\N.save), with its access: when the game reads and
+// writes its saves relative to the intro (the replayed-intro question).
+static void save_open(const char *how, POBJECT_ATTRIBUTES oa, ACCESS_MASK a, NTSTATUS st) {
+    if (t_inside || !oa || !oa->ObjectName) return;
+    std::string path = utf8(oa->ObjectName), l = path;
+    std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+    if (l.find("savegames") == std::string::npos) return;
+    t_inside = true;
+    g_api->log(g_mod, "save %s %s access=0x%lx%s -> 0x%08lx", how, path.c_str(), (unsigned long)a,
+               (a & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) ? " (write)" : "", (unsigned long)st);
+    t_inside = false;
+}
+
 static NTSTATUS NTAPI hk_create(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io, PLARGE_INTEGER sz,
                                 ULONG attr, ULONG share, ULONG disp, ULONG opt, PVOID ea, ULONG eal) {
     NTSTATUS st = o_create(h, a, oa, io, sz, attr, share, disp, opt, ea, eal);
+    save_open("create", oa, a, st);
     if (st >= 0 && h && !t_inside) opened(*h, oa);
     else if (st < 0 && !t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName)))
         probe("open failed", utf8(oa->ObjectName), st);
@@ -145,6 +160,7 @@ static NTSTATUS NTAPI hk_create(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES oa,
 static NTSTATUS NTAPI hk_open(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io, ULONG share,
                               ULONG opt) {
     NTSTATUS st = o_open(h, a, oa, io, share, opt);
+    save_open("open", oa, a, st);
     if (st >= 0 && h && !t_inside) opened(*h, oa);
     else if (st < 0 && !t_inside && oa && oa->ObjectName && tracked(utf8(oa->ObjectName)))
         probe("open failed", utf8(oa->ObjectName), st);
