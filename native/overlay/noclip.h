@@ -20,6 +20,7 @@ bool trainer_loaded();
 // The player's position (address of a float3) through the chains; 0 if none resolves. `why` says which.
 uintptr_t find_player_pos(std::string &why);
 
+void noclip_set_helper(const wchar_t *armer_exe);   // armer.exe: patches the game's code from outside
 bool noclip_install(std::string &err);     // hook every writer (once); idle until a range is set
 bool noclip_installed();
 void noclip_set_range(uintptr_t lo, uintptr_t hi);   // skip the game's writes into [lo, hi); (0, 0) = off

@@ -1009,6 +1009,9 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
     wchar_t trainer[MAX_PATH];
     _snwprintf(trainer, MAX_PATH, L"%spowder_trainer.json", g_dir);
     std::string terr;
+    wchar_t armer[MAX_PATH];
+    _snwprintf(armer, MAX_PATH, L"%sarmer.exe", g_dir);
+    pw::noclip_set_helper(armer);
     if (pw::trainer_load(trainer, terr)) olog("trainer data loaded (powder_trainer.json)");
     else olog("trainer: %s", terr.c_str());
     olog("overlay DLL loaded pid=%lu, server=%s%s", GetCurrentProcessId(), g_base_url.c_str(),

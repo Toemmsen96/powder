@@ -82,21 +82,49 @@ uint8_t *alloc_near(uintptr_t target, size_t size) {
     return nullptr;
 }
 
-// Write code bytes: WriteProcessMemory on ourselves (Wine's server writes through /proc/<pid>/mem, which ignores
-// page protection; VMProtect blocks only VirtualProtect on its code), else VirtualProtect + memcpy.
-bool write_code(uintptr_t at, const uint8_t *src, size_t n) {
-    SIZE_T done = 0;
-    bool ok = WriteProcessMemory(GetCurrentProcess(), (void *)at, src, n, &done) && done == n;
-    if (!ok) {
-        DWORD old;
-        if (VirtualProtect((void *)at, n, PAGE_EXECUTE_READWRITE, &old)) {
-            memcpy((void *)at, src, n);
-            DWORD tmp; VirtualProtect((void *)at, n, old, &tmp);
-            ok = true;
-        }
-    }
+std::wstring g_armer;    // armer.exe beside the overlay (the TLS helper), for patching from outside
+
+bool written(uintptr_t at, const uint8_t *src, size_t n) {
     FlushInstructionCache(GetCurrentProcess(), (void *)at, n);
-    return ok && memcmp((void *)at, src, n) == 0;
+    return memcmp((void *)at, src, n) == 0;
+}
+
+// Write code bytes. VMProtect blocks the game process's own writes to its code (VirtualProtect and
+// WriteProcessMemory on itself fail in Steep; fine elsewhere), so after those armer.exe --write does it from
+// outside (VirtualProtectEx + WriteProcessMemory, like its TLS patch). Wine can't write /proc/self/mem.
+bool write_code(uintptr_t at, const uint8_t *src, size_t n, std::string &how) {
+    SIZE_T done = 0;
+    if (WriteProcessMemory(GetCurrentProcess(), (void *)at, src, n, &done) && done == n && written(at, src, n)) return true;
+    how = "WriteProcessMemory " + std::to_string(GetLastError());
+    DWORD old;
+    if (VirtualProtect((void *)at, n, PAGE_EXECUTE_READWRITE, &old)) {
+        memcpy((void *)at, src, n);
+        DWORD tmp; VirtualProtect((void *)at, n, old, &tmp);
+        if (written(at, src, n)) return true;
+    }
+    how += ", VirtualProtect " + std::to_string(GetLastError());
+    if (!g_armer.empty()) {
+        wchar_t cmd[512];
+        std::wstring hex;
+        for (size_t i = 0; i < n; i++) { wchar_t b[3]; swprintf(b, 3, L"%02x", src[i]); hex += b; }
+        swprintf(cmd, 512, L"\"%ls\" --pid %lu --write %llx %ls", g_armer.c_str(), GetCurrentProcessId(),
+                 (unsigned long long)at, hex.c_str());
+        STARTUPINFOW si{}; si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 10000);
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            if (code == 0 && written(at, src, n)) return true;
+            how += ", armer.exe exit " + std::to_string(code);
+        } else {
+            how += ", armer.exe not started " + std::to_string(GetLastError());
+        }
+    } else {
+        how += ", no armer.exe";
+    }
+    return false;
 }
 
 void put32(std::vector<uint8_t> &c, size_t at, int32_t v) { memcpy(&c[at], &v, 4); }
@@ -188,6 +216,8 @@ bool trainer_load(const wchar_t *path, std::string &err) {
 
 bool trainer_loaded() { return g_loaded; }
 
+void noclip_set_helper(const wchar_t *armer_exe) { g_armer = armer_exe; }
+
 uintptr_t find_player_pos(std::string &why) {
     uintptr_t base = module_base();
     if (!g_loaded || !base) { why = "no trainer data"; return 0; }
@@ -228,35 +258,37 @@ bool noclip_install(std::string &err) {
     if (!g_loaded || g_writers.empty()) { err = "no writers in powder_trainer.json"; return false; }
     uintptr_t base = module_base();
     if (!base) { err = "module not loaded"; return false; }
-    for (auto &w : g_writers) {
-        uintptr_t site = base + w.rva;
+    if (!g_block) {
+        g_block = alloc_near(base, 0x1000);
+        if (!g_block) { err = "no free memory near the module for the caves"; return false; }
+        g_lo = (volatile uint64_t *)g_block;
+        g_hi = (volatile uint64_t *)(g_block + 8);
+        *g_lo = 0; *g_hi = 0;
+    }
+    // one 128-byte cave slot per writer; a retry after a partial install skips the sites already ours
+    for (size_t i = 0; i < g_writers.size(); i++) {
+        const Writer &w = g_writers[i];
+        uintptr_t site = base + w.rva, cave = (uintptr_t)g_block + 64 + 128 * i;
+        int32_t r = (int32_t)((int64_t)cave - (int64_t)(site + 5));
+        if (((const uint8_t *)site)[0] == 0xE9 && memcmp((const uint8_t *)site + 1, &r, 4) == 0) continue;
         if (memcmp((void *)site, w.bytes.data(), w.bytes.size()) != 0) {
             err = ((const uint8_t *)site)[0] == 0xE9 ? "a writer is hooked already (tools/trainer/skiphook.py? remove it)"
                                                       : "a writer's bytes differ (another game build?)";
             return false;
         }
-    }
-    g_block = alloc_near(base, 0x1000);
-    if (!g_block) { err = "no free memory near the module for the caves"; return false; }
-    g_lo = (volatile uint64_t *)g_block;
-    g_hi = (volatile uint64_t *)(g_block + 8);
-    *g_lo = 0; *g_hi = 0;
-    size_t used = 64;
-    for (auto &w : g_writers) {
-        uintptr_t site = base + w.rva, cave = (uintptr_t)g_block + used;
+        if (64 + 128 * (i + 1) > 0x1000) { err = "cave block full"; return false; }
         std::vector<uint8_t> code;
         size_t covered;
         if (!build_cave(site, cave, code, covered, err)) return false;
-        if (used + code.size() > 0x1000) { err = "cave block full"; return false; }
-        memcpy((void *)cave, code.data(), code.size());
+        if (code.size() > 128) { err = "cave too large"; return false; }
         int64_t rel = (int64_t)cave - (int64_t)(site + 5);
         if (rel < INT32_MIN || rel > INT32_MAX) { err = "cave out of jmp range"; return false; }
+        memcpy((void *)cave, code.data(), code.size());
         std::vector<uint8_t> jmp(covered, 0x90);
         jmp[0] = 0xE9;
-        int32_t r = (int32_t)rel;
         memcpy(&jmp[1], &r, 4);
-        if (!write_code(site, jmp.data(), jmp.size())) { err = "could not patch the game's code"; return false; }
-        used = (used + code.size() + 15) & ~(size_t)15;
+        std::string how;
+        if (!write_code(site, jmp.data(), jmp.size(), how)) { err = "could not patch the game's code (" + how + ")"; return false; }
     }
     g_installed = true;
     return true;

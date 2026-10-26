@@ -2,6 +2,7 @@
 //
 //   armer.exe --pid <game pid> --log <log> [--page <hex>]                       (guard mode, Windows)
 //   armer.exe --pid <game pid> --log <log> --target <hex> --patchfn <hex> [--delayms N]  (patch mode, Linux)
+//   armer.exe --pid <game pid> --write <hex addr> <hex bytes>                     (write mode, the overlay's noclip)
 //
 // VMProtect blocks the game's OWN VirtualProtect/WriteProcessMemory on its code, so arming or patching must
 // come from another process; this one does it with VirtualProtectEx / WriteProcessMemory, which VMProtect
@@ -88,7 +89,39 @@ static int patch(HANDLE proc, uintptr_t target, uintptr_t patchfn, const char *l
     return good;
 }
 
+// Write mode: put `hex` bytes at `addr` in the game's code now (the overlay's noclip hooks; VMProtect blocks the
+// game's own writes to its code, not ours). -> exit 0 when the bytes read back.
+static int write_bytes(DWORD pid, uintptr_t addr, const char *hex) {
+    unsigned char buf[64];
+    size_t n = 0;
+    for (; hex[2 * n] && hex[2 * n + 1] && n < sizeof(buf); n++) {
+        char two[3] = {hex[2 * n], hex[2 * n + 1], 0};
+        buf[n] = (unsigned char)strtoul(two, NULL, 16);
+    }
+    HANDLE proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+                              FALSE, pid);
+    if (!proc || !n) { printf("armer: OpenProcess(%lu) failed %lu\n", pid, GetLastError()); return 1; }
+    DWORD old, old2;
+    if (!VirtualProtectEx(proc, (void *)addr, n, PAGE_EXECUTE_READWRITE, &old)) {
+        printf("armer: VirtualProtectEx failed %lu\n", GetLastError()); return 1;
+    }
+    SIZE_T wr = 0, rd = 0;
+    WriteProcessMemory(proc, (void *)addr, buf, n, &wr);
+    VirtualProtectEx(proc, (void *)addr, n, old, &old2);
+    FlushInstructionCache(proc, (void *)addr, n);
+    unsigned char back[64];
+    ReadProcessMemory(proc, (void *)addr, back, n, &rd);
+    CloseHandle(proc);
+    return wr == n && rd == n && memcmp(back, buf, n) == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+    for (int i = 1; i + 2 < argc; i++)
+        if (!strcmp(argv[i], "--write")) {
+            DWORD wpid = 0;
+            for (int k = 1; k + 1 < argc; k++) if (!strcmp(argv[k], "--pid")) wpid = (DWORD)strtoul(argv[k + 1], NULL, 10);
+            return wpid ? write_bytes(wpid, (uintptr_t)strtoull(argv[i + 1], NULL, 16), argv[i + 2]) : 1;
+        }
     DWORD pid = 0, delayms = 8000;
     const char *log = NULL;
     uintptr_t page = 0, target = 0, patchfn = 0;
