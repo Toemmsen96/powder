@@ -109,7 +109,8 @@ have no armature.
 - **Many meshes:** export and import over every mesh of `DataPC_extra_chr_onboarding`, `DataPC_STP_WhiteRoom` and
   `DataPC` gives 421 meshes back with the same positions, UVs and triangles. The rest are unsupported formats (1,
   3, 9), 7 meshes whose submesh table does not cover their draw ranges (vehicles, parachute) and one
-  73,000-vertex helicopter submesh.
+  73,000-vertex helicopter submesh. Over `DataPC_extra_chr` and its `_patch_02` (the gear) 3795 meshes come back
+  the same; the only ones left out are 35 heads (format 1) and 3 scarves (format 3).
 - **Renders:** the jacket rendered in Blender with the embedded texture shows the panels where they belong.
 
 **Not yet seen in the game:** a rebuilt topology with explicit weights (`mods/shoulder_pads` is that test), and
