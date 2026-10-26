@@ -201,6 +201,12 @@ don't run commands against the user's real prefix or data: test on scratch copie
 - MITM capture of real Ubisoft replies (tools/capture/): Connect's CEF ignores the prefix store and proxies; the
   game's OpenSSL is pinned. Real entitlement/offer formats can't be recorded that way.
 - Imported stats (level) without a matching save make the game replay the intro ("progress, but at the start").
+  Confirmed three ways on 2026-10-26: a migrated live save (stats too small), 19.5 h playtime from that save, and
+  setting all viewpoint bits (unlockable_exploration:2:*) by hand each brought the intro back. The game checks the
+  save against the online stats; never change a player's unlock/level stats by hand (or restore an older save)
+  without the other side matching. Recovery that worked: stats back to the event-derived values (stat_events
+  folded with services/stats.rs's rules), the last good save restored locally AND in data/cloudsaves AND the
+  cloudSave entity's slot sizes/hashes updated (else Connect warns "problem getting your latest save").
 
 ## Next steps
 
