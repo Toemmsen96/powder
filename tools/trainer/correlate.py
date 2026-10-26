@@ -43,6 +43,9 @@ else:
     a0 = common
     delta = v1 - v0
     good = np.all(np.isfinite(delta), axis=1) & (np.linalg.norm(delta, axis=1) > 1.0)
+    # not x == y == z (uniform fill values, timers, scales), neither in the value nor in the movement
+    good &= ~((np.abs(v1[:, 0] - v1[:, 1]) < 1) & (np.abs(v1[:, 1] - v1[:, 2]) < 1))
+    good &= ~((np.abs(delta[:, 0] - delta[:, 1]) < 0.5) & (np.abs(delta[:, 1] - delta[:, 2]) < 0.5))
     # dominant exact delta vector = the player's displacement (shared by all true position copies)
     keys = [tuple(np.round(delta[i], 0)) for i in np.nonzero(good)[0]]
     if not keys:

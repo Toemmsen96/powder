@@ -28,9 +28,11 @@ writing a copy does nothing — it gets overwritten next frame).
    ```
 
 3. **Bisect to the one authoritative address** with gentle single writes + held-out observers as the oracle
-   (no sustained freezing — that corrupts/wedges the game):
+   (no sustained freezing — that corrupts/wedges the game). **Ride downhill the whole time** (a resting body is
+   asleep: the copies don't re-sync) and run it right after step 2, on the same gear (a gear change or respawn
+   rebuilds the player's objects and the copies go stale):
    ```
-   python3 findauth2.py <pid> clean.npz 60 0.3   # -> prints AUTHORITATIVE: 0x....
+   python3 findauth2.py <pid> clean.npz          # -> prints AUTHORITATIVE: 0x.... (verified n/3)
    ```
    Verify by writing only that address (+N on X) and watching the player jump.
 
@@ -63,6 +65,9 @@ the kernel traps the write, the game sees nothing.
    Needs binutils (`objdump`, `as`, `ld`, `objcopy`, `nm`) and `kernel.perf_event_paranoid <= 2`.
 
 ## Safety
+- **Never write snapshot addresses blindly.** The game reuses memory quickly; writing +dx into addresses that
+  held the position a minute ago corrupts unrelated state (2026-10-26: the player ended stuck floating, needed a
+  restart). findauth2 only writes addresses that hold the player's X at that moment, and undoes each nudge.
 - **Never sustain-freeze a large/dirty candidate set** — writing garbage to thousands of addresses every frame
   wedges the game. Use single writes (bisect) and only ever write to confirmed position copies.
 - Test on your own game only.

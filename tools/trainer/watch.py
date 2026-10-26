@@ -21,7 +21,7 @@ REG_BITS = list(range(10)) + list(range(16, 24))          # perf_regs x86_64: AX
 REG_MASK = sum(1 << b for b in REG_BITS)
 NR_perf_event_open = 298
 PAGE = mmap.PAGESIZE
-DATA_PAGES = 16
+DATA_PAGES = 4          # per thread; perf's locked-memory budget is ~8.5 MB for ~100 threads
 
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -65,17 +65,32 @@ class Ring:
 
 
 def modules(pid: int) -> list[tuple[int, int, str]]:
-    """(start, end, path) of file mappings, merged per path; a module's base is its lowest mapping."""
-    spans: dict[str, list[int]] = {}
+    """(start, end, path) of loaded modules. A PE image spans SizeOfImage from its header page (a packed game's
+    code is unpacked into anonymous memory, so its file mappings don't show its extent); other files (Wine's
+    .so) are listed per mapping, with start = mapping start - file offset."""
+    out, images = [], {}
+    try:
+        mem = open(f"/proc/{pid}/mem", "rb", 0)
+    except OSError:
+        mem = None
     for line in open(f"/proc/{pid}/maps"):
         parts = line.split(maxsplit=5)
         if len(parts) < 6 or not parts[5].strip().startswith("/"):
             continue
         lo, hi = (int(x, 16) for x in parts[0].split("-"))
-        path = parts[5].strip()
-        s = spans.setdefault(path, [lo, hi])
-        s[0], s[1] = min(s[0], lo), max(s[1], hi)
-    return [(lo, hi, p) for p, (lo, hi) in spans.items()]
+        off, path = int(parts[2], 16), parts[5].strip()
+        if off == 0 and mem is not None:
+            try:
+                mem.seek(lo); hdr = mem.read(0x400)
+            except OSError:
+                hdr = b""
+            if hdr[:2] == b"MZ":
+                pe = struct.unpack_from("<I", hdr, 0x3C)[0]
+                if pe + 0x58 <= len(hdr) and hdr[pe:pe + 4] == b"PE\0\0":
+                    images.setdefault(path, (lo, lo + struct.unpack_from("<I", hdr, pe + 0x50)[0], path))
+                    continue
+        out.append((lo - off, hi, path))
+    return list(images.values()) + [m for m in out if m[2] not in images]
 
 
 def where(mods, addr: int) -> str:
@@ -139,26 +154,39 @@ def decode_before(mem, next_ip: int, regs: dict, watched: int, length: int):
     return best
 
 
-def sample(pid: int, addr: int, length: int, bp_type: int, secs: float):
-    """Yield (ip, tid, regs) of each hit of a breakpoint on every thread of pid, for secs seconds."""
+def sample(pid: int, addrs: list[int], length: int, bp_type: int, secs: float):
+    """Yield (ip, tid, regs) of each hit of breakpoints on addrs (at most 4) on every thread of pid, for secs
+    seconds. One ring buffer per thread (the thread's other events are redirected into it). A thread whose
+    debug-register slots are taken (Wine keeps the main thread's, VMProtect clears them) is skipped."""
     rings: dict[int, Ring] = {}
+    extra: list[int] = []
+    skipped: set[int] = set()
 
     def attach_new():
         for t in os.listdir(f"/proc/{pid}/task"):
             tid = int(t)
-            if tid in rings:
+            if tid in rings or tid in skipped:
                 continue
-            try:
-                fd = perf_open(tid, addr, length, bp_type)
-            except OSError as e:
-                if e.errno == 3:            # thread gone
-                    continue
-                raise
-            rings[tid] = Ring(fd)
-            fcntl_ioctl(fd, 0x2400)          # PERF_EVENT_IOC_ENABLE
+            fds = []
+            for a in addrs:
+                try:
+                    fds.append(perf_open(tid, a, length, bp_type))
+                except OSError as e:
+                    if e.errno not in (3, 28):  # thread gone / no free breakpoint slot
+                        raise
+            if not fds:
+                skipped.add(tid)
+                continue
+            rings[tid] = Ring(fds[0])
+            for fd in fds[1:]:
+                fcntl_ioctl(fd, 0x2405, fds[0])   # PERF_EVENT_IOC_SET_OUTPUT
+                extra.append(fd)
+            for fd in fds:
+                fcntl_ioctl(fd, 0x2400)          # PERF_EVENT_IOC_ENABLE
 
     attach_new()
-    print(f"watching {addr:#x} on {len(rings)} threads for {secs:.0f}s ...", flush=True)
+    print(f"watching {', '.join(f'{a:#x}' for a in addrs)} on {len(rings)} threads"
+          f"{f' ({len(skipped)} without a free slot)' if skipped else ''} for {secs:.0f}s ...", flush=True)
     end, nregs, last_scan = time.time() + secs, len(REG_BITS), time.time()
     try:
         while time.time() < end:
@@ -173,6 +201,8 @@ def sample(pid: int, addr: int, length: int, bp_type: int, secs: float):
             if time.time() - last_scan > 1:
                 attach_new(); last_scan = time.time()
     finally:
+        for fd in extra:
+            os.close(fd)
         for ring in rings.values():
             ring.m.close(); os.close(ring.fd)
 
@@ -189,7 +219,7 @@ def watch_writes(pid: int, addr: int, secs: float, length: int, bp_type: int):
     if addr % length:
         sys.exit(f"address must be aligned to len {length}")
     hits = defaultdict(lambda: {"n": 0, "tids": set(), "regs": None})
-    for ip, tid, regs in sample(pid, addr, length, bp_type, secs):
+    for ip, tid, regs in sample(pid, [addr], length, bp_type, secs):
         h = hits[ip]
         h["n"] += 1; h["tids"].add(tid); h["regs"] = regs
     if not hits:
@@ -234,7 +264,7 @@ def watch_exec(pid: int, spec: str, secs: float):
     op = re.sub(r"^\w+:", "", ops[0])
     print(f"{spec}: {text}")
     eas = defaultdict(int)
-    for _ip, _tid, regs in sample(pid, ip, 8, HW_BP_X, secs):
+    for _ip, _tid, regs in sample(pid, [ip], 8, HW_BP_X, secs):
         ea = eff_addr(op, {**regs, "rip": ip + nbytes})
         if ea is not None:
             eas[ea] += 1
@@ -263,8 +293,8 @@ def main():
                      HW_BP_RW if len(sys.argv) > 5 and sys.argv[5] == "rw" else HW_BP_W)
 
 
-def fcntl_ioctl(fd: int, req: int):
-    if libc.ioctl(fd, req, 0) < 0:
+def fcntl_ioctl(fd: int, req: int, arg: int = 0):
+    if libc.ioctl(fd, req, arg) < 0:
         raise OSError(ctypes.get_errno(), "ioctl")
 
 
