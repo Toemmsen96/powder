@@ -108,6 +108,13 @@ flag clear (prefetch):    repeated to the entry's end: u8 1, u32 stored, u32 unc
 - The checksum is **Adler-32 of the stored bytes, started at 0** instead of 1, i.e. `zlib.adler32(data, 0)`
   (C, every chunk).
 - Chunks hold at most 0x40000 bytes of uncompressed data (C).
+- A datafile can be made **exactly** a given size (`pad_datafile`, `fit_datafile`; mods/world_editor's live edits
+  serve edited cells over an entry's own bytes): recompressed (level 19-22 gives ~5 % less than the shipped
+  chunks), then padded with empty zstd blocks (a raw block of size 0 = 3 bytes, an RLE block of size 0 = 4 bytes)
+  inserted before a frame's first block. They decompress to nothing (libzstd frame by frame: C); every shortfall
+  but 1, 2 and 5 bytes is a sum of 3s and 4s, and those three take the next compression level. No byte follows
+  the second block, and every padded chunk stays shorter than its data. G: the game's zstd (a v1 frame decoder,
+  frames are 28 B5 2F FD with content size) reads empty blocks like libzstd does.
 
 Header block, decompressed: u16 n, then n records `u64 resource id, u32 size, u16 k, k x u16`. The k u16s are
 G: unknown; k is 0 in ~97% of sampled records, otherwise mostly 1. The sizes add up to the body length (C). The first

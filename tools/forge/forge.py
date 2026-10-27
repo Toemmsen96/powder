@@ -309,6 +309,98 @@ def build_datafile(resources: list[Resource], level: int = 9) -> bytes:
     return build_block(bytes(header), level=level) + build_block(b"".join(bodies), level=level)
 
 
+# --- same-size datafiles (mods/world_editor's live edits) ------------------------------------------------------
+
+ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def zstd_frame_header_size(frame: bytes) -> int:
+    """Bytes before a zstd frame's first block: magic, descriptor, window descriptor, dictionary id, content size."""
+    if frame[:4] != ZSTD_FRAME_MAGIC or len(frame) < 6:
+        raise ValueError("not a zstd frame")
+    fhd = frame[4]
+    single = fhd >> 5 & 1
+    fcs = (0 if not single else 1, 2, 4, 8)[fhd >> 6]
+    return 5 + (0 if single else 1) + (0, 1, 2, 4)[fhd & 3] + fcs
+
+
+def zstd_padding(d: int) -> bytes | None:
+    """`d` bytes of empty zstd blocks (raw, size 0: 3 bytes; RLE, size 0: 4 bytes), none of them the last: inserted
+    before a frame's first block they decompress to nothing. None for 1, 2 and 5 (no sum of 3s and 4s)."""
+    for rle in range(4):
+        if d - 4 * rle >= 0 and (d - 4 * rle) % 3 == 0:
+            return b"\x02\x00\x00\x00" * rle + b"\x00\x00\x00" * ((d - 4 * rle) // 3)
+    return None
+
+
+def pad_datafile(data: bytes, size: int) -> bytes | None:
+    """`data` (a datafile) made exactly `size` bytes long without changing what it decompresses to: empty zstd blocks
+    go into one of its compressed chunks (chunk size and checksum updated). The datafile stays a well-formed datafile
+    of two blocks (no trailing bytes), so a reader that expects exactly the entry's size reads it as it is. None if
+    it cannot be done (bigger than `size`, 1, 2 or 5 bytes short, no zstd chunk); try another compression level."""
+    d = size - len(data)
+    if d == 0:
+        return data
+    if d < 0 or zstd_padding(d) is None:
+        return None
+    blocks, pos = [], 0
+    for _ in range(2):
+        b, end = parse_block(data, pos)
+        if not b.table_layout or b.codec != CODEC_ZSTD:
+            return None
+        blocks.append(b)
+        pos = end
+    # spread over the compressed chunks, biggest room first; a padded chunk stays shorter than its data (equal
+    # would read as "stored"; longer than its data no shipped chunk is)
+    rooms = sorted(((c.usize - c.csize - 1, k, j) for k, b in enumerate(blocks) for j, c in enumerate(b.chunks)
+                    if c.csize < c.usize and c.data[:4] == ZSTD_FRAME_MAGIC), reverse=True)
+    share: dict[tuple[int, int], int] = {}
+    for room, k, j in rooms:
+        if d == 0:
+            break
+        t = min(d, room)
+        while t > 0 and (zstd_padding(t) is None or 0 < d - t < 6):
+            t -= 1
+        if t > 0:
+            share[(k, j)] = t
+            d -= t
+    if d:
+        return None
+    out = bytearray()
+    for k, b in enumerate(blocks):
+        chunks = list(b.chunks)
+        for j, c in enumerate(chunks):
+            if (k, j) in share:
+                h = zstd_frame_header_size(c.data)
+                new = c.data[:h] + zstd_padding(share[(k, j)]) + c.data[h:]
+                chunks[j] = Chunk(c.usize, len(new), adler32_0(new), new)
+        out += BLOCK_HDR.pack(DATAFILE_MAGIC, b.version, b.codec, b.max_chunk | TABLE_LAYOUT)
+        out += struct.pack("<I", len(chunks))
+        for c in chunks:
+            out += struct.pack("<II", c.usize, c.csize)
+        for c in chunks:
+            out += struct.pack("<I", c.checksum) + c.data
+    out = bytes(out)
+    if len(out) != size:
+        raise ValueError(f"internal error: padded to {len(out)}, not {size}")
+    return out
+
+
+def fit_datafile(resources: list[Resource], size: int, levels=(9, 19, 22)) -> tuple[bytes, bool]:
+    """The resources as a datafile of exactly `size` bytes if any compression level gets them there (True), else
+    the smallest datafile tried (False: it needs more room than `size`)."""
+    best = None
+    for lvl in levels:
+        data = build_datafile(resources, level=lvl)
+        if len(data) <= size:
+            padded = pad_datafile(data, size)
+            if padded is not None:
+                return padded, True
+        if best is None or len(data) < len(best):
+            best = data
+    return best, False
+
+
 # --- archives -------------------------------------------------------------------------------------------------
 
 @dataclass
