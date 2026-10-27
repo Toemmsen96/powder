@@ -277,10 +277,17 @@ impl OfferCatalog {
 /// grants itself (after a mission step or a challenge it looks up `offers?itemIds=<reward item>` and buys that
 /// offer). For an item no offer grants, a synthetic free offer gives +1 of it. Its id is the item's UUID with every
 /// byte XOR 0xA5: still a UUID, and reversible, so a purchase knows the item without stored state.
+///
+/// The game's UbiServices SDK (JobSearchOffersSpaceEx::parseOffersOnField in the unpacked steep.exe) rejects the
+/// whole reply ("Request space offers failed. Unexpected JSON") unless every offer has offerId, spaceId, public,
+/// type, partitionIndex, nameId, revision, lastModified, tags, items and dynamicItemsGroups (the visible/applicable
+/// dates and `obj` are optional), so a synthetic offer carries them all.
 pub fn synthetic_offer(item_id: &str) -> Option<Value> {
     let offer_id = xor_uuid(item_id)?;
-    Some(serde_json::json!({"offerId": offer_id, "type": "progression", "revision": 1, "tags": ["REWARDS"],
-                            "items": [{"itemId": item_id, "quantity": 1}]}))
+    Some(serde_json::json!({"offerId": offer_id, "spaceId": crate::constants::SPACE_ID, "public": true,
+                            "type": "progression", "partitionIndex": 0, "nameId": "", "revision": 1,
+                            "lastModified": "2017-12-01T00:00:00.000Z", "tags": ["REWARDS"],
+                            "items": [{"itemId": item_id, "quantity": 1}], "dynamicItemsGroups": []}))
 }
 
 /// The store items the game itself knows, as free shop offers. tools/trainer/storemap.py reads them out of the
@@ -298,13 +305,14 @@ pub fn local_store(path: &Path) -> OfferCatalog {
         }
     };
     let mut offers = vec![];
-    for v in items.values() {
+    for (name, v) in &items {
         let (Some(guid), Some(tags)) = (v.get("guid").and_then(Value::as_str), v.get("tags").and_then(Value::as_array))
         else { continue };
         let Some(mut offer) = synthetic_offer(guid) else { continue };
         offer["type"] = Value::from("shop");
-        offer["spaceId"] = Value::from(crate::constants::SPACE_ID);
-        offer["tags"] = Value::Array(tags.clone());
+        offer["nameId"] = Value::from(name.as_str());
+        offer["tags"] = Value::Array(tags.iter().filter(|t| t.as_str().is_some_and(|t| xor_uuid(t).is_none()))
+            .cloned().collect()); // storemap may have taken the space id for a tag
         offers.push(offer);
     }
     log::info!(target: "powder.economy", "{}: {} store items as free offers", path.display(), offers.len());
@@ -509,6 +517,11 @@ mod tests {
         let offer = &found[0];
         assert_eq!(offer["type"], "shop");
         assert_eq!(offer["items"][0]["itemId"], costume);
+        assert_eq!(offer["nameId"], "COSTUME_M_MILITARY_GREY_94");
+        for field in ["offerId", "spaceId", "public", "type", "partitionIndex", "nameId", "revision", "lastModified",
+                      "tags", "items", "dynamicItemsGroups"] {
+            assert!(offer.get(field).is_some(), "the game requires {field}");
+        }
         assert_eq!(synthetic_item(offer["offerId"].as_str().unwrap()).as_deref(), Some(costume));
         assert!(store.query(Some("COSUTME"), Some("progression"), None, 0, 10).is_empty());
         assert!(local_store(&dir.path().join("missing.json")).is_empty());

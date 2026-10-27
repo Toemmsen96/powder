@@ -100,7 +100,8 @@ def catalogue(mem, pid: int, names: dict) -> dict[str, tuple[str, list]]:
                     s = string(buf[i - k:i - k + 48])
                     if not s or not s.isprintable():
                         break
-                    tags.append(s)
+                    if not GUID.fullmatch(s.encode() + b"\x00"):  # the space id record can sit among them
+                        tags.append(s)
                 for t in tags:
                     if t in names:
                         out.setdefault(t, (guid.decode(), tags[::-1]))
