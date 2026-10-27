@@ -583,10 +583,6 @@ def edit_cell(mp: Map, cell: Cell, a, warn) -> tuple[CellEdit, dict[int, list[fl
         d = moves.get(pl.res.id, (pl, mat_translate((0, 0, 0))))[1]
         moves[pl.res.id] = (pl, mat_mul(d, make(mat_mul(pl.matrix, d))))  # from where earlier operations put it
 
-    def about(cur, m):
-        o = cur[12:15]
-        return mat_mul(mat_mul(mat_translate([-c for c in o]), m), mat_translate(o))
-
     for spec, v in a.move or []:
         t = parse_vec(v, 3, "--move")
         add_delta(spec, lambda cur: mat_translate([t[k] - cur[12 + k] for k in range(3)]))
@@ -611,39 +607,62 @@ def edit_cell(mp: Map, cell: Cell, a, warn) -> tuple[CellEdit, dict[int, list[fl
 
     src = cell if a.source is None else mp.cell(a.source, a.layer)
     for k, (spec, v) in enumerate(a.copy or []):
-        pl = src.find(spec)
-        if pl.kind != "entity":
-            sys.exit(f"{spec}: only entities (0x0984415E) can be copied, this is a {pl.kind}")
         vals = parse_vec(v, 3, "--copy")
         new_base = a.id + (k << 12) if a.id else NEW_ID_BASE + (cell.index << 20) + ((a.copy_no + k) << 12)
-        clash = next((i for i in range(new_base, new_base + 0x1000) if i in mp.entries or i in ce.res), None)
-        if clash is not None:
-            sys.exit(f"--copy: the new id block {new_base:#x} clashes with {clash:#x}; pass --id or --copy-no")
-        r, mapping = copy_instance(src, pl, new_base, warn)
-        cur = read_mat(r.payload, 14)
-        d = mat_translate([vals[i] - cur[12 + i] for i in range(3)])
-        if len(vals) == 4:
-            d = mat_mul(d, about(mat_mul(cur, d), mat_rot_z(vals[3])))
-        moved = Placed(r, "entity", 14)
-        r = forge.Resource(r.id, r.type, r.name, transform_object(moved, d, set(src.by_id) | {r.id}), r.flag, r.pre,
-                           r.extra)
-        deps = dependencies(src, pl.res, set(ce.res)) if src is not cell else []
-        for dep in deps:
-            ce.add_dependency(dep)
-        ce.add_placed(r)
-        at = read_mat(r.payload, 14)
-        ce.log.append(f"copied {pl.res.name} as {r.name} ({r.id:#x}, {len(mapping)} ids renumbered) at {fmt_pos(at)}"
-                      + (f", +{len(deps)} dependencies from cell {src.index}" if deps else ""))
-        check_inside(mp, cell, at, r.name, warn)
-        if src is not cell:
-            wanted = linked_ids([pl.res.payload] + [x.payload for x in dependencies(src, pl.res, set())])
-            blob = merge_prefetch(ce.more.get("prefetch_raw", mp.prefetch_blob(cell.entry.id)),
-                                  mp.prefetch_blob(src.entry.id), wanted)
-            if blob is not None:
-                ce.more["prefetch_raw"] = blob
+        add_copy(mp, ce, src, src.find(spec), vals[:3], vals[3] if len(vals) == 4 else 0.0, 1.0, new_base, warn)
+    finish_prefetch(ce)
+    return ce, targets
+
+
+def about(cur, m):
+    """`m` (a turn or scale) about the origin of the object whose matrix is `cur`."""
+    o = cur[12:15]
+    return mat_mul(mat_mul(mat_translate([-c for c in o]), m), mat_translate(o))
+
+
+def add_copy(mp: Map, ce: CellEdit, src: Cell, pl: Placed, pos, yaw: float, scale: float, new_base: int,
+             warn) -> forge.Resource:
+    """A copy of the entity `pl` (of cell `src`) placed in `ce`'s cell at `pos`, turned by `yaw` degrees and scaled
+    by `scale` about its origin, under the fresh id block `new_base`. From another cell, the entity's dependencies
+    and prefetch records come along."""
+    cell = ce.cell
+    if pl.kind != "entity":
+        sys.exit(f"{pl.res.name or hex(pl.res.id)}: only entities (0x0984415E) can be copied, this is a {pl.kind}")
+    clash = next((i for i in range(new_base, new_base + 0x1000) if i in mp.entries or i in ce.res), None)
+    if clash is not None:
+        sys.exit(f"--copy: the new id block {new_base:#x} clashes with {clash:#x}; pass --id or --copy-no")
+    r, mapping = copy_instance(src, pl, new_base, warn)
+    cur = read_mat(r.payload, 14)
+    d = mat_translate([pos[i] - cur[12 + i] for i in range(3)])
+    if yaw:
+        d = mat_mul(d, about(mat_mul(cur, d), mat_rot_z(yaw)))
+    if scale != 1.0:
+        d = mat_mul(d, about(mat_mul(cur, d), mat_scale(scale)))
+    moved = Placed(r, "entity", 14)
+    r = forge.Resource(r.id, r.type, r.name, transform_object(moved, d, set(src.by_id) | {r.id}), r.flag, r.pre,
+                       r.extra)
+    deps = dependencies(src, pl.res, set(ce.res)) if src.entry.id != cell.entry.id else []
+    for dep in deps:
+        ce.add_dependency(dep)
+    ce.add_placed(r)
+    at = read_mat(r.payload, 14)
+    ce.log.append(f"copied {pl.res.name} as {r.name} ({r.id:#x}, {len(mapping)} ids renumbered) at {fmt_pos(at)}"
+                  + (f", +{len(deps)} dependencies from cell {src.index}" if deps else ""))
+    check_inside(mp, cell, at, r.name, warn)
+    if src.entry.id != cell.entry.id:
+        wanted = linked_ids([pl.res.payload] + [x.payload for x in dependencies(src, pl.res, set())])
+        if "prefetch" in ce.more:  # finished by an earlier step
+            ce.more["prefetch_raw"] = bytes.fromhex(ce.more.pop("prefetch"))
+        blob = merge_prefetch(ce.more.get("prefetch_raw", mp.prefetch_blob(cell.entry.id)),
+                              mp.prefetch_blob(src.entry.id), wanted)
+        if blob is not None:
+            ce.more["prefetch_raw"] = blob
+    return r
+
+
+def finish_prefetch(ce: CellEdit) -> None:
     if "prefetch_raw" in ce.more:
         ce.more["prefetch"] = ce.more.pop("prefetch_raw").hex()
-    return ce, targets
 
 
 def neighbours(g: Grid, index: int, radius: int) -> list[int]:
@@ -655,9 +674,10 @@ def neighbours(g: Grid, index: int, radius: int) -> list[int]:
 
 
 def edit_proxies(mp: Map, cell: Cell, targets: dict[int, list[float] | None], radius: int,
-                 warn) -> list[CellEdit]:
+                 warn, edits: dict[tuple[int, int], CellEdit] | None = None) -> list[CellEdit]:
     """The proxies (0x1CBDE084) standing in for moved/removed objects in the cells around `cell` (same layer and
-    level, and the coarser cells over them): moved along or dropped."""
+    level, and the coarser cells over them): moved along or dropped. With `edits` ((layer, index) -> edit), a cell
+    already being edited takes the changes, and new edits are added to it."""
     out = []
     g = mp.grid
     near = neighbours(g, cell.index, radius)
@@ -672,10 +692,10 @@ def edit_proxies(mp: Map, cell: Cell, targets: dict[int, list[float] | None], ra
         if (cell.layer, idx) not in mp.cells:
             continue
         c = mp.cell(idx, cell.layer)
-        ce = None
+        ce = edits.get((cell.layer, idx)) if edits is not None else None
         for o in c.objects():
             hit = [t for t in o.targets if t in targets]
-            if o.kind != "proxy" or not hit:
+            if o.kind != "proxy" or not hit or ce is not None and o.res.id not in ce.res:
                 continue
             if len(hit) < len(o.targets) or any(targets[t] != targets[hit[0]] for t in hit):
                 warn(f"cell {idx}: proxy {o.res.id:#x} stands in for {len(o.targets)} objects that do not all move "
@@ -690,8 +710,10 @@ def edit_proxies(mp: Map, cell: Cell, targets: dict[int, list[float] | None], ra
                 ce.set_payload(o.res, transform_object(o, d, set(c.by_id)))
                 ce.log.append(f"moved the proxy {o.res.id:#x} of {hit[0]:#x} along: {fmt_pos(o.matrix)} -> "
                               f"{fmt_pos(mat_mul(o.matrix, d))}")
-        if ce:
+        if ce and ce not in out:
             out.append(ce)
+            if edits is not None:
+                edits[(cell.layer, idx)] = ce
     return out
 
 
@@ -905,6 +927,244 @@ def cmd_edit(a):
         print(f"{len(warnings)} warning(s)")
 
 
+# --- index and batch edits (mods/world_editor) ---------------------------------------------------------------
+
+INDEX_VERSION = 1
+IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+
+def index_cell(mp: Map, key: tuple[int, int]) -> list[str]:
+    """Index lines of a cell's placed entities and groups (packed instances, proxies and data objects left out):
+    obj, layer, cell, id, kind, x, y, z, yaw, scale, bounding-box size x/y/z, name, prop."""
+    layer, idx = key
+    c = mp.cell(idx, layer)
+    rids = set(c.by_id)
+    out = []
+    for o in c.objects():
+        if o.kind not in ("entity", "group") or o.matrix_at is None:
+            continue
+        m = o.matrix
+        if not is_affine(m) or o.kind == "group" and m == IDENTITY:
+            continue
+        (x, y, z), sc, (yaw, _, _) = decompose(m)
+        size = (0.0, 0.0, 0.0)
+        p = o.res.payload
+        for off, _, cls in object_headers(p, rids - {o.res.id}):
+            if cls == AABB_CLASS and off + 36 <= len(p):
+                lo, hi = struct.unpack_from("<3f", p, off + 12), struct.unpack_from("<3f", p, off + 24)
+                if all(math.isfinite(v) for v in lo + hi):
+                    size = tuple(max(0.0, hi[k] - lo[k]) for k in range(3))
+                break
+        name, prop = (re.sub(r"[\t\r\n]", " ", t) for t in (o.res.name, o.props[0] if o.props else ""))
+        out.append("\t".join(["obj", str(layer), str(idx), f"{o.res.id:#x}", o.kind, f"{x:.2f}", f"{y:.2f}",
+                              f"{z:.2f}", f"{yaw:.1f}", f"{sum(sc) / 3:.3f}", *(f"{v:.1f}" for v in size), name,
+                              prop]))
+    return out
+
+
+_INDEX_MAP: Map | None = None
+
+
+def _index_init(base: str) -> None:
+    global _INDEX_MAP
+    _INDEX_MAP = Map(base)  # a worker's own file handles (forked ones would share their offsets)
+
+
+def _index_part(keys: list[tuple[int, int]]) -> list[str]:
+    out = []
+    for key in keys:
+        try:
+            out += index_cell(_INDEX_MAP, key)
+        except (ValueError, struct.error) as ex:
+            print(f"warning: L{key[0]} Cell{key[1]:05d}: {ex}", file=sys.stderr)
+    return out
+
+
+def cmd_index(a):
+    """Every placed entity and group of a map, one tab-separated line each, for the world editor's panel."""
+    global _INDEX_MAP
+    mp = Map(a.map)
+    keys = sorted(mp.cells)
+    jobs = max(1, a.jobs or min(16, os.cpu_count() or 1))
+    parts = [keys[i::jobs * 4] for i in range(jobs * 4)]
+    lines = []
+    if jobs > 1:
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn")
+        with ctx.Pool(jobs, _index_init, (mp.base,)) as pool:
+            for part in pool.imap_unordered(_index_part, parts):
+                lines += part
+    else:
+        _INDEX_MAP = mp
+        for part in parts:
+            lines += _index_part(part)
+    lines.sort(key=lambda ln: (int(ln.split("\t")[1]), int(ln.split("\t")[2]), ln))
+    head = [f"# world.py index v{INDEX_VERSION}: obj layer cell id kind x y z yaw scale size_x size_y size_z name prop",
+            f"map\t{mp.name}\t" + ",".join(os.path.basename(fg.path) for fg in mp.archives)]
+    head += [f"grid\t{g.layer}\t{g.min_x:g}\t{g.min_y:g}\t{g.cell:g}\t{g.levels}" for g in mp.layers]
+    head += [f"cell\t{layer}\t{idx}" for layer, idx in keys]
+    tmp = a.out + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(head + lines) + "\n")
+    os.replace(tmp, a.out)
+    print(f"{a.out}: {len(lines)} objects in {len(keys)} cells of {mp.name}")
+
+
+def map_key(name: str) -> str:
+    """"DataPC_STP_Alpes" / "Alpes" / "alpes" -> "alpes"."""
+    return re.sub(r"^DataPC_STP_", "", name, flags=re.I).lower()
+
+
+def fold_edits(edits: list[dict], warn) -> tuple[dict, dict]:
+    """The world editor's edit list folded, in order, into the final state: added copies {n: {src: (layer, cell,
+    id), pos, yaw, scale, name}} and changes of shipped objects {(layer, cell, id): {pos, yaw, scale, removed}}
+    (pos None: not moved). An edit of a removed or unknown object is skipped."""
+    adds: dict[int, dict] = {}
+    objs: dict[tuple[int, int, int], dict] = {}
+    for e in sorted(edits, key=lambda e: e.get("n", 0) if isinstance(e.get("n"), int) else 0):
+        n = e.get("n", "?")
+        try:
+            op = e["op"]
+            if op == "add":
+                s = e["src"]
+                adds[int(n)] = {"src": (int(s.get("layer", 0)), int(s["cell"]), int(str(s["id"]), 16)),
+                                "pos": [float(v) for v in e["pos"][:3]], "yaw": float(e.get("yaw", 0)),
+                                "scale": float(e.get("scale", 1)), "name": str(e.get("name", ""))}
+                continue
+            if "of" in e:
+                st = adds.get(int(e["of"]))
+                if st is None:
+                    warn(f"edit {n}: {op} of added object {e['of']}, which is gone: skipped")
+                    continue
+            else:
+                o = e["obj"]
+                key = (int(o.get("layer", 0)), int(o["cell"]), int(str(o["id"]), 16))
+                st = objs.setdefault(key, {"pos": None, "yaw": 0.0, "scale": 1.0, "removed": False})
+                if st["removed"]:
+                    warn(f"edit {n}: {op} of removed object {o['id']}: skipped")
+                    continue
+            if op == "move":
+                pos = [float(v) for v in e["pos"][:3]]
+                if len(pos) != 3:
+                    raise ValueError("pos needs x, y, z")
+                st["pos"] = pos
+            elif op == "turn":
+                st["yaw"] += float(e["deg"])
+            elif op == "scale":
+                st["scale"] *= float(e["factor"])
+            elif op == "remove":
+                if "of" in e:
+                    del adds[int(e["of"])]
+                else:
+                    st["removed"] = True
+            else:
+                warn(f"edit {n}: unknown op {op!r}: skipped")
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as ex:
+            warn(f"edit {n}: malformed ({ex!r}): skipped")
+    for st in list(adds.values()) + list(objs.values()):
+        pos_ok = st["pos"] is None or len(st["pos"]) == 3 and all(math.isfinite(v) and abs(v) < 1e5 for v in st["pos"])
+        if not pos_ok or not math.isfinite(st["yaw"]) or not 0.01 <= st["scale"] <= 100:
+            warn(f"an object ends up at {st['pos']}, turned {st['yaw']}, scale {st['scale']}: left out")
+            st["bad"] = True
+    return ({n: st for n, st in adds.items() if not st.get("bad")},
+            {k: st for k, st in objs.items() if not st.get("bad")})
+
+
+def cmd_apply(a):
+    """A list of world-editor edits (JSON: a list, or {"edits": [...]}) applied to this map: every cell it changes
+    (and the neighbours whose proxies follow) written to -o, as `edit` writes them."""
+    mp = Map(a.map)
+    with open(a.edits, encoding="utf-8") as f:
+        data = json.load(f)
+    edits = data.get("edits", []) if isinstance(data, dict) else data
+    edits = [e for e in edits if isinstance(e, dict) and map_key(str(e.get("map", ""))) == map_key(mp.name)]
+    warnings = []
+
+    def warn(s):
+        warnings.append(s)
+        print(f"warning: {s}", file=sys.stderr)
+
+    adds, objs = fold_edits(edits, warn)
+    cells: dict[tuple[int, int], CellEdit] = {}
+    moved: list[tuple[Cell, dict]] = []
+    per_cell: dict[tuple[int, int], dict[int, dict]] = collections.defaultdict(dict)
+    for (layer, idx, oid), st in objs.items():
+        per_cell[(layer, idx)][oid] = st
+    for (layer, idx), changes in sorted(per_cell.items()):
+        if (layer, idx) not in mp.cells:
+            warn(f"L{layer} Cell{idx:05d}: no such cell in {mp.name}: {len(changes)} change(s) skipped")
+            continue
+        c = mp.cell(idx, layer)
+        listed = set(c.block.ids)
+        ns = argparse.Namespace(remove=[], move=[], offset=[], yaw=[], scale=[], copy=[], source=None, layer=layer,
+                                id=None, copy_no=0)
+        for oid, st in changes.items():
+            if oid not in listed:
+                warn(f"L{layer} Cell{idx:05d}: no object {oid:#x}: its change is skipped")
+            elif st["removed"]:
+                ns.remove.append(f"{oid:#x}")
+            else:
+                if st["pos"] is not None:
+                    ns.move.append((f"{oid:#x}", ",".join(repr(v) for v in st["pos"])))
+                if st["yaw"]:
+                    ns.yaw.append((f"{oid:#x}", repr(st["yaw"])))
+                if st["scale"] != 1.0:
+                    ns.scale.append((f"{oid:#x}", repr(st["scale"])))
+        try:
+            ce, targets = edit_cell(mp, c, ns, warn)
+        except SystemExit as ex:
+            warn(f"L{layer} Cell{idx:05d}: {ex}: its changes are skipped")
+            continue
+        cells[(layer, idx)] = ce
+        if targets:
+            moved.append((c, targets))
+    sources: dict[tuple[int, int], Cell] = {}
+    copies: collections.Counter = collections.Counter()
+    for n, st in sorted(adds.items()):
+        x, y = st["pos"][0], st["pos"][1]
+        # the finest cell of the main table there (empty slots have no datafile to add to)
+        where = next(((0, i) for lvl in range(mp.grid.levels) if (i := mp.grid.at(x, y, lvl)) is not None
+                      and (0, i) in mp.cells), None)
+        sl, sc, sid = st["src"]
+        what = f"add {n} ({st['name'] or hex(sid)})"
+        if where is None:
+            warn(f"{what}: no cell of {mp.name} covers ({x:.1f}, {y:.1f}): skipped")
+            continue
+        if (sl, sc) not in mp.cells:
+            warn(f"{what}: its source cell L{sl} {sc} is not in {mp.name}: skipped")
+            continue
+        if copies[where] > 0xFF:
+            warn(f"{what}: more than 256 copies in cell {where[1]}: skipped")
+            continue
+        try:
+            if (sl, sc) not in sources:
+                sources[(sl, sc)] = mp.cell(sc, sl)
+            src = sources[(sl, sc)]
+            pl = next((o for o in src.objects() if o.res.id == sid), None)
+            if pl is None:
+                warn(f"{what}: no object {sid:#x} in its source cell {sc}: skipped")
+                continue
+            if where not in cells:
+                cells[where] = CellEdit(mp.cell(where[1], 0))
+            add_copy(mp, cells[where], src, pl, st["pos"], st["yaw"], st["scale"],
+                     NEW_ID_BASE + (where[1] << 20) + (copies[where] << 12), warn)
+            copies[where] += 1
+        except SystemExit as ex:
+            warn(f"{what}: {ex}: skipped")
+    for c, targets in moved:
+        edit_proxies(mp, c, targets, a.proxy_radius, warn, cells)
+    os.makedirs(a.out, exist_ok=True)
+    written = 0
+    for key in sorted(cells):
+        ce = cells[key]
+        finish_prefetch(ce)
+        if ce.log:
+            write_edit(mp, ce, a.out)
+            written += 1
+    print(f"{mp.name}: {len(edits)} edit(s): {len(adds)} added object(s), {len(objs)} changed; {written} cell(s) "
+          f"written, {len(warnings)} warning(s)")
+
+
 def cmd_check(a):
     """Parse every cell of a map and check what WORLD.md states (C) on it."""
     mp = Map(a.map)
@@ -1076,6 +1336,17 @@ def main(argv=None):
     p.add_argument("--proxy-radius", type=int, default=1, help="look for proxies of moved/removed objects this many "
                    "cells around (default 1; see WORLD.md)")
     p.set_defaults(fn=cmd_edit)
+    p = sp.add_parser("index", help="every placed entity and group, one tab-separated line each (world editor)")
+    m(p)
+    p.add_argument("-o", "--out", required=True, help="the index file to write")
+    p.add_argument("--jobs", type=int, help="worker processes (default: the CPUs, at most 16)")
+    p.set_defaults(fn=cmd_index)
+    p = sp.add_parser("apply", help="write the cells a list of world-editor edits (JSON) changes")
+    m(p)
+    p.add_argument("edits", help='JSON: [edit, ...] or {"edits": [...]}; edits of other maps are left out')
+    p.add_argument("-o", "--out", required=True, help="folder for the edited cells (its map's forge folder)")
+    p.add_argument("--proxy-radius", type=int, default=1, help="as for edit")
+    p.set_defaults(fn=cmd_apply)
     p = sp.add_parser("check", help="parse every cell, check the layout claims, rebuild DataBlocks")
     m(p)
     p.add_argument("--limit", type=int, help="only the first N cells")

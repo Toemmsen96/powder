@@ -15,7 +15,14 @@ world.py find  <map> 0x<prop id> | <name substring>    # every placement (prop i
 world.py edit  <map> CELL -o OUT [--move OBJ X,Y,Z] [--offset OBJ DX,DY,DZ] [--yaw OBJ DEG] [--scale OBJ S]
                               [--remove OBJ] [--copy OBJ X,Y,Z[,YAW]] [--source CELL] [--layer N]
 world.py check <map> [--ids]                           # parse every cell, rebuild every DataBlock, statistics
+world.py index <map> -o FILE [--jobs N]                # every placed entity/group, one TSV line each (world editor)
+world.py apply <map> EDITS.json -o OUT                 # a world-editor edit list -> the cells it changes
 ```
+
+`index` and `apply` serve `mods/world_editor` (its README has the edit list's format). `apply` folds the list in
+order, makes one edit per changed cell (several adds from different source cells and the proxies of moved objects in
+neighbouring cells all land in the same cell edit, so nothing overwrites another), and puts each added copy into the
+finest existing cell of the first table at its position.
 
 `<map>` is the base archive, e.g. `"$G/DataPC_STP_Alpes.forge"`; its `_patch_NN` are added, and archives a
 powder-wrap session put there (`.powder-assets`) are left out. `OBJ` is an object's id or exact name. `edit` also
