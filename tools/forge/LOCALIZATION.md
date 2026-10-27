@@ -73,3 +73,6 @@ codes (fewer for 1% to almost half of a package's strings: Ubisoft's coder does 
   crc32(NAME) so the same name gets the same id each time; `items.py add-costume --title` keys it by the item's name
   (COSTUME_MF_POWDER_MASTER_CHIEF: **0x1f43**). TRIED in-game 2026-10-27: an id past every shipped one (0x86ef,
   appended to the last bank) crashed the game at start; renaming a shipped id (0x4ed2 -> "MASTER CHIEF") works.
+  CONFIRMED in-game 2026-10-27: a new id inside the range (0x45f2 "POWDER OVERALLS" on a cloned costume, next to the
+  renamed 0x4ed2) shows its name, and the original keeps its own. (The phase-1 crash blamed on in-range ids came
+  from a source with an unlock condition, see ITEMS.md.)
