@@ -515,6 +515,10 @@ def plan_costume(game: Game, ctx: dict, spec: CostumeSpec) -> CostumePlan:
     if any(r.name == name for r in bres):
         sys.exit(f"{name}: an item of that name exists")
     d = parse_item(src.payload)
+    if d["unlock"]:  # seen 2026-10-27: a clone of COSTUME_MF_C_Spandex_Gold_142 (GOLD_SPANDEX CONDITION) crashed the
+        # game at start; the condition is linked twice in the record and not yet cloned or removed
+        sys.exit(f"{like}: it has an unlock condition ({', '.join(hex(u) for u in d['unlock'])}); cloning such items "
+                 "crashes the game - pick a source without one (items.py show)")
     if d["category"] != COSTUME_CATEGORY:  # e.g. JACKET_MF_C_Penguin_228, the part of a costume bundle that draws it
         print(f"  note: {like} is no costume item (category {d['category']}); the new item gets its category")
     item_tags = {t for lst in d["tags"] for t in lst}
