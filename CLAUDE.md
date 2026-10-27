@@ -1,8 +1,9 @@
 # Powder — notes for Claude Code
 
 Powder is a self-hosted stand-in for Steep's (Ubisoft) online services, so an owned copy stays playable, and a modding
-platform for it (end goal: a community-run Steep like ReSkate for Skate 3). Branch `rework/rust-server`: the Rust
-server (default) + mods + tools; `main` is the Python server (the reference for behaviour) and the Windows launcher.
+platform for it (end goal: a community-run Steep like ReSkate for Skate 3). Work only on `main` (since 2026-10-27):
+the Rust server (default) + mods + tools, the Python server (the reference for behaviour, `POWDER_SERVER=python`)
+and the launchers. Remotes: `origin` = Toemmsen96/powder, `resteep` = resteepMod/rusty-powder (push to both).
 
 **Read on demand, not up front:** `docs/NOTES.md` (port state, security review, dead ends, dated state and open
 steps), README (users' docs), `tools/forge/*.md` (FORGE/ITEMS/WORLD/LOCALIZATION/MESHES/TEXTURES/BLENDER: game data),
@@ -14,7 +15,7 @@ steps), README (users' docs), `tools/forge/*.md` (FORGE/ITEMS/WORLD/LOCALIZATION
 ```
 cargo test && cargo clippy --all-targets   # all pass, no warnings
 cargo build --release                      # powder-wrap/the launcher run target/release first: rebuild before the user tests
-uv run pytest                              # Python; 4 fail on Linux (Windows-only tests)
+uv run pytest                              # Python; on Linux 4 Windows-only tests + test_limits' TLS test fail
 native/build.sh [overlay|mods]             # MinGW: TLS helper, overlay, client mod DLLs
 linux/powder-launcher [launch --dry-run]   # the Linux launcher (GUI without args)
 ```
@@ -30,14 +31,14 @@ Launcher/games/Steep"`; prefix `~/Games/ubisoft-connect` (GE-Proton via umu-run)
   JSON via `util::dumps`; note behaviour differences in the commit message.
 - **Style:** `//!` / docstring module docs saying what and why, few terse comments, ~120-column lines, `anyhow` with
   context, log targets `powder.<area>`.
-- **Commits:** one focused commit per piece, body says what was tested, end with the Co-Authored-By line; push to
-  `origin rework/rust-server` when done and green.
+- **Commits:** one focused commit per piece, body says what was tested, end with the Co-Authored-By line; push `main`
+  to `origin` and `resteep` when done and green.
 - **Server internals:** tokio + `Arc` services, `parking_lot` locks never across `.await`; `ModHost` behind a Mutex;
   HTTPS `handle()` runs in `spawn_blocking`.
 - **Mods:** server = Lua (`mods/<name>/mod.lua`, sandboxed); client = `mods/<name>/client/` (DLLs need the player's
   approval, pinned to hashes: a server must never push code); asset mods = `client/forge/<Base>/` entries built into
   a per-session `<Base>_patch_03.forge`. Game data in mods is generated locally (gitignored).
-- **Agents:** parallel work in worktrees; tell each to `git reset --hard origin/rework/rust-server` first, give
+- **Agents:** parallel work in worktrees; worktrees start from `main`; give
   disjoint files, commit but not push; cherry-pick here, test, remove the worktree, push.
 - **Scratch server:** config with ports 18443/18080/16005/19000 in a scratch dir;
   `curl --resolve public-ubiservices.ubi.com:18443:127.0.0.1 --cacert <data>/tls/ca.pem https://...`.
