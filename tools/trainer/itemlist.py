@@ -53,6 +53,8 @@ def main():
         if "gameId" not in src.get("obj", {}):
             sys.exit(f"{like}: its entry has no obj.gameId (read the list with a current storemap.py --item-list)")
         obj = {**src["obj"], "gameId": int(rid, 16), "price": 0}
+        if "Token" in obj:
+            obj["Token"] = 0  # the source's unlock token (e.g. a Ubisoft Club reward's) is not the new item's
         items = [it for it in items if it["nameId"] != name] + [{**src, "itemId": guid, "nameId": name, "obj": obj}]
         store[name] = {"guid": guid, "type": "0x3856b74b", "tags": src["tags"], "custom": True}
         print(f"{name}: {guid} ({src['type']}, obj {obj}), tags {', '.join(src['tags'])}")
