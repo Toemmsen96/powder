@@ -34,6 +34,22 @@ bundle costume (costume 005, the penguin), the new item is a **jacket** (the pen
 its jacket item `JACKET_MF_C_Penguin_228`): look for it under jackets. Leave the master_chief mod itself off to see
 Chief only on the new item.
 
+## Master Chief as a new, owned costume (2026-10-27)
+
+The plain clone never showed up: the menu and store list only items with a store GUID, and the GUIDs come from
+Ubisoft's item list (ITEMS.md), whose entries name their game object by a tag. The list has entries no game object
+uses; `--chief` now names the new item after one of them, `PROGRESSION_TOKEN_BEAVER_COSTUME_ULC_CONDITION_ULC_4026690459`
+(GUID `077f575a-e943-4d28-8cc4-7d637a54dce0`), so the game should tie that GUID to it (G). Made with
+
+```
+mods/master_chief/make_chief.py --game <Steep> --target urban_japan -o build/chief_016   # a full costume model
+CHIEF_SRC=build/chief_016 mods/custom_costume_test/generate.sh --chief
+powder-server admin grant <player> 077f575a-e943-4d28-8cc4-7d637a54dce0 1                # own it
+```
+
+and a free offer in `data/store_items.json`. In the game, with only this mod on (master_chief off, so the military
+costume looks normal): Costumes should list one more costume (the urban outfit's name and icon, Chief's body).
+
 ## What to check in the game, in order
 
 1. **The game starts and the menu loads** with the mod on. A crash or hang at start points at
