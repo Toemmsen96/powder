@@ -52,7 +52,8 @@ in the store, so nobody could equip it. The penguin version was seen in the game
 | the coat | `STP_M_Jacket_013`, `STP_F_Jacket_010` (entities, LOD0..3) | `mesh.py import --glb`: the whole model into the coat's one submesh; 63,200 vertices, 56,074 triangles in every LOD |
 | the textures | the coat's two colourways (`STP_MF_Jacket_013_T01`, `_T02`: 2 texture sets x 4 maps, with `_Mip0`/`_Mip1`) | `texture.py replace --raw-rows`: armour, suit, helmet and visor packed 2x2. The coat's embedded material holds the shared placeholder set, which stays |
 | the rest of the set (military only) | pants, helmet, harness and belts (M and F, 12 entities) | `mesh.py edit --scale 0.001` |
-| the menu picture | the costume's icon texture (`DataPC_extra_2`, 256 x 256 BC7) | `render_icon.py` (Blender, Cycles on the CPU, a front view on a transparent background), `texture.py replace` |
+| the menu picture | the costume's icon texture (`DataPC_extra_2`, 256 x 256 BC7) | `render_icon.py` (Blender, Cycles on the CPU, a front view on a transparent background), blended onto the icon's own backdrop with the penguin painted out (the menu draws an icon's colours and ignores its alpha: a black backdrop showed as a dark gradient, 2026-10-27), `texture.py replace` |
+| the bundle's extras (penguin) | backpack harness, gloves, ski and snowboard boots: shared models, but colourways only the penguin's items use (`..._FunT25`, `..._T19`) | diffuse maps tinted Chief green (`recolour`) |
 
 Every item that uses these models becomes Chief (or vanishes): the coat model in other colourways, the pants,
 helmet and harness on their own.
@@ -105,6 +106,8 @@ Verified with tools, without running the game:
   textures are the same for the penguin.
 
 Confirmed in the game with the jacket version: the bone mapping, the fit, added bones and the texture layout.
+Confirmed 2026-10-27 with the penguin version: Chief in the costume list with his picture (then still on a dark
+backdrop, and with the penguin's yellow boots, gloves and harness; both fixed since, not yet seen in-game).
 
 Assumed:
 - The costume's LODs take the full model (no reduced LODs yet: some cost at a distance).

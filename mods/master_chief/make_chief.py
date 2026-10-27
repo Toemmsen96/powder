@@ -67,7 +67,11 @@ PRESETS = {
     "penguin": {"costumes": {"M": "STP_M_Costume_005", "F": "STP_F_Costume_005"},
                 "layout": {"STP_MF_Costume_005": QUARTERS},
                 "collapse": ["STP_MF_Costume_005_HEAD", "0x9c6dd89793", "0x9c6dd897bb"],  # head, goggle, glass
-                "colourways": {}, "embedded": True, "hide": [], "icons": ["COSTUME_PENGUIN_MF_Map"]},
+                "colourways": {}, "embedded": True, "hide": [], "icons": ["COSTUME_PENGUIN_MF_Map"],
+                # the bundle's extras (shared models, colourways only the penguin's items use): tinted Chief green
+                "recolour": ["STP_MF_Backpack_001_FunT25", "STP_MF_Backpack_001_FunT25_BP",
+                             "STP_MF_Backpack_001_FunT25_SangleOnly", "STP_MF_Gloves_002_T19",
+                             "STP_MF_SkiBoot_001_T19", "STP_MF_SnowboardBoots_001_T19"]},
     "urban_japan": {"costumes": {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"},
                     "layout": {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
                                "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
@@ -81,6 +85,7 @@ PRESETS = {
 DEFAULT_TARGET = "penguin"
 KEYS = ("costumes", "layout", "collapse", "colourways", "embedded", "hide")
 ICON_BASE = "DataPC_extra_2"  # the costumes' menu pictures (UI textures, 256 x 256)
+TINT = (0.30, 0.36, 0.22)  # Chief's armour green (linear multiplier on a colourway's grey levels)
 COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[DEFAULT_TARGET][k] for k in KEYS)
 SLOTS = {0: "diffuse", 1: "normal", 2: "specular", 7: "mask"}  # TextureSet slot -> map
 FALLBACK = ("Pants", "Glove", "Jacket")  # gear of the same gender searched for bones the costume lacks
@@ -375,6 +380,48 @@ def write_glb(parts: list, xf: dict, rest: dict, path: str) -> tuple[int, int]:
     return nv, nt
 
 
+def picture(game: str, name: str, png: str, out: str) -> None:
+    """The costume's menu picture: the render over the game's own icon's backdrop. The menu draws an icon's colours
+    and ignores its alpha (the shipped icons hide a backdrop under alpha 0), so the old costume is painted out with
+    the backdrop's colour (smoothed) and the render blended onto that."""
+    from PIL import Image, ImageFilter
+    orig = os.path.join(os.path.dirname(out), "orig.png")
+    run(os.path.join(TOOLS, "texture.py"), "export", os.path.join(game, ICON_BASE + ".forge"), name, "-o", orig)
+    o = np.asarray(Image.open(orig).convert("RGBA"), dtype=np.float32)
+    clear = o[..., 3] == 0
+    fill = o[..., :3][clear].mean(axis=0) if clear.any() else np.array([190.0, 210, 230])
+    back = np.where(clear[..., None], o[..., :3], fill)
+    back = Image.fromarray(back.astype(np.uint8), "RGB").filter(ImageFilter.GaussianBlur(6)).convert("RGBA")
+    top = Image.open(png).convert("RGBA").resize(back.size)
+    rgb = Image.alpha_composite(back, top)
+    rgb.putalpha(top.getchannel("A"))
+    rgb.save(out)
+
+
+def recolour(game: str, names: list[str], tmp: str, out: str) -> None:
+    """Tint the diffuse maps of these colourway materials (entries of TextureSets) Chief's green, keeping their
+    shading: the bundle's gear that shares its model with other items can't be hidden, but its colours are its own."""
+    from PIL import Image
+    arch = os.path.join(game, BASE + ".forge")
+    for name in names:
+        newest, entry = mesh.game_entry(arch, name)
+        ids = {struct.unpack_from("<Q", r.payload, 15)[0] for r in forge.parse_datafile(newest.read(entry)).resources
+               if r.type == 0xD70E6670 and r.payload[13] == 1}  # slot 0: the diffuse map
+        for tid in ids:
+            src = os.path.join(tmp, f"{tid:x}.png")
+            run(os.path.join(TOOLS, "texture.py"), "export", arch, f"{tid:#x}", "-o", src)
+            im = Image.open(src).convert("RGBA")
+            grey = np.asarray(im.convert("L"), dtype=np.float32) / 255
+            rgb = np.clip(grey[..., None] * np.array(TINT) * 255 * 1.6, 0, 255).astype(np.uint8)
+            tinted = Image.fromarray(rgb, "RGB")
+            tinted.putalpha(im.getchannel("A"))
+            tinted.save(src)
+            for base in sorted({b for b, _ in holders(game, [tid])}):
+                run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(game, base + ".forge"), f"{tid:#x}",
+                    "--image", src, "-o", os.path.join(out, base))
+        print(f"  tinted: {name} ({len(ids)} map{'s' if len(ids) != 1 else ''})")
+
+
 def holders(game: str, ids: list[int]) -> set[tuple[str, str]]:
     """(base archive, entry id) of every datafile that holds one of these resources."""
     out = run(os.path.join(TOOLS, "forge.py"), "where", game, *[x for i in ids for x in ("--id", f"{i:#x}")])
@@ -435,9 +482,12 @@ def main():
                 run(os.path.join(TOOLS, "mesh.py"), "edit", os.path.join(a.game, base + ".forge"), entry,
                     "--scale", "0.001", "-o", os.path.join(a.out, base))
             print(f"  hidden: {name}")
+        recolour(a.game, PRESETS[a.target].get("recolour", []), tmp, a.out)
         for name in PRESETS[a.target]["icons"] if a.icon else []:
+            pic = os.path.join(tmp, "picture.png")
+            picture(a.game, name, a.icon, pic)
             run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, ICON_BASE + ".forge"), name,
-                "--image", a.icon, "-o", os.path.join(a.out, ICON_BASE))
+                "--image", pic, "-o", os.path.join(a.out, ICON_BASE))
             print(f"  picture: {name}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
