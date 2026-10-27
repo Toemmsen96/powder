@@ -27,6 +27,12 @@ WORLD_TEST=copy mods/world_test/generate.sh    # only the two new firs
 POWDER_CLIENT_MODS=world_test                  # in Lutris' environment, then restart Lutris
 ```
 
+**Default since 2026-10-27: `WORLD_TEST=big`** (the first test was too subtle to spot): nine firs in a ring 4-12 m
+around the rider (five 20 m firs north and east, four 9.5 m firs west and south-west, none between the rider and the
+customisation cameras), the shipped 20 m fir 52 m north grown to 50 m (2.5x), and the boulder 6 m east of the rider at
+twice its size. The z values near the spawn are estimates (G): a fir may stand slightly sunk or float a little.
+`WORLD_TEST=both` is the original three-change test.
+
 ## What you should see
 
 In the main menu and the rider customisation screens, look around the rider. The WhiteRoom has four
