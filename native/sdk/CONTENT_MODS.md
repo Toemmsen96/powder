@@ -33,7 +33,24 @@ map   = "Alpes"
 edits = "assets/alps_park.json"               # the world editor's edit format (world.py apply)
 ```
 
-## The session build (`tools/forge/compose.py`, run by powder-wrap before the asset mods are packed)
+## Who does what
+
+The build needs the player's own game install (Steep's data is never shipped), so it runs in the **launcher** on the
+player's machine: the Windows launcher (powder/launcher) and powder-wrap on Linux call the same Python module
+(`tools/forge/compose.py`). The split:
+
+| part | job |
+|---|---|
+| server | which content mods it runs; hands their declarations and assets to launchers (`/_powder/mods`); serves the item list, store offers and grants built from them - the same for every player, so riders see each other's custom gear |
+| launcher | fetches the server's content mods, builds them against the local install (cached), packs the session's `_patch_03` archives |
+
+Content mods are **data only** (`content.toml`, models, pictures, edit lists): Powder's own tools turn them into game
+files, so a launcher can take them from a server without running anyone's code (the parsers must treat them as
+untrusted input: size limits, no paths outside the mod). Mods with code (client DLLs, a model-fitting script like
+master_chief's make_chief.py) keep today's per-player approval; for a content mod such a script runs on the
+author's machine and the mod ships its result (e.g. the fitted .glb).
+
+## The session build (`tools/forge/compose.py`, run by the launcher before the asset mods are packed)
 
 1. Read the named mods' `content.toml` in `POWDER_CLIENT_MODS` order; refuse duplicate item names; report two mods
    replacing the same entry (the later one wins, as today, but it is named in the log).
