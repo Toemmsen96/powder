@@ -1,9 +1,9 @@
 """The GTK4 / Libadwaita front-end.
 
 A single ``Adw.ApplicationWindow`` with an ``Adw.ViewStack`` behind an ``Adw.ViewSwitcher``: a Launch page (the
-server implementation, the overlay switch, the Steep folder, the game command and the big Launch button), a
-Mods page (every server mod as a switch row) and a Servers page (add/remove/select). Changes persist through
-:meth:`Settings.save` as they happen.
+detected game - prefix, Proton, umu-run -, the server implementation, the overlay switch, optional overrides and the
+big Launch button), a Mods page (the mods for the game, with their status and a Build/Generate button, and the
+server mods) and a Servers page (add/remove/select). Changes persist through :meth:`Settings.save` as they happen.
 
 GTK is imported lazily so the rest of the package stays usable without PyGObject. ``self_test`` builds the
 application and window without starting the main loop; on a headless machine where GTK cannot reach a display
@@ -13,8 +13,14 @@ from __future__ import annotations
 
 import re
 
+import subprocess
+import threading
+from pathlib import Path
+
+from . import game
 from .launch import launch as do_launch
 from .model import Server, Settings
+from .mods import conflicts, list_client_mods
 
 APP_ID = "com.powder.LinuxLauncher"
 
@@ -92,9 +98,22 @@ class LauncherWindow:
         Adw, Gtk = self.Adw, self.Gtk
         page = Adw.PreferencesPage()
 
+        d = game.detect(self.s.wine_prefix, self.s.proton)
+        g_game = Adw.PreferencesGroup(title="Game",
+                                      description="Found automatically; nothing to set up unless something is missing")
+        for title, value in (("Ubisoft Connect", d.connect_exe if d.prefix else ""),
+                             ("Proton", d.proton or "umu's default Proton"), ("umu-run", d.umu)):
+            row = Adw.ActionRow(title=title, subtitle=self.GLib.markup_escape_text(value or "not found"))
+            icon = Gtk.Image.new_from_icon_name("emblem-ok-symbolic" if value else "dialog-warning-symbolic")
+            row.add_suffix(icon)
+            g_game.add(row)
+        for p in d.problems:
+            g_game.add(Adw.ActionRow(title="Problem", subtitle=self.GLib.markup_escape_text(p)))
+        page.add(g_game)
+
         g_server = Adw.PreferencesGroup(title="Server")
         self.impl_row = Adw.ComboRow(title="Server implementation",
-                                     subtitle="Python is tested; Rust is the in-progress port")
+                                     subtitle="Rust is the default; Python is the reference implementation")
         model = Gtk.StringList()
         for v in ("python", "rust"):
             model.append(v)
@@ -110,8 +129,12 @@ class LauncherWindow:
         g_server.add(self.overlay_row)
         page.add(g_server)
 
-        g_steep = Adw.PreferencesGroup(title="Steep folder",
-                                       description="Leave empty to autodetect the newest steep.exe in the prefix")
+        g_steep = Adw.PreferencesGroup(title="Overrides (optional)",
+                                       description="Leave empty: detected automatically")
+        self.prefix_row = Adw.EntryRow(title="Wine prefix")
+        self.prefix_row.set_text(self.s.wine_prefix)
+        self.prefix_row.connect("changed", self._on_prefix)
+        g_steep.add(self.prefix_row)
         self.steep_row = Adw.EntryRow(title="POWDER_STEEP_DIR")
         self.steep_row.set_text(self.s.steep_dir)
         self.steep_row.connect("changed", self._on_steep)
@@ -122,13 +145,10 @@ class LauncherWindow:
         g_steep.add(self.steep_row)
         page.add(g_steep)
 
-        g_cmd = Adw.PreferencesGroup(title="Game command",
-                                     description="What powder-wrap runs (e.g. the Lutris launch command)")
-        self.cmd_row = Adw.EntryRow(title="Command")
+        self.cmd_row = Adw.EntryRow(title="Game command (instead of Ubisoft Connect via umu-run)")
         self.cmd_row.set_text(" ".join(self.s.game_command))
         self.cmd_row.connect("changed", self._on_cmd)
-        g_cmd.add(self.cmd_row)
-        page.add(g_cmd)
+        g_steep.add(self.cmd_row)
 
         g_go = Adw.PreferencesGroup()
         launch_btn = Gtk.Button(label="Launch game")
@@ -151,6 +171,10 @@ class LauncherWindow:
 
     def _on_steep(self, row):
         self.s.steep_dir = row.get_text().strip()
+        self._save()
+
+    def _on_prefix(self, row):
+        self.s.wine_prefix = row.get_text().strip()
         self._save()
 
     def _on_cmd(self, row):
@@ -177,7 +201,7 @@ class LauncherWindow:
             do_launch(self.s)
             self._toast("launching the game through powder-wrap...")
         except ValueError as exc:
-            self._error_dialog("Set a game command", str(exc))
+            self._error_dialog("Cannot start the game", str(exc))
         except OSError as exc:
             self._error_dialog("Could not start powder-wrap", str(exc))
 
@@ -189,10 +213,40 @@ class LauncherWindow:
     # --- Mods page ---------------------------------------------------------
     def _mods_page(self):
         from .mods import list_server_mods
-        Adw = self.Adw
+        Adw, Gtk = self.Adw, self.Gtk
         page = Adw.PreferencesPage()
+        self.mods_page = page
+
+        cgroup = Adw.PreferencesGroup(title="Mods for the game",
+                                      description="Loaded into Steep at the next launch. Overlay DLL mods turn the "
+                                                  "overlay on (press Home in-game, Mods tab)")
+        self.client_mods = list_client_mods(self.s.repo)
+        if not self.client_mods:
+            cgroup.set_description("No mods with a game part found under the repo's mods/ folder.")
+        self._client_rows = {}
+        for m in self.client_mods:
+            sub = m.kinds + (" - " + m.description if m.description else "")
+            row = Adw.SwitchRow(title=m.name, subtitle=self.GLib.markup_escape_text(sub))
+            row.set_subtitle_lines(2)
+            if m.status != "ready":
+                btn = Gtk.Button(label="Build" if m.status == "build" else "Generate", valign=Gtk.Align.CENTER)
+                btn.set_tooltip_text("native/build.sh mods" if m.status == "build" else f"mods/{m.name}/generate.sh")
+                btn.connect("clicked", self._on_prepare, m)
+                row.add_suffix(btn)
+            row.set_active(m.name in self.s.client_mods)
+            row.connect("notify::active", self._on_client_toggle, m)
+            cgroup.add(row)
+            self._client_rows[m.name] = row
+        self.conflict_row = Adw.ActionRow(title="Conflict")
+        self.conflict_row.add_css_class("warning")
+        self.conflict_row.set_visible(False)
+        cgroup.add(self.conflict_row)
+        self._show_conflicts()
+        page.add(cgroup)
+
         group = Adw.PreferencesGroup(title="Server mods",
-                                     description="Enabled mods are written to the generated server config")
+                                     description="Lua mods the local server runs (a game mod's server half is "
+                                                 "switched on with it)")
         mods = list_server_mods(self.s.repo)
         if not mods:
             group.set_description("No server mods found under the repo's mods/ folder.")
@@ -214,6 +268,53 @@ class LauncherWindow:
             group.add(row)
         page.add(group)
         return page
+
+    def _on_client_toggle(self, row, _p, m):
+        if row.get_active():
+            if m.name not in self.s.client_mods:
+                self.s.client_mods.append(m.name)
+            if m.dll and not self.s.overlay:
+                self.overlay_row.set_active(True)          # DLL mods run inside the overlay
+                self._toast("overlay turned on: the mod's DLL loads with it")
+            if m.status != "ready":
+                self._toast(f"{m.name}: press {'Build' if m.status == 'build' else 'Generate'} before launching")
+        else:
+            self.s.client_mods = [n for n in self.s.client_mods if n != m.name]
+        self._save()
+        self._show_conflicts()
+
+    def _show_conflicts(self):
+        msgs = conflicts(self.client_mods, self.s.client_mods)
+        self.conflict_row.set_subtitle(self.GLib.markup_escape_text("; ".join(msgs)))
+        self.conflict_row.set_visible(bool(msgs))
+
+    def _on_prepare(self, btn, m):
+        """Run native/build.sh mods or the mod's generate.sh in the background; the button shows progress."""
+        repo = Path(self.s.repo)
+        cmd = [str(repo / "native" / "build.sh"), "mods"] if m.status == "build" else \
+            [str(repo / "mods" / m.name / "generate.sh")]
+        btn.set_sensitive(False)
+        btn.set_label("Working...")
+        log = repo / "data" / "logs" / f"launcher-{m.name}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+
+        def work():
+            with open(log, "w") as fh:
+                rc = subprocess.run(cmd, cwd=repo, stdout=fh, stderr=subprocess.STDOUT).returncode
+            self.GLib.idle_add(done, rc)
+
+        def done(rc):
+            if rc == 0:
+                btn.set_visible(False)
+                self._toast(f"{m.name}: ready")
+                m.status = "ready"
+            else:
+                btn.set_sensitive(True)
+                btn.set_label("Retry")
+                self._toast(f"{m.name}: failed, see {log}")
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_mod_toggle(self, row, _p, name: str):
         if row.get_active():

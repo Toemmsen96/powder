@@ -57,8 +57,12 @@ class Settings:
     server_impl: str = "rust"                              # "rust" | "python"
     overlay: bool = False
     steep_dir: str = ""                                    # POWDER_STEEP_DIR override ("" = autodetect)
-    game_command: list[str] = field(default_factory=list)  # the command powder-wrap wraps; [] = not set
+    game_command: list[str] = field(default_factory=list)  # the command powder-wrap wraps; [] = detected (game.py)
     enabled_mods: list[str] = field(default_factory=list)  # server mod names ([] = none; "*" = all)
+    client_mods: list[str] = field(default_factory=list)   # mods for the player's game (POWDER_CLIENT_MODS), in order
+    wine_prefix: str = ""                                  # "" = detected (Lutris' Ubisoft Connect entry, ~/Games)
+    proton: str = ""                                       # PROTONPATH; "" = the prefix's version file
+    imported_lutris: bool = False                          # Lutris' POWDER_* settings were taken over once
     servers: list[Server] = field(default_factory=list)
     selected_server: int = 0
 
@@ -83,6 +87,10 @@ class Settings:
             steep_dir=str(data.get("steep_dir", "")),
             game_command=[str(x) for x in data.get("game_command", [])],
             enabled_mods=[str(x) for x in data.get("enabled_mods", [])],
+            client_mods=[str(x) for x in data.get("client_mods", [])],
+            wine_prefix=str(data.get("wine_prefix", "")),
+            proton=str(data.get("proton", "")),
+            imported_lutris=bool(data.get("imported_lutris", False)),
             servers=servers,
             selected_server=int(data.get("selected_server", 0)),
         )
@@ -97,6 +105,10 @@ class Settings:
             f"steep_dir = {_esc(self.steep_dir)}",
             f"game_command = {_array(self.game_command)}",
             f"enabled_mods = {_array(self.enabled_mods)}",
+            f"client_mods = {_array(self.client_mods)}",
+            f"wine_prefix = {_esc(self.wine_prefix)}",
+            f"proton = {_esc(self.proton)}",
+            f"imported_lutris = {'true' if self.imported_lutris else 'false'}",
             f"selected_server = {int(self.selected_server)}",
         ]
         for s in self.servers:

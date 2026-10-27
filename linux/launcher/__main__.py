@@ -10,7 +10,8 @@ import sys
 
 from . import launch as launch_mod
 from .model import Server, Settings
-from .mods import list_server_mods
+from . import game
+from .mods import conflicts, list_client_mods, list_server_mods
 
 
 def _print_settings(s: Settings) -> None:
@@ -20,6 +21,9 @@ def _print_settings(s: Settings) -> None:
     print(f"steep_dir:       {s.steep_dir or '(autodetect)'}")
     print(f"game_command:    {s.game_command or '(not set)'}")
     print(f"enabled_mods:    {s.enabled_mods or '(none)'}")
+    print(f"client_mods:     {s.client_mods or '(none)'}")
+    print(f"wine_prefix:     {s.wine_prefix or '(detect)'}")
+    print(f"proton:          {s.proton or '(detect)'}")
     print(f"selected_server: {s.selected_server}")
     if s.servers:
         print("servers:")
@@ -59,6 +63,75 @@ def cmd_disable_mod(s: Settings, args) -> int:
         s.enabled_mods = [m for m in s.enabled_mods if m != args.name]
         s.save()
     print(f"disabled mod: {args.name}")
+    return 0
+
+
+def cmd_detect(s: Settings, _args) -> int:
+    d = game.detect(s.wine_prefix, s.proton)
+    print(f"prefix:  {d.prefix or '(not found)'}")
+    print(f"connect: {d.connect_exe or '-'}")
+    print(f"proton:  {d.proton or '(umu default)'}")
+    print(f"umu-run: {d.umu or '(not installed)'}")
+    if d.lutris:
+        print(f"lutris:  {d.lutris.config} ({d.lutris.name}); its Powder env: "
+              + (", ".join(f"{k}={v}" for k, v in d.lutris.env.items() if k.startswith("POWDER_")) or "none"))
+    for p in d.problems:
+        print(f"problem: {p}")
+    return 1 if d.problems else 0
+
+
+def cmd_list_client_mods(s: Settings, _args) -> int:
+    mods = list_client_mods(s.repo)
+    for m in mods:
+        on = "on " if m.name in s.client_mods else "off"
+        need = {"ready": "", "build": " (needs: native/build.sh mods)",
+                "generate": f" (needs: mods/{m.name}/generate.sh)"}[m.status]
+        print(f"[{on}] {m.name} [{m.kinds}]{need}" + (f" - {m.description}" if m.description else ""))
+    for c in conflicts(mods, s.client_mods):
+        print(f"warning: {c}")
+    return 0
+
+
+def cmd_enable_client_mod(s: Settings, args) -> int:
+    known = {m.name for m in list_client_mods(s.repo)}
+    if args.name not in known:
+        print(f"no client mod named {args.name} (see list-client-mods)", file=sys.stderr)
+        return 2
+    if args.name not in s.client_mods:
+        s.client_mods.append(args.name)
+        s.save()
+    print(f"enabled client mod: {args.name}")
+    return 0
+
+
+def cmd_disable_client_mod(s: Settings, args) -> int:
+    if args.name in s.client_mods:
+        s.client_mods = [m for m in s.client_mods if m != args.name]
+        s.save()
+    print(f"disabled client mod: {args.name}")
+    return 0
+
+
+def cmd_set_prefix(s: Settings, args) -> int:
+    s.wine_prefix = args.path
+    s.save()
+    print(f"wine_prefix: {s.wine_prefix or '(detect)'}")
+    return 0
+
+
+def cmd_install_desktop(s: Settings, _args) -> int:
+    """Put the launcher into the desktop's application menu (~/.local/share/applications), pointing at this repo."""
+    import os
+    from pathlib import Path
+    src = Path(s.repo) / "linux" / "powder-launcher.desktop"
+    exe = Path(s.repo) / "linux" / "powder-launcher"
+    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "applications"
+    base.mkdir(parents=True, exist_ok=True)
+    lines = [ln for ln in src.read_text(encoding="utf-8").splitlines() if not ln.startswith("#")]
+    lines = [f'Exec="{exe}"' if ln.startswith("Exec=") else ln for ln in lines]
+    out = base / "powder-launcher.desktop"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"added to the application menu: {out}")
     return 0
 
 
@@ -118,7 +191,13 @@ def cmd_set_game_command(s: Settings, args) -> int:
     return 0
 
 
-def cmd_launch(s: Settings, _args) -> int:
+def cmd_launch(s: Settings, args) -> int:
+    if args.dry_run:
+        env = launch_mod.build_env(s)
+        for k in sorted(env):
+            print(f"{k}={env[k]}")
+        print(" ".join(launch_mod.build_command(s)))
+        return 0
     try:
         proc = launch_mod.launch(s)
     except ValueError as exc:
@@ -177,7 +256,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("cmd", nargs=argparse.REMAINDER, help="the command and its arguments")
     sp.set_defaults(func=cmd_set_game_command)
 
-    sub.add_parser("launch", help="launch the game through powder-wrap").set_defaults(func=cmd_launch)
+    sub.add_parser("detect", help="show the detected prefix, Proton and umu-run").set_defaults(func=cmd_detect)
+    sub.add_parser("list-client-mods", help="list mods for the game and their status").set_defaults(
+        func=cmd_list_client_mods)
+    sp = sub.add_parser("enable-client-mod", help="load a client mod in the game")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_enable_client_mod)
+    sp = sub.add_parser("disable-client-mod", help="stop loading a client mod")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_disable_client_mod)
+    sub.add_parser("install-desktop", help="add the launcher to the application menu").set_defaults(
+        func=cmd_install_desktop)
+    sp = sub.add_parser("set-prefix", help='set the Wine prefix ("" = detect)')
+    sp.add_argument("path")
+    sp.set_defaults(func=cmd_set_prefix)
+
+    sp = sub.add_parser("launch", help="launch the game through powder-wrap")
+    sp.add_argument("--dry-run", action="store_true", help="print the environment and command, start nothing")
+    sp.set_defaults(func=cmd_launch)
     return p
 
 
@@ -187,6 +283,11 @@ def main(argv: "list[str] | None" = None) -> int:
         from . import gui
         return gui.self_test()
     settings = Settings.load()
+    if launch_mod.import_lutris(settings, game.detect(settings.wine_prefix, settings.proton).lutris):
+        settings.save()
+    elif not settings.imported_lutris:
+        settings.imported_lutris = True
+        settings.save()
     if args.cmd is None or args.gui:
         return cmd_gui(settings, args)
     return args.func(settings, args)

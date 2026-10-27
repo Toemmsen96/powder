@@ -155,7 +155,15 @@ Python server.
 `linux/powder-wrap` runs Ubisoft Connect and Steep against Powder for one session and changes nothing on
 the system. With it Ubisoft Connect **and** Steep are fully online under Proton.
 
-**Quick start in Lutris:** build the native parts once with `native/build.sh` (TLS helper, overlay, client mods;
+**Easiest: the Linux launcher.** Install Ubisoft Connect once (e.g. with Lutris; Steep in it), build the native
+parts with `native/build.sh` and the Rust server with `cargo build --release`, then run `linux/powder-launcher`
+(`linux/powder-launcher install-desktop` puts it into the application menu). It finds the Wine prefix, the Proton
+build (the prefix's `version` file) and `umu-run` by itself, starts Ubisoft Connect and Steep through powder-wrap,
+and its **Mods** page switches the mods for the game on and off (with a Build/Generate button for mods that need
+it) - no environment variables, no Lutris settings. Settings already in Lutris' environment are taken over once.
+Details: [Linux launcher](#linux-launcher).
+
+**Or in Lutris:** build the native parts once with `native/build.sh` (TLS helper, overlay, client mods;
 needs a MinGW-w64 cross compiler) and the Rust server with `cargo build --release`. Then Configure the game
 (Steep, and Ubisoft Connect if you start it on its own) > System options (show advanced options) > **Command
 prefix**: `/path/to/powder/linux/powder-wrap`. Close Ubisoft Connect first, and don't run another Powder server
@@ -194,9 +202,14 @@ The server's output goes to `$XDG_RUNTIME_DIR/powder-wrap.log` (without `XDG_RUN
 ### Linux launcher
 
 `linux/powder-launcher` is a small GTK4/Libadwaita app that drives all of this from a window instead of
-environment variables: it picks the server implementation (`python` or `rust`), toggles the in-game overlay,
-chooses which server mods are enabled, manages your list of Powder servers (a name and a Join address
-`host#<fingerprint>`), and launches Steep - through `linux/powder-wrap`, so everything above still holds.
+environment variables: it finds the game (Wine prefix with Ubisoft Connect from Lutris' config or `~/Games`, the
+Proton named in the prefix's `version` file, `umu-run`) and starts it, picks the server implementation (`python`
+or `rust`), toggles the in-game overlay, chooses the **mods for the game** (overlay DLLs, asset mods, session
+steps; with their status, a Build/Generate button, and a warning when two change the same entries) and the
+server mods (a game mod's server half follows it), manages your list of Powder servers (a name and a Join
+address `host#<fingerprint>`; joining another server is not done yet), and launches Steep - through
+`linux/powder-wrap`, so everything above still holds. Its server config is `config.launcher.toml`, your
+`config.toml` with the launcher's mod choice.
 Run it with no arguments for the GUI:
 
 ```
@@ -206,8 +219,8 @@ linux/powder-launcher
 <details>
 <summary><b>Command line, requirements, desktop entry</b></summary>
 
-The same wrapper is also a command line for the parts you want to script (`linux/powder-launcher list-mods`,
-`linux/powder-launcher launch`, and so on). It runs the Python package in `linux/launcher` with the repo's
+The same wrapper is also a command line for the parts you want to script (`detect`, `list-client-mods`,
+`enable-client-mod NAME`, `launch [--dry-run]`, `list-mods`, `install-desktop`, and so on). It runs the Python package in `linux/launcher` with the repo's
 `.venv` if there is one, else `uv`, else the system `python3`; the GUI needs PyGObject with GTK 4 and
 Libadwaita installed (on Arch: `python-gobject gtk4 libadwaita`). `linux/powder-launcher.desktop` is a desktop
 entry for a menu or launcher - edit its `Exec=` to the absolute path of `linux/powder-launcher`. The overlay
