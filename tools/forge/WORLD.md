@@ -174,8 +174,9 @@ ordinary entities and groups.
   between id + 1 and id + 77), patch-era edits add a second block elsewhere (C on samples).
 - An instance **owns** its id and its nested objects' ids: every id-like u64 (2^32..2^42) followed by a known
   object class (`OBJECT_CLASSES`, 82 classes learned from the own-id blocks of ~6,000 cells of the four maps) and
-  not a resource of the datafile (those are links). On the first 3,000 Alps cells this finds no id owned by two
-  different instances (C on that sample; ids repeat only where the same object is listed in several cells).
+  not a resource of the datafile (those are links). Over all 18,246 Alps cells this finds 732,837 owned ids and none
+  owned by two different instances (C; ids repeat only where the same object is listed in several cells, 490
+  objects, mostly scatter rules and packed instances).
 - A **copy** gets the block `0x1F0_0000_0000 + (cell index << 20) + (copy number << 12)` and keeps the order of
   its original's ids (`--id`, `--copy-no` override). Every occurrence of an owned id in the payload is replaced, so
   internal links follow; links to resources (prop, shapes, materials) stay. `edit` refuses a block that clashes with
