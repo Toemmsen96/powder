@@ -436,8 +436,10 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
           last=$now
           sleep 0.5
       done ) &
+    vlog=$!
     "$@"
     rc=$?
+    kill "$vlog" 2>/dev/null
     exit $rc
     ;;
 esac
