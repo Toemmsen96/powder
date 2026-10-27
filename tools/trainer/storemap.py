@@ -119,7 +119,9 @@ def item_list(mem, pid: int) -> list[dict]:
       -0x30 itemId  -0x28 spaceId  -0x20 type ("GEAR", "PROGRESSION_TOKEN", ...)  -0x18 nameId (the game object's
       name: how the game ties the GUID to its object)    (each a pointer to a string element: string at +0x10)
       -0x10 u32 ?, u32 revision   -0x08 u32 ?, u32 date (day << 24 | month << 16 | year)
-      +0x00 u64 0x320D000E   +0x08 tags: vector of pointers to string elements   +0x40 obj (JSON)
+      +0x00 u64 0x320D000E   +0x08 tags: vector of pointers to string elements   +0x40 obj (a cJSON tree, read by
+      json_tree; e.g. {"gameId": 1017655268344, "Token": 0, "price": 56000}: gameId is the game object's resource id,
+      the link from the GUID to the object)
     Returns {itemId, spaceId, type, nameId, revision, lastModified, tags} per item, in memory order."""
 
     def read(a: int, n: int) -> bytes | None:
@@ -140,6 +142,31 @@ def item_list(mem, pid: int) -> list[dict]:
             return None
         b = read(struct.unpack_from("<Q", rec)[0], size)
         return b.decode("latin1") if b is not None and len(b) == size else None
+
+    def json_tree(a: int, depth: int = 0):
+        """A cJSON node (0x58 bytes: next, prev, child, type, valuestring, valueint, valuedouble; its key inline at
+        +0x40, or a pointer there when longer): (key, value)."""
+        b = read(a, 0x58)
+        if not b or len(b) < 0x58 or depth > 8:
+            raise ValueError("unreadable JSON node")
+        child, typ = struct.unpack_from("<Q", b, 0x10)[0], struct.unpack_from("<I", b, 0x18)[0] & 0xFF
+        raw = b[0x40:0x58].split(b"\0")[0]
+        if len(raw) >= 15 or not raw.isascii():
+            raw = (read(struct.unpack_from("<Q", b, 0x40)[0], 128) or b"").split(b"\0")[0]
+        key = raw.decode("latin1")
+        if typ in (5, 6):
+            items, c = [], child
+            while c and len(items) < 256:
+                items.append(json_tree(c, depth + 1))
+                c = struct.unpack_from("<Q", read(c, 8), 0)[0]
+            return key, ({k: v for k, v in items} if typ == 6 else [v for _, v in items])
+        if typ == 3:
+            v = struct.unpack_from("<d", b, 0x30)[0]
+            return key, int(v) if v.is_integer() else v
+        if typ == 4:
+            p = struct.unpack_from("<Q", b, 0x20)[0]
+            return key, (read(p, 512) or b"").split(b"\0")[0].decode("latin1") if p else ""
+        return key, {0: False, 1: True}.get(typ)
 
     out, seen = [], set()
     key = np.uint64(ITEM_RECORD)
@@ -164,11 +191,15 @@ def item_list(mem, pid: int) -> list[dict]:
             if any(t is None for t in tags):
                 continue
             _, revision, _, date = struct.unpack_from("<IIII", buf, o - 0x10)
+            try:
+                obj = json_tree(struct.unpack_from("<Q", buf, o + 0x40)[0])[1] if o + 0x48 <= len(buf) else {}
+            except (ValueError, struct.error):
+                obj = {}
             seen.add(item_id)
             out.append({"itemId": item_id, "spaceId": space, "type": fields[2] or "", "nameId": fields[3] or "",
                         "revision": revision,
                         "lastModified": f"{date & 0xFFFF:04d}-{(date >> 16) & 0xFF:02d}-{date >> 24:02d}T00:00:00.000Z",
-                        "tags": tags})
+                        "tags": tags, "obj": obj if isinstance(obj, dict) else {}})
     return out
 
 

@@ -212,9 +212,11 @@ master_chief's entries.
    type PROGRESSION_TOKEN (an entry of the game's own list); a custom entry is a copy of a similar GEAR entry.
    TRIED 2026-10-27: the game downloads and caches the list, then logs out (DE-010-02, offline mode) within half a
    second - also when it builds the catalogue from that cached copy (same fingerprint, no download), so the content
-   is refused, not the transfer. Lead: every item was sent with `obj: {}`, but the game's own records hold a
-   non-empty obj (a JSON object with several members at record +0x40; possibly the link to the game object, the
-   store code mentions `gameId`): read it from the running game (online, original list) and send it per item.
+   is refused, not the transfer. Cause: every item was sent with `obj: {}`. The game's records hold obj as a cJSON
+   tree: `{"gameId": <the object's resource id>, "Token": 0, "price": <credits>}` (e.g. COSTUME_M_MILITARY_GREY_94:
+   gameId 1017655268344 = 0xecf0fb13f8, price 56000) - **gameId is the link from the GUID to the game object**, not
+   nameId. storemap.py --item-list now reads obj (3,830 of 3,840 items have a gameId); itemlist.py --id sets the
+   custom item's gameId (price 0). Next try: the list with real objs + COSTUME_MF_POWDER_MASTER_CHIEF.
    If the game takes a custom list it replaces its cached copy: keep serving a list from then on (without the file
    the server sends Ubisoft's fingerprint, the game downloads, and the empty reply logs it out), or restore the
    backed-up cache folder.
