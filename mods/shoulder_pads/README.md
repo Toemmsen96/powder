@@ -1,6 +1,6 @@
 # shoulder_pads: new geometry from a glTF (Blender) file
 
-This mod tests whether the game draws **new geometry with its own bone weights**. It adds two orange shoulder pads
+This mod shows that the game draws **new geometry with its own bone weights** (confirmed in-game). It adds two orange shoulder pads
 to the default male rider's jacket, `STP_M_Jacket_001`, which the menu rider (Freerider M, item `JACKET_M_N_001`)
 wears. The jacket keeps every vertex it had. Each pad is a flattened ellipsoid of 220 vertices and 400 triangles,
 added to the jacket's submesh in all 4 LODs and bound 100 % to the upper-arm helper bone of its side

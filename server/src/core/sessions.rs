@@ -70,6 +70,8 @@ pub fn ubi_shaped_ticket(app_id: &str, session_id: &str) -> String {
 pub trait NexChannel: Send + Sync {
     /// -> the call id used.
     fn send_request(&self, protocol: &str, method: &str, params: &[u8], call_id: Option<u32>) -> u32;
+    /// Close the connection (a kick).
+    fn disconnect(&self) {}
 }
 
 /// A player's live connections; kept across a re-login (the new session shares them).
@@ -103,6 +105,14 @@ impl Channels {
 
     pub fn nex(&self) -> Option<Arc<dyn NexChannel>> {
         self.nex.lock().clone()
+    }
+
+    /// Close them all (a kick): websockets are told by their queue closing, the NEX connection by disconnect.
+    pub fn close(&self) {
+        self.websockets.lock().clear();
+        if let Some(nex) = self.nex.lock().take() {
+            nex.disconnect();
+        }
     }
 
     /// Forget the NEX connection if it is this one (a later login may have replaced it); -> whether it was.
@@ -152,14 +162,51 @@ struct Maps {
     by_player: HashMap<String, Arc<PlayerSession>>,
 }
 
-#[derive(Default)]
+/// Kick notices waiting for a slow receiver; beyond this the oldest are lost (a receiver then sees Lagged).
+const KICK_QUEUE: usize = 64;
+
 pub struct SessionRegistry {
     maps: Mutex<Maps>,
+    /// Profile ids kicked: Ubisoft Connect's demux connections listen (they hold no channel here).
+    kicks: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self { maps: Mutex::default(), kicks: tokio::sync::broadcast::channel(KICK_QUEUE).0 }
+    }
 }
 
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Kicked players' profile ids (lower-case), as they are kicked.
+    pub fn subscribe_kicks(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.kicks.subscribe()
+    }
+
+    /// End every session of a player and close their connections (game, websockets, Ubisoft Connect's demux);
+    /// -> whether they had a session.
+    pub fn kick(&self, profile_id: &str) -> bool {
+        let pid = profile_id.to_lowercase();
+        let channels: Vec<Arc<Channels>> = {
+            let m = self.maps.lock();
+            let mut all: Vec<Arc<Channels>> = vec![];
+            for s in m.by_ticket.values().chain(m.by_player.get(&pid)).filter(|s| s.profile_id() == pid) {
+                if !all.iter().any(|c| Arc::ptr_eq(c, &s.channels)) {
+                    all.push(s.channels.clone());
+                }
+            }
+            all
+        };
+        self.drop_player(&pid);
+        for c in &channels {
+            c.close();
+        }
+        let _ = self.kicks.send(pid); // no receiver: no Connect is connected
+        !channels.is_empty()
     }
 
     /// A new session (and ticket) for a player. `app_id` (Ubisoft Connect's) makes it a Connect session with a
@@ -279,6 +326,41 @@ mod tests {
 
     fn player(pid: &str) -> Player {
         Player { profile_id: pid.into(), user_id: pid.into(), name: format!("P-{pid}") }
+    }
+
+    #[derive(Default)]
+    struct Nex(std::sync::atomic::AtomicBool);
+    impl NexChannel for Nex {
+        fn send_request(&self, _: &str, _: &str, _: &[u8], _: Option<u32>) -> u32 {
+            0
+        }
+        fn disconnect(&self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn kick_ends_sessions_and_closes_connections() {
+        let r = SessionRegistry::new();
+        let game = r.issue(player("a"), "10.0.0.1", "");
+        let connect = r.issue(player("a"), "10.0.0.1", "connect-app");
+        let other = r.issue(player("b"), "10.0.0.2", "");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        connect.channels.add_websocket(tx);
+        let nex = Arc::new(Nex::default());
+        game.channels.set_nex(Some(nex.clone()));
+        let mut kicks = r.subscribe_kicks();
+        assert!(r.kick("A"));
+        assert!(r.by_token(&game.ticket).is_none() && r.by_token(&connect.ticket).is_none());
+        assert!(r.for_player("a").is_none());
+        assert!(nex.0.load(Ordering::Relaxed), "the game's connection was told to close");
+        assert!(game.channels.nex().is_none());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)),
+                "the websocket's queue closed: its task closes the socket");
+        assert_eq!(kicks.try_recv().unwrap(), "a");
+        assert!(r.by_token(&other.ticket).is_some(), "others stay");
+        assert!(!r.kick("a"), "nothing left");
+        assert_eq!(kicks.try_recv().unwrap(), "a", "noticed anyway (a Connect without a session)");
     }
 
     #[test]

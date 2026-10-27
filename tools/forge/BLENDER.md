@@ -139,9 +139,8 @@ have no armature.
   the same; the only ones left out are 35 heads (format 1) and 3 scarves (format 3).
 - **Renders:** the jacket rendered in Blender with the embedded texture shows the panels where they belong.
 
-**Not yet seen in the game:** a rebuilt topology with explicit weights (`mods/shoulder_pads` is that test), and
-added bones or a grown bone map (no mod tests them yet). Only same-topology edits are confirmed in-game
-(`mods/mesh_edit`).
+**Seen in the game:** same-topology edits (`mods/mesh_edit`) and a rebuilt topology with explicit weights
+(`mods/shoulder_pads`). **Not yet seen:** added bones or a grown bone map (no mod tests them yet).
 
 ## Still open
 

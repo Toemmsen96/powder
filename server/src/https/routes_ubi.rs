@@ -969,6 +969,43 @@ mod tests {
         st
     }
 
+    /// Bans and the whitelist (services/access.rs) at sign-in and for tickets already handed out.
+    #[test]
+    fn banned_players_are_kept_out() {
+        let (st, _) = with_player();
+        register(&st, "rider@example.com", "Rider");
+        let r = connect_login(&st, &basic("rider@example.com", PASSWORD));
+        assert_eq!(r.status, 200);
+        let (pid, ticket) = (body(&r)["profileId"].as_str().unwrap().to_string(), body(&r)["ticket"].as_str().unwrap().to_string());
+        assert!(st.accounts.session_for_ticket(&ticket, "127.0.0.1").unwrap().is_some());
+        assert_eq!(game_login(&st).status, 200, "the game follows Connect's sign-in");
+
+        st.accounts.access.ban_player(&pid, "griefing", None, "test").unwrap().unwrap();
+        assert!(st.accounts.session_for_ticket(&ticket, "127.0.0.1").unwrap().is_none(), "a ticket from before");
+        let r = connect_login(&st, &basic("rider@example.com", PASSWORD));
+        assert_eq!((r.status, body(&r)["message"].as_str()), (401, Some("Invalid credentials")));
+        assert_eq!(game_login(&st).status, 401);
+        // the launcher says why
+        let mut launcher = req("POST", "/_powder/account/login", &[("Content-Type", "application/json")]);
+        launcher.body = crate::util::dumps(&json!({"email": "rider@example.com", "password": PASSWORD})).into();
+        let r = handle(&st, &launcher);
+        assert_eq!((r.status, body(&r)["error"].as_str()), (400, Some("You are banned from this server: griefing")));
+
+        st.accounts.access.unban_player(&pid, "test").unwrap();
+        st.accounts.access.set_whitelist(true, "test").unwrap();
+        assert_eq!(connect_login(&st, &basic("rider@example.com", PASSWORD)).status, 401);
+        st.accounts.access.allow(&pid, "test").unwrap();
+        assert_eq!(connect_login(&st, &basic("rider@example.com", PASSWORD)).status, 200);
+
+        // an address ban also stops registrations from there
+        st.accounts.access.ban_address("127.0.0.0/8", "", None, "test").unwrap().unwrap();
+        assert_eq!(connect_login(&st, &basic("rider@example.com", PASSWORD)).status, 401);
+        let mut reg = req("POST", "/_powder/account/register", &[("Content-Type", "application/json")]);
+        reg.body = crate::util::dumps(&json!({"email": "new@example.com", "password": PASSWORD, "name": "New"})).into();
+        let r = handle(&st, &reg);
+        assert_eq!((r.status, body(&r)["error"].as_str()), (400, Some("Your address is banned from this server")));
+    }
+
     #[test]
     fn failed_sign_ins_are_rate_limited() {
         let st = limited(3);

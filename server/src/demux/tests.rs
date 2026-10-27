@@ -412,3 +412,29 @@ fn built_in_owned_games_list_steep_for_both_versions() {
         .map(|p| match p.1 { V::Bytes(b) => b, _ => panic!() }).collect();
     assert_eq!(got, expected, "byte for byte the built-in entries");
 }
+
+/// A kick closes the kicked player's Connect; a kick of someone else leaves it alone, also while a message is
+/// arriving (the read is not cut midway).
+#[tokio::test]
+async fn a_kick_closes_the_players_connect() {
+    let f = fixture();
+    let mut c = Client::connect(&f.deps, 50010);
+    c.request(1, 2, vec![F::msg(1, vec![F::str(3, "any-ticket")]), F::str(2, "uplay_pc")]).await;
+    let me = f.deps.accounts.default_profile_id().unwrap();
+    // half a message, a kick of another player, then the rest
+    let msg = pb::frame(&pb::encode(&[F::msg(1, vec![F::int(1, 9), F::msg(6, vec![F::str(1, "nope_service"),
+                                                                                F::bytes(2, b"")])])]));
+    let (head, rest) = msg.split_at(5);
+    c.io.write_all(head).await.unwrap();
+    tokio::task::yield_now().await;
+    f.deps.accounts.sessions.kick("someone-else");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    c.io.write_all(rest).await.unwrap();
+    assert_eq!(hex::encode(c.recv_raw().await), PYTHON_UNKNOWN_SERVICE, "still healthy");
+    f.deps.accounts.sessions.kick(&me.to_uppercase());
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), c.io.read(&mut buf)).await.expect("closed").unwrap();
+    assert_eq!(n, 0, "the server closed the connection");
+    c.server.await.unwrap().unwrap();
+    assert!(f.deps.clients.snapshot().is_empty());
+}

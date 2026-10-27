@@ -16,6 +16,16 @@
 //!   api.admin.reset(profile_id)                     wipe the player (an owning account is kept)
 //!   api.admin.notify(profile_id, type, content)     -> sockets reached: a notification on the player's websockets
 //!   api.admin.chat(from, to, text)                  -> message | nil, reason: a Ubisoft Connect chat message
+//!   api.admin.access()                              -> {whitelist, rules = [{kind, value, name, reason, created_at,
+//!                                                   expires, by}]}: bans and the whitelist (services/access.rs)
+//!   api.admin.ban(profile_id, reason, seconds, by)  -> true | nil, reason; seconds nil = until unbanned; kicks
+//!   api.admin.unban(profile_id, by)                 -> whether there was a ban
+//!   api.admin.ban_ip(address, reason, seconds, by)  -> the range banned ("192.0.2.0/24") | nil, reason; kicks
+//!   api.admin.unban_ip(address, by)                 -> whether there was a ban | nil, reason
+//!   api.admin.kick(profile_id, reason)              -> whether they were online (they may sign in again)
+//!   api.admin.set_whitelist(on, by)                 while on, only its players and the admins get in; kicks
+//!   api.admin.allow(profile_id, by), disallow(profile_id): on or off the whitelist
+//!   (players() also says `banned` and `allowed` = on the whitelist)
 //!
 //! Admins are the profile ids in `[server] admins` (ids, not emails or names: players can change those). Mods
 //! are the host's own code, so every mod gets this table; the server only checks the arguments. The services
@@ -24,6 +34,7 @@
 use crate::constants::{CONNECT_SPACE_ID, CREDITS_ITEM};
 use crate::services::stats::{stat_value, Stat, LEVEL_KEY, PROFILE_GROUP, STAT_DOUBLE};
 use crate::mods::SharedDeadline;
+use crate::services::access::{ALLOW_PLAYER, BAN_PLAYER};
 use crate::services::Services;
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde_json::{json, Value as Json};
@@ -124,6 +135,9 @@ pub(crate) fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool, deadl
         let game: BTreeSet<String> = s.sessions.players().iter().filter(|x| x.channels.nex().is_some())
             .map(|x| x.profile_id().to_lowercase()).collect();
         let connect: BTreeSet<String> = s.connect_clients.profile_ids().iter().map(|p| p.to_lowercase()).collect();
+        let rules = s.accounts.access.list().map_err(ext)?;
+        let of = |kind: &str| -> BTreeSet<String> { rules.iter().filter(|r| r.kind == kind).map(|r| r.value.clone()).collect() };
+        let (banned, allowed) = (of(BAN_PLAYER), of(ALLOW_PLAYER));
         let mut out = vec![];
         for p in s.repos.players().map_err(ext)? {
             let pid = &p.profile_id;
@@ -131,7 +145,8 @@ pub(crate) fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool, deadl
             let email = s.repos.account_by_profile(pid).map_err(ext)?.map(|a| a.email);
             out.push(json!({"profile_id": pid, "name": p.name, "email": email, "level": level,
                             "credits": s.economy.credits(pid).map_err(ext)?, "created_at": p.created_at,
-                            "game": game.contains(pid), "connect": connect.contains(pid), "admin": is_admin(&s, pid)}));
+                            "game": game.contains(pid), "connect": connect.contains(pid), "admin": is_admin(&s, pid),
+                            "banned": banned.contains(pid), "allowed": allowed.contains(pid)}));
         }
         lua.to_value(&out)
     })?)?;
@@ -224,8 +239,9 @@ pub(crate) fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool, deadl
         Ok(s.sessions.push_ws(&pid, &kind, lua.from_value(content)?, serde_json::Map::new()))
     })?)?;
 
+    let sl = slot.clone();
     t.set("chat", lua.create_function(move |lua, (from, to, text): (String, String, String)| {
-        let s = services(&slot)?;
+        let s = services(&sl)?;
         let (from, to) = match (known(&s, &from)?, known(&s, &to)?) {
             (Ok(f), Ok(t)) => (f, t),
             (Err(why), _) | (_, Err(why)) => return refused(why),
@@ -237,7 +253,126 @@ pub(crate) fn admin_table(lua: &Lua, slot: ServicesSlot, configured: bool, deadl
             None => refused("could not post".into()),
         }
     })?)?;
+    access_functions(lua, &t, slot)?;
     Ok(t)
+}
+
+/// A duration from Lua: nil = until removed, else whole seconds > 0.
+fn seconds(v: Option<i64>) -> Result<Option<i64>, String> {
+    match v {
+        None => Ok(None),
+        Some(n) if n > 0 => Ok(Some(n)),
+        Some(_) => Err("the duration must be a number of seconds above 0, or nil".into()),
+    }
+}
+
+fn by(who: Option<String>) -> String {
+    who.map(|w| crate::services::access::clean_reason(&w)).filter(|w| !w.is_empty()).unwrap_or_else(|| "a mod".into())
+}
+
+/// Kick whoever a change keeps out, now (the server's sweep would within seconds).
+fn enforce(s: &Services) {
+    if let Err(e) = s.enforce_access() {
+        log::warn!(target: "powder.mods", "applying the access rules failed: {e:#}");
+    }
+}
+
+fn access_functions(lua: &Lua, t: &Table, slot: ServicesSlot) -> mlua::Result<()> {
+    let sl = slot.clone();
+    t.set("access", lua.create_function(move |lua, ()| {
+        lua.to_value(&services(&sl)?.accounts.access.summary().map_err(ext)?)
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("ban", lua.create_function(move |lua, (pid, reason, secs, who): (String, Option<String>, Option<i64>, Option<String>)| {
+        let s = services(&sl)?;
+        let pid = match known(&s, &pid)? {
+            Ok(p) => p,
+            Err(why) => return refused(why),
+        };
+        let secs = match seconds(secs) {
+            Ok(v) => v,
+            Err(why) => return refused(why),
+        };
+        match s.accounts.access.ban_player(&pid, reason.as_deref().unwrap_or(""), secs, &by(who)).map_err(ext)? {
+            Ok(()) => {
+                enforce(&s);
+                ok(lua, &json!(true))
+            }
+            Err(why) => refused(why),
+        }
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("unban", lua.create_function(move |_, (pid, who): (String, Option<String>)| {
+        let s = services(&sl)?;
+        let Some(pid) = profile_id(&pid) else { return Ok(false) };
+        s.accounts.access.unban_player(&pid, &by(who)).map_err(ext)
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("ban_ip", lua.create_function(move |lua, (address, reason, secs, who): (String, Option<String>, Option<i64>, Option<String>)| {
+        let s = services(&sl)?;
+        let secs = match seconds(secs) {
+            Ok(v) => v,
+            Err(why) => return refused(why),
+        };
+        match s.accounts.access.ban_address(&address, reason.as_deref().unwrap_or(""), secs, &by(who)).map_err(ext)? {
+            Ok(range) => {
+                enforce(&s);
+                ok(lua, &json!(range))
+            }
+            Err(why) => refused(why),
+        }
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("unban_ip", lua.create_function(move |lua, (address, who): (String, Option<String>)| {
+        let s = services(&sl)?;
+        match s.accounts.access.unban_address(&address, &by(who)).map_err(ext)? {
+            Ok(had) => ok(lua, &json!(had)),
+            Err(why) => refused(why),
+        }
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("kick", lua.create_function(move |_, (pid, reason): (String, Option<String>)| {
+        let s = services(&sl)?;
+        let Some(pid) = profile_id(&pid) else { return Ok(false) };
+        let reason = crate::services::access::clean_reason(reason.as_deref().unwrap_or(""));
+        // a Connect without a session (signed in before a restart) is closed by the kick notice too
+        let connect = s.connect_clients.profile_ids().iter().any(|p| p.eq_ignore_ascii_case(&pid));
+        let why = if reason.is_empty() { "kicked by an admin".to_string() } else { reason };
+        Ok(s.accounts.access.kick(&pid, &why) || connect)
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("set_whitelist", lua.create_function(move |_, (on, who): (bool, Option<String>)| {
+        let s = services(&sl)?;
+        s.accounts.access.set_whitelist(on, &by(who)).map_err(ext)?;
+        enforce(&s);
+        Ok(true)
+    })?)?;
+
+    let sl = slot.clone();
+    t.set("allow", lua.create_function(move |_, (pid, who): (String, Option<String>)| {
+        let s = services(&sl)?;
+        let pid = match known(&s, &pid)? {
+            Ok(p) => p,
+            Err(why) => return Ok((false, Some(why))),
+        };
+        s.accounts.access.allow(&pid, &by(who)).map_err(ext)?;
+        Ok((true, None))
+    })?)?;
+
+    t.set("disallow", lua.create_function(move |_, pid: String| {
+        let s = services(&slot)?;
+        let Some(pid) = profile_id(&pid) else { return Ok(false) };
+        let had = s.accounts.access.disallow(&pid).map_err(ext)?;
+        enforce(&s);
+        Ok(had)
+    })?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -365,6 +500,50 @@ mod tests {
         let r = post(&st, "/_powder/admin/api/reset", &cookie, json!({"id": rider}));
         assert_eq!(r.status, 200);
         assert_eq!(st.economy.credits(rider).unwrap(), st.config.gameplay.starting_credits);
+    }
+
+    #[test]
+    fn bans_kicks_and_the_whitelist() {
+        let (st, rider) = (server(true), RIDER);
+        let r = sign_in(&st, "admin@example.com");
+        let cookie = header(&r, "set-cookie").unwrap().split(';').next().unwrap().to_string();
+        let get = |path: &str| body(&handle(&st, &req("GET", path, &[("cookie", &cookie)], "")));
+        let session = st.sessions.issue(st.accounts.player(rider).unwrap(), "10.0.0.9", "");
+        let r = post(&st, "/_powder/admin/api/kick", &cookie, json!({"id": rider, "reason": "be nice"}));
+        assert_eq!(body(&r)["result"]["online"], true);
+        assert!(st.sessions.by_token(&session.ticket).is_none(), "the session is gone");
+        assert_eq!(body(&post(&st, "/_powder/admin/api/kick", &cookie, json!({"id": rider})))["result"]["online"], false);
+
+        let session = st.sessions.issue(st.accounts.player(rider).unwrap(), "10.0.0.9", "");
+        let r = post(&st, "/_powder/admin/api/ban", &cookie, json!({"id": rider, "reason": "griefing", "seconds": 3600}));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(st.sessions.by_token(&session.ticket).is_none(), "kicked at once");
+        let access = get("/_powder/admin/api/access");
+        assert_eq!((access["rules"][0]["kind"].as_str(), access["rules"][0]["name"].as_str()),
+                   (Some("ban_player"), Some("Rider")));
+        assert!(access["rules"][0]["by"].as_str().is_some_and(|by| by.starts_with("Boss")), "the admin's name");
+        assert!(access["rules"][0]["expires"].is_i64());
+        assert!(get("/_powder/admin/api/players")["players"].as_array().unwrap().iter()
+                    .any(|p| p["profile_id"] == rider && p["banned"] == true));
+        let r = post(&st, "/_powder/admin/api/ban", &cookie, json!({"id": ADMIN}));
+        assert_eq!(r.status, 400, "not an admin");
+        assert_eq!(body(&post(&st, "/_powder/admin/api/unban", &cookie, json!({"id": rider})))["result"], true);
+
+        let r = post(&st, "/_powder/admin/api/ban_ip", &cookie, json!({"address": "198.51.100.7/24"}));
+        assert_eq!(body(&r)["result"], "198.51.100.0/24");
+        assert_eq!(post(&st, "/_powder/admin/api/ban_ip", &cookie, json!({"address": "nope"})).status, 400);
+        assert_eq!(body(&post(&st, "/_powder/admin/api/unban_ip", &cookie, json!({"address": "198.51.100.0/24"})))
+                       ["result"], true);
+
+        let session = st.sessions.issue(st.accounts.player(rider).unwrap(), "10.0.0.9", "");
+        assert_eq!(post(&st, "/_powder/admin/api/whitelist", &cookie, json!({"on": true})).status, 200);
+        assert!(st.sessions.by_token(&session.ticket).is_none(), "not on the whitelist: kicked");
+        assert_eq!(get("/_powder/admin/api/access")["whitelist"], true);
+        assert_eq!(post(&st, "/_powder/admin/api/allow", &cookie, json!({"id": rider})).status, 200);
+        assert_eq!(st.accounts.access.check(rider, "10.0.0.9").unwrap(), None);
+        assert_eq!(post(&st, "/_powder/admin/api/whitelist", &cookie, json!({"on": false})).status, 200);
+        // the admin's own page keeps working throughout (admins pass the whitelist)
+        assert_eq!(handle(&st, &req("GET", "/_powder/admin/api/players", &[("cookie", &cookie)], "")).status, 200);
     }
 
     struct NoNex;

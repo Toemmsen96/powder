@@ -91,8 +91,33 @@ impl Connection {
     }
 
     async fn serve<S: AsyncRead + AsyncWrite + Unpin>(&mut self, stream: &mut S) -> std::io::Result<()> {
+        let mut kicks = self.deps.accounts.sessions.subscribe_kicks();
+        let mut listening = true;
         loop {
-            let Some(msg) = read_message(stream, &self.peer).await? else { return Ok(()) };
+            let msg = {
+                // a read is not cancelled midway (that would lose bytes of the stream): kick notices are
+                // waited for beside it
+                let read = read_message(stream, &self.peer);
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        msg = &mut read => break msg?,
+                        kick = kicks.recv(), if listening => match kick {
+                            Ok(pid) if self.profile_id.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&pid)) => {
+                                log::info!(target: "powder.demux", "{}: {} was kicked, closing", self.peer,
+                                           self.player_name.as_deref().unwrap_or(&pid));
+                                return Ok(());
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!(target: "powder.demux", "{}: {n} kick notice(s) missed", self.peer);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => listening = false,
+                        },
+                    }
+                }
+            };
+            let Some(msg) = msg else { return Ok(()) };
             let out = self.handle(&msg);
             if !out.is_empty() {
                 for m in out {

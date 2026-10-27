@@ -161,6 +161,51 @@ enum AdminCommand {
     AccountLink { email: String, player: String },
     /// Delete an account (the player and its progress stay).
     AccountDelete { email: String },
+    /// List the bans and the whitelist.
+    Bans,
+    /// Ban a player (profile id, account email or player name); a running server kicks them within seconds.
+    Ban {
+        player: String,
+        /// How long: 30m, 12h, 7d, 2w; default: until unbanned.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Lift a player's ban.
+    Unban { player: String },
+    /// Ban an address or a range (192.0.2.7, 192.0.2.0/24, 2001:db8::/32).
+    BanIp {
+        address: String,
+        /// How long: 30m, 12h, 7d, 2w; default: until unbanned.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Lift an address ban (the same address or range).
+    UnbanIp { address: String },
+    /// Disconnect a player now (the running server does it within seconds); they may sign in again.
+    Kick {
+        player: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// The whitelist: `on`, `off`, `add PLAYER`, `remove PLAYER`, or `list`. While on, only its players (and the
+    /// admins) get in.
+    Whitelist {
+        action: WhitelistAction,
+        player: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum WhitelistAction {
+    On,
+    Off,
+    Add,
+    Remove,
+    List,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -236,6 +281,24 @@ fn admin(cmd: AdminCommand, config: Config) -> Result<()> {
         AdminCommand::Offers { text } => {
             pid(None)?;
             a::offers(&s, &text, out).map(|_| true)
+        }
+        AdminCommand::Bans => a::bans(&s, out).map(|_| true),
+        AdminCommand::Ban { player, duration, reason } => a::ban(&s, &player, duration.as_deref(), &reason, out),
+        AdminCommand::Unban { player } => a::unban(&s, &player, out),
+        AdminCommand::BanIp { address, duration, reason } => {
+            a::ban_ip(&s, &address, duration.as_deref(), &reason, out)
+        }
+        AdminCommand::UnbanIp { address } => a::unban_ip(&s, &address, out),
+        AdminCommand::Kick { player, reason } => a::kick(&s, &player, &reason, out),
+        AdminCommand::Whitelist { action, player } => {
+            let action = match action {
+                WhitelistAction::On => a::Whitelist::On,
+                WhitelistAction::Off => a::Whitelist::Off,
+                WhitelistAction::Add => a::Whitelist::Add,
+                WhitelistAction::Remove => a::Whitelist::Remove,
+                WhitelistAction::List => a::Whitelist::List,
+            };
+            a::whitelist(&s, action, player.as_deref(), out)
         }
         cmd => return accounts_admin(cmd, repos, accounts),
     }?;
@@ -359,6 +422,9 @@ fn trust(action: TrustAction, wine_prefix: Option<PathBuf>, wine: &str, config: 
     Ok(())
 }
 
+/// How often the running server applies bans, the whitelist and the CLI's kicks to who is online.
+const ACCESS_SWEEP_S: u64 = 5;
+
 async fn run(config: Config) -> Result<()> {
     let config = Arc::new(config);
     log::info!(target: "powder", "Powder {} ({}): config {}", version(), config.server.name,
@@ -372,6 +438,21 @@ async fn run(config: Config) -> Result<()> {
     let services = Arc::new(Services::new(config.clone(), assets.clone(), repos.clone(), Some(mods.clone())));
     mods.lock().attach(&services);
     let accounts = services.accounts.clone();
+    // bans and kicks from the admin CLI (another process), expired bans, and players a new ban or the whitelist
+    // now keeps out (services/access.rs)
+    let sweeper = services.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(ACCESS_SWEEP_S));
+        loop {
+            every.tick().await;
+            let s = sweeper.clone();
+            match tokio::task::spawn_blocking(move || s.enforce_access()).await {
+                Ok(Err(e)) => log::warn!(target: "powder.access", "checking who is online failed: {e:#}"),
+                Err(e) => log::warn!(target: "powder.access", "checking who is online failed: {e}"),
+                Ok(Ok(_)) => {}
+            }
+        }
+    });
     let pki = Arc::new(tls::ensure_pki(&config.data_dir().join("tls"))?);
     let s = &config.server;
     let addr = |port: u16| -> Result<SocketAddr> {

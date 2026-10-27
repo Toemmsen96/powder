@@ -3,7 +3,10 @@
 // direction (camera -> rider). Calibration, on a background thread: snapshot every float3 1.5-15 m from the
 // player, then, while the player stands still and the camera turns, keep the points that moved each time at a
 // constant distance (they orbit the player); the position most of them agree on is the camera. Same method as
-// tools/trainer/findcam.py. Reads are fault-safe (ReadProcessMemory on ourselves).
+// tools/trainer/findcam.py. If the rider moves meanwhile, it waits for it to stand still and scans again. All the
+// agreeing copies are kept: when the one in use stops following (frozen while the rider moves on, or far away),
+// the next one that still follows takes over, and only with none left is the camera looked for again. Reads are
+// fault-safe (ReadProcessMemory on ourselves).
 #pragma once
 #include <cstdint>
 #include <string>

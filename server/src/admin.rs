@@ -311,6 +311,138 @@ pub fn format_g(f: f64) -> String {
     }
 }
 
+// ---- access: bans, the whitelist, kicks (services/access.rs) ------------------------------------------------------
+/// A player as an admin types them: profile id, account email or player name.
+fn find(s: &Services, player: &str) -> Result<String> {
+    s.accounts.access.find_player(player)?.with_context(|| format!("no player {player:?} (a profile id, an account's \
+                                                                     email or a player's name)"))
+}
+
+fn duration(text: Option<&str>) -> Result<Option<i64>> {
+    crate::services::access::parse_duration(text.unwrap_or(""))
+        .with_context(|| format!("not a duration: {:?} (e.g. 30m, 12h, 7d, 2w)", text.unwrap_or("")))
+}
+
+fn until(expires: Option<i64>) -> String {
+    expires.map(|t| format!("until {}", crate::services::access::format_time(t))).unwrap_or_else(|| "permanent".into())
+}
+
+const RUNNING: &str = "(a running server applies it within a few seconds)";
+
+pub fn bans(s: &Services, out: &mut dyn Write) -> Result<()> {
+    use crate::services::access::{ALLOW_PLAYER, BAN_IP, BAN_PLAYER};
+    let access = &s.accounts.access;
+    writeln!(out, "whitelist: {}", if access.whitelist_enabled()? { "on" } else { "off" })?;
+    let rules = access.list()?;
+    let name = |pid: &str| -> Result<String> { Ok(s.repos.player(pid)?.map(|p| p.name).unwrap_or_default()) };
+    for r in &rules {
+        let reason = if r.reason.is_empty() { String::new() } else { format!("  {:?}", r.reason) };
+        match r.kind.as_str() {
+            BAN_PLAYER => writeln!(out, "banned   {}  {:16} {}  by {}{reason}", r.value, name(&r.value)?, until(r.expires),
+                                   r.by)?,
+            BAN_IP => writeln!(out, "banned   address {:24} {}  by {}{reason}", r.value, until(r.expires), r.by)?,
+            ALLOW_PLAYER => writeln!(out, "allowed  {}  {:16} by {}", r.value, name(&r.value)?, r.by)?,
+            _ => {}
+        }
+    }
+    if rules.is_empty() {
+        writeln!(out, "no bans, nobody on the whitelist")?;
+    }
+    Ok(())
+}
+
+pub fn ban(s: &Services, player: &str, length: Option<&str>, reason: &str, out: &mut dyn Write) -> Result<bool> {
+    let (pid, seconds) = (find(s, player)?, duration(length)?);
+    match s.accounts.access.ban_player(&pid, reason, seconds, "cli")? {
+        Ok(()) => {
+            let expires = seconds.map(|t| crate::util::unix_now() as i64 + t);
+            writeln!(out, "banned {pid}, {} {RUNNING}", until(expires))?;
+            Ok(true)
+        }
+        Err(why) => {
+            writeln!(out, "{why}")?;
+            Ok(false)
+        }
+    }
+}
+
+pub fn unban(s: &Services, player: &str, out: &mut dyn Write) -> Result<bool> {
+    let pid = find(s, player)?;
+    let had = s.accounts.access.unban_player(&pid, "cli")?;
+    writeln!(out, "{}", if had { format!("lifted the ban of {pid}") } else { format!("{pid} is not banned") })?;
+    Ok(had)
+}
+
+pub fn ban_ip(s: &Services, address: &str, length: Option<&str>, reason: &str, out: &mut dyn Write) -> Result<bool> {
+    let seconds = duration(length)?;
+    match s.accounts.access.ban_address(address, reason, seconds, "cli")? {
+        Ok(range) => {
+            let expires = seconds.map(|t| crate::util::unix_now() as i64 + t);
+            writeln!(out, "banned the address {range}, {} {RUNNING}", until(expires))?;
+            Ok(true)
+        }
+        Err(why) => {
+            writeln!(out, "{why}")?;
+            Ok(false)
+        }
+    }
+}
+
+pub fn unban_ip(s: &Services, address: &str, out: &mut dyn Write) -> Result<bool> {
+    match s.accounts.access.unban_address(address, "cli")? {
+        Ok(true) => writeln!(out, "lifted the ban of {address}")?,
+        Ok(false) => writeln!(out, "{address} is not banned (`admin bans` lists the bans)")?,
+        Err(why) => writeln!(out, "{why}")?,
+    }
+    Ok(true)
+}
+
+pub fn kick(s: &Services, player: &str, reason: &str, out: &mut dyn Write) -> Result<bool> {
+    let pid = find(s, player)?;
+    s.accounts.access.request_kick(&pid, reason)?;
+    writeln!(out, "kick of {pid} requested {RUNNING}")?;
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Whitelist {
+    On,
+    Off,
+    Add,
+    Remove,
+    List,
+}
+
+pub fn whitelist(s: &Services, action: Whitelist, player: Option<&str>, out: &mut dyn Write) -> Result<bool> {
+    let access = &s.accounts.access;
+    let player = |verb: &str| -> Result<String> {
+        find(s, player.with_context(|| format!("whitelist {verb} needs a player"))?)
+    };
+    match action {
+        Whitelist::On => {
+            access.set_whitelist(true, "cli")?;
+            let n = access.list()?.iter().filter(|r| r.kind == crate::services::access::ALLOW_PLAYER).count();
+            writeln!(out, "whitelist on: {n} player(s) and the admins get in {RUNNING}")?;
+        }
+        Whitelist::Off => {
+            access.set_whitelist(false, "cli")?;
+            writeln!(out, "whitelist off: every player gets in (bans still apply)")?;
+        }
+        Whitelist::Add => {
+            let pid = player("add")?;
+            access.allow(&pid, "cli")?;
+            writeln!(out, "{pid} is on the whitelist")?;
+        }
+        Whitelist::Remove => {
+            let pid = player("remove")?;
+            let had = access.disallow(&pid)?;
+            writeln!(out, "{}", if had { format!("{pid} is off the whitelist") } else { format!("{pid} was not on it") })?;
+        }
+        Whitelist::List => return bans(s, out).map(|_| true),
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

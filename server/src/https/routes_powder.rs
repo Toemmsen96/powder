@@ -150,6 +150,10 @@ fn account_call(c: &Ctx, change: Option<Change>) -> Reply {
         None => accounts.register_from(&email, &field(&body, "password"), &field(&body, "name"), &ip),
         Some(change) => accounts.authenticate(&email, &field(&body, "password")).and_then(|account| {
             limiter.succeeded(&ip, &email);
+            // a banned player (or one off the whitelist) learns why here: the launcher shows it
+            if let Some(refusal) = accounts.access.check(&account.profile_id, &ip)? {
+                return Err(AccountError::Account(refusal.message()));
+            }
             change(accounts, account, &body)
         }),
     };

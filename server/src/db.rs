@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (3, include_str!("../migrations/0003_achievements.sql")),
     (4, include_str!("../migrations/0004_accounts.sql")),
     (5, include_str!("../migrations/0005_ugc.sql")),
+    (6, include_str!("../migrations/0006_access.sql")),
 ];
 
 struct Inner {
@@ -136,7 +137,7 @@ mod tests {
     #[test]
     fn migrations_and_nested_transactions() {
         let db = Db::memory().unwrap();
-        assert_eq!(db.migrate().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(db.migrate().unwrap(), vec![1, 2, 3, 4, 5, 6]);
         assert!(db.migrate().unwrap().is_empty());
         let r: Result<()> = db.tx(|| {
             db.execute("INSERT INTO kv(scope, key, value_json) VALUES ('s', 'a', '1')", [])?;
