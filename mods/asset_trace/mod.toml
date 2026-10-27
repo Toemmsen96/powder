@@ -1,0 +1,4 @@
+version = "0.1"
+description = "Shows which game data files Steep reads (overlay Mods tab); logs the reads for tools/forge"
+[client]
+inject = ["asset_trace.dll"]

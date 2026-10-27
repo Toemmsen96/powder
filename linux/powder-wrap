@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# powder-wrap: run Ubisoft Connect / Steep (Wine, Proton, Lutris) against a Powder server, changing nothing
+# on the system. Everything lasts only as long as the wrapped command:
+#
+#   - a private network namespace: the session sees loopback only, so the game and Connect have no network
+#     route out (to Ubisoft or anywhere else) and nothing on the network sees the session. It is not a
+#     sandbox: the session keeps the host's files, so Unix sockets on the filesystem stay reachable (D-Bus,
+#     X11/Wayland, PulseAudio/PipeWire, systemd-resolved: hence the nsswitch.conf below)
+#   - the Ubisoft hostnames point at 127.0.0.1 through a bind-mounted /etc/hosts (and an nsswitch.conf that
+#     resolves names from it only), inside the session only (no /etc/hosts edit, no sysctl: port 443 can be
+#     bound inside the namespace)
+#   - the Powder server runs inside the session and stops with it
+#   - the local CA is added to the Wine prefix's own root store for the session and removed afterwards
+#     (the system's CA store is not touched)
+#
+# Lutris: Configure the game > System options > Command prefix:  /path/to/powder/linux/powder-wrap
+# By hand:   WINEPREFIX=~/Games/ubisoft-connect powder-wrap <command...>
+#
+# Settings (environment): POWDER_CONFIG (default <repo>/config.toml), POWDER_SERVER (rust | python, default
+# rust; without a Rust build it falls back to python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version),
+# POWDER_OVERLAY=1 (the in-game overlay, native/overlay/), POWDER_CLIENT_MODS=name,name (with the overlay: load
+# these client mods of this repo, mods/<name>/client/*.dll built by native/build.sh mods - your choice, nothing
+# loads unless named), POWDER_SKIP_INTRO=0 (keep the Ubisoft/Steep logo videos at start; skipped by default, for
+# the session only: the game's files are not changed).
+# Log: $XDG_RUNTIME_DIR/powder-wrap.log, without XDG_RUNTIME_DIR ${XDG_CACHE_HOME:-~/.cache}/powder/powder-wrap.log.
+# Close Ubisoft Connect before starting: a Connect already running outside the session would be reused.
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+REPO=$(cd "$(dirname "$SELF")/.." && pwd)
+CONFIG=${POWDER_CONFIG:-$REPO/config.toml}
+SERVER=${POWDER_SERVER:-rust}
+# never a fixed name in /tmp (anyone could put a link there first); the inner stages use the outer's
+if [ "${POWDER_WRAP_STAGE:-outer}" != outer ] && [ -n "${POWDER_WRAP_LOG:-}" ]; then
+    LOG=$POWDER_WRAP_LOG
+elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -O "$XDG_RUNTIME_DIR" ]; then
+    LOG=$XDG_RUNTIME_DIR/powder-wrap.log
+else
+    LOG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/powder
+    mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
+    LOG=$LOG_DIR/powder-wrap.log
+fi
+export POWDER_WRAP_LOG=$LOG
+HOSTS=(public-ubiservices.ubi.com msr-public-ubiservices.ubi.com public-im-ubiservices.ubi.com
+       public-ws-ubiservices.ubi.com steep-prod-pc.steep.olympus.ubi.com
+       dmx.upc.ubisoft.com channel-service.upc.ubi.com static3.cdn.ubi.com)
+
+# Lutris does not show a command prefix's output: messages also go to the log, and a failure to the desktop
+say() { printf 'powder-wrap: %s\n' "$*" >&2; printf 'powder-wrap: %s\n' "$*" >> "$LOG" 2>/dev/null || true; }
+die() {
+    say "$*"
+    command -v notify-send >/dev/null && notify-send -a powder-wrap "Powder: the game was not started" "$*" 2>/dev/null
+    exit 1
+}
+
+# [server] https_port from the config (443 if unset or no config)
+https_port() {
+    python3 -I - "$CONFIG" <<'EOF'
+import sys, tomllib
+try:
+    print(tomllib.load(open(sys.argv[1], "rb")).get("server", {}).get("https_port", 443))
+except FileNotFoundError:
+    print(443)
+EOF
+}
+
+# the server's data folder: [server] data_dir, relative to the config file (default data/)
+data_dir() {
+    python3 -I - "$CONFIG" <<'EOF'
+import sys, tomllib, pathlib
+cfg = pathlib.Path(sys.argv[1])
+try:
+    d = tomllib.load(open(cfg, "rb")).get("server", {}).get("data_dir", "data")
+except FileNotFoundError:
+    d = "data"
+print((cfg.parent / d).resolve())
+EOF
+}
+
+# the server to run, into the array SERVER_CMD (a repository path with spaces stays one argument)
+# Steep's folder in the prefix (POWDER_STEEP_DIR, else the newest steep.exe under drive_c): where the game
+# loads version.dll from, so where the TLS-helper proxy goes.
+steep_dir() {
+    if [ -n "${POWDER_STEEP_DIR:-}" ]; then printf '%s' "$POWDER_STEEP_DIR"; return; fi
+    find "$WINEPREFIX/drive_c" -iname steep.exe -printf '%h\n' 2>/dev/null | head -1
+}
+
+# The 32-byte certificate pin (SHA-256 of the server leaf's tbsCertificate) from server.pem, into $2. Needs a
+# Python with the cryptography package (the repo's .venv has it); returns non-zero if none is available.
+tls_pin() {
+    local py
+    for py in "$REPO/.venv/bin/python" python3; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        "$py" - "$1" "$2" 2>/dev/null <<'PYEOF' && return 0
+import sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+certs = x509.load_pem_x509_certificates(open(sys.argv[1], "rb").read())
+def is_ca(c):
+    try:
+        return c.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except x509.ExtensionNotFound:
+        return False
+leaf = next(c for c in certs if not is_ca(c))           # server.pem is key + leaf + CA
+d = hashes.Hash(hashes.SHA256()); d.update(leaf.tbs_certificate_bytes)
+open(sys.argv[2], "wb").write(d.finalize())
+PYEOF
+    done
+    return 1
+}
+
+server_command() {
+    case $SERVER in
+    python)
+        if [ -x "$REPO/.venv/bin/powder-server" ]; then SERVER_CMD=("$REPO/.venv/bin/powder-server")
+        elif command -v uv >/dev/null; then SERVER_CMD=(uv run --frozen --offline --project "$REPO" powder-server)
+        elif python3 -I -c "import aiohttp, cryptography" 2>/dev/null; then SERVER_CMD=(env "PYTHONPATH=$REPO" python3 -m powder.server)
+        else die "no Python server to run: no $REPO/.venv, no uv, and the system python3 lacks aiohttp/cryptography (install uv and run 'uv sync' in $REPO, or POWDER_SERVER=rust)"
+        fi ;;
+    rust)
+        for b in "$REPO/target/release/powder-server" "$REPO/target/debug/powder-server"; do
+            [ -x "$b" ] && { SERVER_CMD=("$b"); return; }
+        done
+        if [ -z "${POWDER_SERVER:-}" ]; then       # the default, not asked for: the Python server instead
+            say "no Rust server built (cargo build --release in $REPO): using the Python server"
+            SERVER=python; server_command; return
+        fi
+        die "no Rust server built (cargo build --release in $REPO)" ;;
+    *) die "POWDER_SERVER must be python or rust, not $SERVER" ;;
+    esac
+}
+
+# The wine the prefix runs with: POWDER_WINE, Proton's (PROTONPATH, as Lutris/umu set it, or the Proton
+# version the prefix records), else wine on PATH.
+find_wine() {
+    [ -n "${POWDER_WINE:-}" ] && { echo "$POWDER_WINE"; return; }
+    [ -n "${PROTONPATH:-}" ] && [ -x "$PROTONPATH/files/bin/wine" ] && { echo "$PROTONPATH/files/bin/wine"; return; }
+    local version
+    version=$(cat "$WINEPREFIX/version" 2>/dev/null || true)
+    if [ -n "$version" ]; then
+        for d in "$HOME/.local/share/Steam/compatibilitytools.d" "$HOME/.steam/root/compatibilitytools.d" \
+                 "$HOME/.local/share/lutris/runners/proton" "$HOME/.local/share/lutris/runners/wine"; do
+            for w in "$d/$version"*/files/bin/wine; do
+                [ -x "$w" ] && { echo "$w"; return; }
+            done
+        done
+    fi
+    command -v wine || die "no wine found for $WINEPREFIX (set POWDER_WINE)"
+}
+
+# .reg adding/naming the CA in the prefix's root store, the layout Wine uses itself (see server/src/trust.rs)
+ca_key() {
+    python3 -I - "$1" <<'EOF'
+import hashlib, ssl, sys
+der = ssl.PEM_cert_to_DER_cert(open(sys.argv[1]).read())
+print(r"HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates" + "\\" + hashlib.sha1(der).hexdigest().upper())
+EOF
+}
+ca_reg() {
+    python3 -I - "$1" "$2" <<'EOF'
+import hashlib, ssl, struct, sys
+der = ssl.PEM_cert_to_DER_cert(open(sys.argv[1]).read())
+prop = lambda i, d: struct.pack("<III", i, 1, len(d)) + d
+blob = prop(3, hashlib.sha1(der).digest()) + prop(0x20, der)
+h = [f"{b:02x}" for b in blob]
+lines = [",".join(h[i:i + 25]) for i in range(0, len(h), 25)]
+sys.stdout.write(f'Windows Registry Editor Version 5.00\r\n\r\n[{sys.argv[2]}]\r\n"Blob"=hex:' + ",\\\r\n  ".join(lines) + "\r\n")
+EOF
+}
+
+case ${POWDER_WRAP_STAGE:-outer} in
+
+outer)  # ---- as the user: check, then enter a new user + mount + network namespace -------------------------
+    : > "$LOG"
+    [ $# -gt 0 ] || die "usage: powder-wrap <command...>   (e.g. as Lutris' command prefix; see the top of $SELF)"
+    [ -n "${WINEPREFIX:-}" ] || die "WINEPREFIX is not set (Lutris sets it; by hand: WINEPREFIX=... powder-wrap ...)"
+    command -v unshare >/dev/null || die "unshare (util-linux) is needed"
+    command -v ip >/dev/null || die "ip (iproute2) is needed"
+    say "session log: $LOG"
+    server_command
+    export POWDER_WRAP_STAGE=net POWDER_WRAP_UID=$(id -u) POWDER_WRAP_GID=$(id -g)
+    exec unshare --user --map-root-user --mount --net --fork -- "$SELF" "$@"
+    ;;
+
+net)    # ---- namespace root: loopback, hosts, the server; then back to the user's id for the command --------
+    ip link set lo up
+    hosts=$(mktemp)
+    { echo "127.0.0.1 localhost"; echo "::1 localhost ip6-localhost"
+      for h in "${HOSTS[@]}"; do echo "127.0.0.1 $h"; done; } > "$hosts"
+    mount --bind "$hosts" /etc/hosts
+    # names from that file only: nss-resolve (Arch's default, before "files") would ask systemd-resolved over
+    # its socket, which the network namespace does not cut off, and get Ubisoft's real addresses
+    nss=$(mktemp)
+    sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
+    mount --bind "$nss" /etc/nsswitch.conf
+    # the logo, loading and disclaimer videos at start (POWDER_SKIP_INTRO=0 keeps them): for this session only,
+    # Steep's videos/ folder is covered by a folder of links to every other video (through a second view of the real
+    # folder, so the links do not point into the cover); the game's files stay as they are
+    vids="" vorig=""
+    vd="$(steep_dir)/videos"
+    if [ "${POWDER_SKIP_INTRO:-1}" = 1 ] && [ -d "$vd" ]; then
+        vids=$(mktemp -d) vorig=$(mktemp -d)
+        mount --bind "$vd" "$vorig"
+        skip_video() {
+            case ${1##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2) return 0 ;;
+                disclaimer.bk2) return 0 ;; esac   # in the language folders (videos/en/, videos/de/, ...)
+            return 1
+        }
+        for f in "$vorig"/*; do
+            skip_video "$f" && continue
+            if [ -d "$f" ]; then   # a language folder: rebuilt link by link, so its disclaimer stays out
+                mkdir "$vids/${f##*/}"
+                for g in "$f"/*; do
+                    skip_video "$g" || ln -s "$g" "$vids/${f##*/}/${g##*/}"
+                done
+            else
+                ln -s "$f" "$vids/${f##*/}"
+            fi
+        done
+        mount --bind "$vids" "$vd"
+        say "intro logos skipped this session (POWDER_SKIP_INTRO=0 keeps them)"
+    fi
+    # content mods (mods/<name>/content.toml; native/sdk/CONTENT_MODS.md): built together before the server starts,
+    # since it reads the item list, store offers and grants tools/forge/compose.py writes; the built entry folders
+    # (symlinks into compose's cache) join the asset mods in the user stage (POWDER_COMPOSE_OUT). Runs whenever the
+    # game's own item list is known (<data>/game_item_list.json), so the served list always matches the named mods.
+    composed="" cmods=""
+    for m in ${POWDER_CLIENT_MODS//,/ }; do
+        case $m in */*|.*|'') continue ;; esac
+        [ -f "$REPO/mods/$m/content.toml" ] && cmods+="${cmods:+,}$m"
+    done
+    if [ -n "$cmods" ] || [ -f "$(data_dir)/game_item_list.json" ]; then
+        composed=$(mktemp -d)
+        if python3 "$REPO/tools/forge/compose.py" --game "$(steep_dir)" --data "$(data_dir)" --mods "$cmods" \
+                -o "$composed" >> "$LOG" 2>&1; then
+            say "content mods: ${cmods:-none} ready"
+            export POWDER_COMPOSE_OUT="$composed"
+        else
+            say "content mods: ${cmods} could not be built (see $LOG); started without them"
+        fi
+    fi
+    port=$(https_port)
+    server_command
+    "${SERVER_CMD[@]}" -c "$CONFIG" run >> "$LOG" 2>&1 &
+    server=$!
+    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"; [ -n "$vids" ] && rm -rf "$vids"
+          [ -n "$composed" ] && rm -rf "$composed"' EXIT
+    for _ in $(seq 100); do
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+        kill -0 "$server" 2>/dev/null || die "the Powder server stopped; see $LOG"
+        sleep 0.1
+    done
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || die "the Powder server does not answer on port $port; see $LOG"
+    say "Powder server up (pid $server, $SERVER), network: this session only"
+    export POWDER_WRAP_STAGE=user
+    set +e
+    unshare --user --map-user="$POWDER_WRAP_UID" --map-group="$POWDER_WRAP_GID" -- "$SELF" "$@"
+    rc=$?
+    exit $rc
+    ;;
+
+user)   # ---- the user's id again: CA into the prefix, the command, CA out -------------------------------
+    wine=$(find_wine)
+    wineserver="$(dirname "$wine")/wineserver"
+    [ -x "$wineserver" ] || wineserver=wineserver
+    ca="$(data_dir)/tls/ca.pem"
+    [ -f "$ca" ] || die "no local CA at $ca (the server makes it on its first start)"
+    key=$(ca_key "$ca")
+    reg=$(mktemp --suffix=.reg)
+    ca_reg "$ca" "$key" > "$reg"
+    winereg() { WINEDEBUG=-all "$wine" reg "$@" >/dev/null 2>&1; }
+    # a session that was killed (SIGKILL, power loss) could not take its CA out: do it now, if it was another one
+    marker="$WINEPREFIX/.powder-wrap-ca"
+    if [ -f "$marker" ] && [ "$(cat "$marker")" != "$key" ]; then
+        old=$(cat "$marker")
+        case $old in                                    # only ever a root-store certificate key
+        'HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates\'[0-9A-F]*)
+            if [ ${#old} -eq ${#key} ] && winereg delete "$old" /f; then
+                say "removed a CA a previous session left in $WINEPREFIX"
+            fi ;;
+        *) say "ignoring $marker: not a CA key" ;;
+        esac
+    fi
+    printf '%s' "$key" > "$marker"
+    winereg import "$reg" || { rm -f "$reg" "$marker"; die "could not add the local CA to $WINEPREFIX (wine: $wine)"; }
+    rm -f "$reg"
+    "$wineserver" -w
+    say "local CA trusted in $WINEPREFIX for this session"
+
+    # ---- the game's own TLS (Linux): the version.dll proxy hook (native/version_proxy.c) ----------------
+    # Steep's statically-linked OpenSSL rejects our certificate (nothing on Linux injected the Windows TLS
+    # helper). It imports version.dll, so a version.dll beside the game loads into it before its code runs:
+    # that is our proxy, which forwards version.dll's functions to a copy of the real one (vers_powder.dll)
+    # and, inside the game, makes OpenSSL's certificate check accept our pinned certificate. Opt out with
+    # POWDER_NO_TLS_HELPER=1; point at the folder with POWDER_STEEP_DIR if it is not found.
+    helper=""
+    if [ "${POWDER_NO_TLS_HELPER:-}" != 1 ]; then
+        proxy="$REPO/native/bin/version.dll"
+        armer="$REPO/native/bin/armer.exe"
+        sysver="$WINEPREFIX/drive_c/windows/system32/version.dll"
+        sdir=$(steep_dir)
+        if [ ! -f "$proxy" ] || [ ! -f "$armer" ]; then
+            say "TLS helper not built (run native/build.sh): the game will show offline"
+        elif [ -z "$sdir" ] || [ ! -d "$sdir" ]; then
+            say "Steep's folder not found (set POWDER_STEEP_DIR): the game will show offline"
+        elif [ ! -f "$sysver" ]; then
+            say "no $sysver to forward version.dll to: skipping the TLS helper"
+        elif ! tls_pin "$(data_dir)/tls/server.pem" "$sdir/powder_tls.pin"; then
+            say "could not compute the certificate pin (needs Python with cryptography): skipping the TLS helper"
+        else
+            cp -f "$proxy" "$sdir/version.dll" && cp -f "$sysver" "$sdir/vers_powder.dll" \
+                && cp -f "$armer" "$sdir/armer.exe"
+            rm -f "$sdir/powder_tls.log"
+            # load our version.dll over the builtin. The env var may not survive Proton/umu to the game, so
+            # set the override in the prefix registry too (that always applies); both are removed on cleanup.
+            export WINEDLLOVERRIDES="version=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+            winereg add 'HKCU\Software\Wine\DllOverrides' /v version /t REG_SZ /d native,builtin /f
+            helper="$sdir"
+            say "TLS helper in $sdir (its log: $sdir/powder_tls.log)"
+
+            # ---- optional in-game overlay (native/overlay/): the version.dll proxy loads it once the game
+            # code is unpacked. Opt in with POWDER_OVERLAY=1; the admin tab needs POWDER_SERVER=rust. ---------
+            if [ "${POWDER_OVERLAY:-}" = 1 ]; then
+                ov="$REPO/native/bin/powder_overlay.dll"
+                if [ -f "$ov" ]; then
+                    cp -f "$ov" "$sdir/powder_overlay.dll"
+                    # the Trainer tab's data for this game build (player position chains, noclip writers)
+                    cp -f "$REPO/native/overlay/steep_trainer.json" "$sdir/powder_trainer.json" 2>/dev/null || true
+                    # client mods the player named (native code: only these, from this repo)
+                    rm -rf "$sdir/powder_mods"
+                    if [ -n "${POWDER_CLIENT_MODS:-}" ]; then
+                        mkdir -p "$sdir/powder_mods"
+                        for m in ${POWDER_CLIENT_MODS//,/ }; do
+                            case $m in */*|.*|'') say "client mod name '$m' ignored"; continue ;; esac
+                            if compgen -G "$REPO/mods/$m/client/*.dll" >/dev/null; then
+                                cp -f "$REPO/mods/$m/client/"*.dll "$sdir/powder_mods/"
+                                say "client mod $m loads with the overlay"
+                            elif [ ! -d "$REPO/mods/$m/client/forge" ]; then
+                                say "client mod $m has no mods/$m/client/*.dll (native/build.sh mods) nor assets: skipped"
+                            fi
+                        done
+                    fi
+                    rm -f "$sdir/powder_overlay.log"
+                    p=$(https_port)
+                    url="https://public-ubiservices.ubi.com"
+                    [ "$p" != 443 ] && url="$url:$p"
+                    printf '%s\n' "$url" > "$sdir/powder_overlay.cfg"
+                    say "in-game overlay in $sdir (press Home in-game; admin tab needs POWDER_SERVER=rust)"
+                else
+                    say "overlay not built (run 'native/build.sh overlay'): skipping POWDER_OVERLAY"
+                fi
+            fi
+        fi
+    fi
+
+    # ---- asset mods: mods/<name>/client/forge/<Base>/ hold .forge entries (tools/forge/forge.py extract's
+    # files or unpacked folders) that override the game's. For the mods named in POWDER_CLIENT_MODS, build one
+    # <Base>_patch_03.forge per base archive (the game probes _patch_03 after _patch_02; the newest copy of an
+    # entry wins) and put it beside the game for this session. What we put there is listed in .powder-assets,
+    # so cleanup (or the next session, after a killed one) removes exactly that and never a file of the game's.
+    asset_dir=${sdir:-$(steep_dir)}
+    asset_list="$asset_dir/.powder-assets"
+    if [ -n "$asset_dir" ] && [ -f "$asset_list" ]; then
+        while IFS= read -r f; do case $f in */*|*[!A-Za-z0-9_.-]*) ;; *_patch_03.forge) rm -f "$asset_dir/$f" ;; esac; done < "$asset_list"
+        rm -f "$asset_list"
+    fi
+    if [ -n "${POWDER_CLIENT_MODS:-}" ] && [ -n "$asset_dir" ] && [ -d "$asset_dir" ]; then
+        declare -A asset_parts=()
+        session_forge=()
+        for m in ${POWDER_CLIENT_MODS//,/ }; do
+            case $m in */*|.*|'') continue ;; esac
+            for d in "$REPO/mods/$m/client/forge"/*/; do
+                [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+            done
+            # ---- a mod's session step: mods/<name>/session.sh (repo code, run only for mods the player named)
+            # makes this session's files, at most 10 minutes, as the user. It gets POWDER_STEEP_DIR (the game's
+            # folder, to read), POWDER_DATA_DIR, POWDER_CONFIG, POWDER_HTTPS_PORT (the server is up),
+            # POWDER_MOD_FORGE (an empty folder: its <Base>/ subfolders are added to the asset mods above, then
+            # deleted) and POWDER_MOD_RUNTIME (powder_mods/<name>/ beside the game, for its client DLL to read;
+            # removed with the session; empty without the overlay). Example: mods/world_editor.
+            if [ -f "$REPO/mods/$m/session.sh" ]; then
+                mf=$(mktemp -d)
+                session_forge+=("$mf")
+                rt=""
+                if [ -n "$helper" ] && [ -d "$helper/powder_mods" ]; then
+                    rt="$helper/powder_mods/$m"
+                    mkdir -p "$rt"
+                fi
+                if POWDER_STEEP_DIR="$asset_dir" POWDER_DATA_DIR="$(data_dir)" POWDER_CONFIG="$CONFIG" \
+                        POWDER_HTTPS_PORT="$(https_port)" POWDER_MOD_FORGE="$mf" POWDER_MOD_RUNTIME="$rt" \
+                        timeout 600 bash "$REPO/mods/$m/session.sh" >> "$LOG" 2>&1; then
+                    say "mod $m: session step done"
+                else
+                    say "mod $m: session step failed (see $LOG)"
+                fi
+                for d in "$mf"/*/; do
+                    [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+                done
+            fi
+        done
+        if [ -n "${POWDER_COMPOSE_OUT:-}" ]; then   # the content mods' build (namespace stage, compose.py)
+            for d in "$POWDER_COMPOSE_OUT"/*/; do
+                [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+            done
+        fi
+        for base in "${!asset_parts[@]}"; do
+            out="${base}_patch_03.forge"
+            if [ ! -f "$asset_dir/$base.forge" ]; then
+                say "asset mod for $base: no $base.forge in the game folder: skipped"; continue
+            elif [ -e "$asset_dir/$out" ]; then
+                say "asset mods for $base: $out exists and is not ours: skipped"; continue
+            fi
+            entries=()
+            while IFS= read -r d; do
+                [ -n "$d" ] && for e in "$d"*; do [ -e "$e" ] && entries+=("$e"); done
+            done <<< "${asset_parts[$base]}"
+            tmp_forge=$(mktemp -d)
+            if python3 "$REPO/tools/forge/forge.py" build "$tmp_forge/$out" --like "$asset_dir/$base.forge" \
+                    "${entries[@]}" >> "$LOG" 2>&1 \
+                    && cp -f "$tmp_forge/$out" "$asset_dir/$out"; then
+                printf '%s\n' "$out" >> "$asset_list"
+                say "asset mods: $out (${#entries[@]} entries) for this session"
+            else
+                say "asset mods for $base: building $out failed (see $LOG)"
+            fi
+            rm -rf "$tmp_forge"
+        done
+        if [ ${#session_forge[@]} -gt 0 ]; then rm -rf "${session_forge[@]}"; fi
+    fi
+
+    cleanup() {
+        "$wineserver" -w 2>/dev/null || true          # the game's Wine processes are gone
+        # powder_tls.log is kept (it is the helper's diagnostic; the next session resets it)
+        if [ -n "$helper" ]; then
+            rm -f "$helper/version.dll" "$helper/vers_powder.dll" "$helper/armer.exe" "$helper/powder_tls.pin"
+            # the overlay (if it was deployed); powder_overlay.log is kept, like powder_tls.log
+            rm -f "$helper/powder_overlay.dll" "$helper/powder_overlay.cfg" "$helper/powder_trainer.json"
+            rm -rf "$helper/powder_mods"
+            winereg delete 'HKCU\Software\Wine\DllOverrides' /v version /f
+        fi
+        if [ -n "${asset_dir:-}" ] && [ -f "$asset_list" ]; then   # the asset mods' _patch_03 archives
+            while IFS= read -r f; do case $f in */*|*[!A-Za-z0-9_.-]*) ;; *_patch_03.forge) rm -f "$asset_dir/$f" ;; esac; done < "$asset_list"
+            rm -f "$asset_list"
+        fi
+        if winereg delete "$key" /f; then
+            rm -f "$marker"
+            say "local CA removed from $WINEPREFIX"
+        else
+            say "could not remove the local CA from $WINEPREFIX (the next session tries again)"
+        fi
+        "$wineserver" -w 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    set +e
+    # which video the game plays when, for the first 3 minutes (to see where startup time goes): one log line per
+    # newly opened .bk2, seconds since the command started
+    ( start=$SECONDS last=""
+      while [ $((SECONDS - start)) -lt 180 ]; do
+          now=$(for p in $(pgrep -x steep.exe); do ls -l "/proc/$p/fd" 2>/dev/null; done | grep -io '[^/]*\.bk2' | sort -u | tr '\n' ' ')
+          [ -n "$now" ] && [ "$now" != "$last" ] && printf 'powder-wrap: +%ss video: %s\n' $((SECONDS - start)) "$now" >> "$LOG"
+          last=$now
+          sleep 0.5
+      done ) &
+    vlog=$!
+    "$@"
+    rc=$?
+    kill "$vlog" 2>/dev/null
+    exit $rc
+    ;;
+esac

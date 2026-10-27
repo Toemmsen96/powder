@@ -21,6 +21,19 @@ NATIVE_BIN = paths.native_dir()                 # <repo>/native/bin, or bundled 
 DLL = NATIVE_BIN / "hook_guard.dll"
 ARMER = NATIVE_BIN / "armer.exe"
 LOG = NATIVE_BIN / "hook_guard.log"
+PIN = NATIVE_BIN / "hook_guard.pin"              # 32 bytes the helper pins the server certificate by
+
+
+def write_pin(pin: bytes) -> None:
+    """The certificate pin the helper reads at attach (next to the DLL). 32 bytes, else cleared."""
+    if len(pin) == 32:
+        PIN.write_bytes(pin)
+    else:
+        clear_pin()
+
+
+def clear_pin() -> None:
+    PIN.unlink(missing_ok=True)
 
 PROCESS_ACCESS = 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0400   # CREATE_THREAD|VM_OPERATION|VM_READ|VM_WRITE|QUERY_INFO
 MEM_COMMIT_RESERVE, PAGE_READWRITE = 0x3000, 0x04

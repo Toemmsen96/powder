@@ -4,6 +4,7 @@ data/
 __pycache__/
 *.pyc
 config.toml
+config.launcher.toml
 .pytest_cache/
 *.log
 native/bin/
@@ -13,3 +14,8 @@ launcher.toml
 /build/
 /dist/
 /.claude/
+/target/
+native/third_party/
+/mods/*/client/*.dll
+/mods/*/client/forge/
+models

@@ -1,0 +1,25 @@
+# Powder's Rust programs: the server (powder-server) and the modding tools.
+[workspace]
+members = ["server"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"                 # releases take their version from the git tag (POWDER_VERSION at build time)
+edition = "2024"
+rust-version = "1.99"            # the toolchain rust-toolchain.toml pins
+license = "AGPL-3.0-or-later"
+
+# password hashing (scrypt) is seconds per hash unoptimized: keep debug builds and tests usable
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

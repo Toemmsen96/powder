@@ -1,0 +1,16 @@
+# Two new costumes, built together with every other enabled content mod (tools/forge/compose.py) at game start.
+[[costume]]
+name    = "COSTUME_MF_POWDER_MASTER_CHIEF"
+costume = "STP_M_Costume_016"
+label   = "PowderChief"
+source  = "assets/chief_model"
+title   = "Master Chief"
+icon    = "assets/chief.png"
+store   = "COSTUME_M_MILITARY_GREY_94"
+grant   = true
+
+[[costume]]
+name  = "COSTUME_MF_POWDER_BIB_TEST"
+like  = "COSTUME_MF_URBAN_OUTFIT_BIB_131"
+title = "Powder Overalls"
+icon  = "assets/overalls.png"

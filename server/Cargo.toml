@@ -1,0 +1,53 @@
+[package]
+name = "powder-server"
+description = "Powder: self-hosted stand-in for Steep's online services, to keep an owned copy playable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "powder-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+log = { version = "0.4", features = ["std"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
+parking_lot = "0.12"
+regex = "1"
+rpassword = "7"                   # admin account-password: no echo
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }   # the websocket's Stream/Sink
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "v5"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# crypto: the NEX handshake and payloads, passwords, certificates
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+md-5 = "0.10"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8", "pem"] }
+rand = "0.8"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+rustls-pemfile = "2"
+scrypt = { version = "0.11", default-features = false }
+sha1 = "0.10"
+sha2 = "0.10"
+x509-parser = "0.16"
+
+[dev-dependencies]
+tempfile = "3"

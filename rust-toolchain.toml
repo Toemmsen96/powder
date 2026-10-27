@@ -1,0 +1,4 @@
+# The Rust toolchain Powder builds with: the latest stable when it was set (rustup installs it on first use).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

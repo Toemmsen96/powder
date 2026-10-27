@@ -1,0 +1,21 @@
+; version.dll proxy exports: forward every real version.dll function to vers_powder.dll (a copy of the real
+; one placed beside our version.dll). Only the hook in version_proxy.c is ours; version info still works.
+LIBRARY version.dll
+EXPORTS
+    GetFileVersionInfoA = vers_powder.GetFileVersionInfoA
+    GetFileVersionInfoByHandle = vers_powder.GetFileVersionInfoByHandle
+    GetFileVersionInfoExA = vers_powder.GetFileVersionInfoExA
+    GetFileVersionInfoExW = vers_powder.GetFileVersionInfoExW
+    GetFileVersionInfoSizeA = vers_powder.GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeExA = vers_powder.GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = vers_powder.GetFileVersionInfoSizeExW
+    GetFileVersionInfoSizeW = vers_powder.GetFileVersionInfoSizeW
+    GetFileVersionInfoW = vers_powder.GetFileVersionInfoW
+    VerFindFileA = vers_powder.VerFindFileA
+    VerFindFileW = vers_powder.VerFindFileW
+    VerInstallFileA = vers_powder.VerInstallFileA
+    VerInstallFileW = vers_powder.VerInstallFileW
+    VerLanguageNameA = vers_powder.VerLanguageNameA
+    VerLanguageNameW = vers_powder.VerLanguageNameW
+    VerQueryValueA = vers_powder.VerQueryValueA
+    VerQueryValueW = vers_powder.VerQueryValueW

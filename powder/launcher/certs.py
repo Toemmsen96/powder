@@ -120,6 +120,16 @@ def thumbprint(cert: x509.Certificate) -> str:
     return cert.fingerprint(hashes.SHA1()).hex().upper()
 
 
+def leaf_tbs_pin(leaf_der: bytes) -> bytes:
+    """The 32 bytes the TLS helper pins a server certificate by: SHA-256 of its tbsCertificate (the signed
+    body). The game's OpenSSL caches those same bytes for the certificate it receives (hook_guard.c), so this
+    matches only the exact certificate the server presents, and no other certificate for any host."""
+    tbs = x509.load_der_x509_certificate(leaf_der).tbs_certificate_bytes
+    d = hashes.Hash(hashes.SHA256())
+    d.update(tbs)
+    return d.finalize()
+
+
 def pretty(fingerprint: str) -> str:
     """For people: upper-case hex in groups of four."""
     f = fingerprint.upper()

@@ -1,0 +1,255 @@
+{
+ "_comment": [
+  "Steep (steep.exe, Ubisoft Connect version, as of 2026-10-26).",
+  "position: pointer chains from static addresses to the player's transform (tools/trainer/ptrscan.py):",
+  "[[module+root] + o1] + o2 ... = the struct; the position float3 is at struct + offset. Found in one",
+  "session and not yet confirmed across launches/maps: the overlay takes the address most chains agree on.",
+  "writers: the instructions that write the position (tools/trainer/watch.py) and their original bytes;",
+  "the overlay hooks them for noclip (native/overlay/noclip.cpp) and refuses if the bytes differ.",
+  "fixes: crash guards (native/overlay/fixes.cpp): a NULL in null_guard at rva is pointed at a zeroed block."
+ ],
+ "module": "steep.exe",
+ "position": {
+  "offset": "0x50",
+  "chains": [
+   {
+    "root": "0x2ce0988",
+    "offsets": [
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2ce0a50",
+    "offsets": [
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2e3fea8",
+    "offsets": [
+     "0x420",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312ca20",
+    "offsets": [
+     "0x10",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2ce0988",
+    "offsets": [
+     "0x30",
+     "0x10",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2ce0a50",
+    "offsets": [
+     "0x30",
+     "0x10",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312c060",
+    "offsets": [
+     "0x30",
+     "0x20",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312ca10",
+    "offsets": [
+     "0x30",
+     "0x20",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2e70990",
+    "offsets": [
+     "0x60",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x33367c0",
+    "offsets": [
+     "0x90",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2d26a68",
+    "offsets": [
+     "0x88",
+     "0x30",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x3128188",
+    "offsets": [
+     "0xf0",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312bc40",
+    "offsets": [
+     "0x140",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2e3fea8",
+    "offsets": [
+     "0x60",
+     "0x100",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d88e8",
+    "offsets": [
+     "0xa0",
+     "0xc0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x330d2d0",
+    "offsets": [
+     "0xd0",
+     "0x90",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d88f8",
+    "offsets": [
+     "0xa0",
+     "0xe0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x313b510",
+    "offsets": [
+     "0x180",
+     "0x20",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d8888",
+    "offsets": [
+     "0xa8",
+     "0x120",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d8898",
+    "offsets": [
+     "0xa8",
+     "0x120",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d88c8",
+    "offsets": [
+     "0xa8",
+     "0x120",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d88d8",
+    "offsets": [
+     "0xa8",
+     "0x120",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x32d8908",
+    "offsets": [
+     "0xa0",
+     "0x140",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312bb20",
+    "offsets": [
+     "0x220",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x312be68",
+    "offsets": [
+     "0x220",
+     "0x0",
+     "0x0"
+    ]
+   },
+   {
+    "root": "0x2d232c8",
+    "offsets": [
+     "0x18",
+     "0x350",
+     "0x0"
+    ]
+   }
+  ]
+ },
+ "writers": [
+  {
+   "rva": "0x124d0ae",
+   "bytes": "0f294950488b4918",
+   "asm": "movaps [rcx+0x50],xmm1; mov rcx,[rcx+0x18]"
+  },
+  {
+   "rva": "0x124d16b",
+   "bytes": "0f294b50488b03",
+   "asm": "movaps [rbx+0x50],xmm1; mov rax,[rbx]"
+  },
+  {
+   "rva": "0x124d218",
+   "bytes": "0f294f50488b07",
+   "asm": "movaps [rdi+0x50],xmm1; mov rax,[rdi]"
+  },
+  {
+   "rva": "0x37fd6b",
+   "bytes": "0f297a300f283c24",
+   "asm": "movaps [rdx+0x30],xmm7; movaps xmm7,[rsp]"
+  }
+ ],
+ "fixes": [
+  {
+   "name": "Alaska crash: no record for (rider, sport/gear key)",
+   "rva": "0x5c8f73",
+   "bytes": "8b401c488d8d28010000",
+   "null_guard": "rax",
+   "args_at": "0x5c8f42",
+   "args_bytes": "e849f7fdff488b0dc23ab602",
+   "asm": "call 0x5a8690 (lookup(ecx=rider, edx=key) -> NULL); mov eax,[rax+0x1c] faults (crash log 2026-10-26)"
+  }
+ ]
+}
