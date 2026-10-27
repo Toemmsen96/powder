@@ -436,6 +436,9 @@ def main():
     ap.add_argument("--glb", help="also keep the fitted models, <this>_M.glb and <this>_F.glb (to look at in Blender)")
     ap.add_argument("--target", choices=sorted(PRESETS), default=DEFAULT_TARGET, help="the costume Chief replaces")
     ap.add_argument("--icon", help="the costume's menu picture (PNG, e.g. from render_icon.py)")
+    ap.add_argument("--export-assets", metavar="DIR", help="only write what is Chief's own for a content mod: the "
+                    "fitted models (chief_M.glb, chief_F.glb) and the maps per Steep material (textures/<material>_"
+                    "<map>.png), plus content.toml's model/texture keys (model.toml); no game entries")
     a = ap.parse_args()
     global COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE
     COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[a.target][k] for k in KEYS)
@@ -446,6 +449,27 @@ def main():
         p["bones"] = steep
     sole = min(float(p["pos"][:, 2].min()) for p in parts)
     tmp = tempfile.mkdtemp(prefix="powder_chief_")
+    if a.export_assets:  # a content mod's own files (tools/forge/costume_model.py puts them into the game's entries)
+        try:
+            os.makedirs(os.path.join(a.export_assets, "textures"), exist_ok=True)
+            lines = [f'costume = "{COSTUMES["M"]}"']
+            for gender in COSTUMES:
+                rest = steep_rest(a.game, gender, set(mpos) | {"Spine2"})
+                scale, xf = fit(mpos, rest, sole)
+                write_glb(parts, xf, rest, os.path.join(a.export_assets, f"chief_{gender}.glb"))
+                lines.append(f'model_{gender.lower()} = "assets/chief_{gender}.glb"')
+            pngs = maps(a.model, tmp)
+            for mat, m in pngs.items():
+                for k, png in m.items():
+                    shutil.copy(png, os.path.join(a.export_assets, "textures", f"{mat}_{k}.png"))
+                    lines.append(f'textures.{mat}.{k} = "assets/textures/{mat}_{k}.png"')
+            lines.append(f"embedded = {'true' if EMBEDDED else 'false'}")
+            with open(os.path.join(a.export_assets, "model.toml"), "w") as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"exported to {a.export_assets} (keys for content.toml in model.toml)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return
     try:
         shutil.rmtree(a.out, ignore_errors=True)
         for gender, costume in COSTUMES.items():

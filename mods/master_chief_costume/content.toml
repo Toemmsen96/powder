@@ -1,0 +1,25 @@
+# Master Chief as a new costume. Only the model's own files are in assets/ (generate.sh); the game's entries are made
+# from them at each game start against the player's own install (tools/forge/compose.py, costume_model.py).
+[[costume]]
+name  = "COSTUME_MF_POWDER_MASTER_CHIEF"
+label = "PowderChief"
+title = "Master Chief"
+icon  = "assets/icon.png"
+store = "COSTUME_M_MILITARY_GREY_94"
+grant = true
+costume = "STP_M_Costume_016"
+model_m = "assets/chief_M.glb"
+model_f = "assets/chief_F.glb"
+textures.STP_MF_Costume_016_Jacket_ALL.diffuse = "assets/textures/STP_MF_Costume_016_Jacket_ALL_diffuse.png"
+textures.STP_MF_Costume_016_Jacket_ALL.normal = "assets/textures/STP_MF_Costume_016_Jacket_ALL_normal.png"
+textures.STP_MF_Costume_016_Jacket_ALL.specular = "assets/textures/STP_MF_Costume_016_Jacket_ALL_specular.png"
+textures.STP_MF_Costume_016_Jacket_ALL.mask = "assets/textures/STP_MF_Costume_016_Jacket_ALL_mask.png"
+textures.STP_MF_Costume_016_Pants_ALL.diffuse = "assets/textures/STP_MF_Costume_016_Pants_ALL_diffuse.png"
+textures.STP_MF_Costume_016_Pants_ALL.normal = "assets/textures/STP_MF_Costume_016_Pants_ALL_normal.png"
+textures.STP_MF_Costume_016_Pants_ALL.specular = "assets/textures/STP_MF_Costume_016_Pants_ALL_specular.png"
+textures.STP_MF_Costume_016_Pants_ALL.mask = "assets/textures/STP_MF_Costume_016_Pants_ALL_mask.png"
+textures.STP_MF_Costume_016_Helmet_ALL.diffuse = "assets/textures/STP_MF_Costume_016_Helmet_ALL_diffuse.png"
+textures.STP_MF_Costume_016_Helmet_ALL.normal = "assets/textures/STP_MF_Costume_016_Helmet_ALL_normal.png"
+textures.STP_MF_Costume_016_Helmet_ALL.specular = "assets/textures/STP_MF_Costume_016_Helmet_ALL_specular.png"
+textures.STP_MF_Costume_016_Helmet_ALL.mask = "assets/textures/STP_MF_Costume_016_Helmet_ALL_mask.png"
+embedded = true

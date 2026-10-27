@@ -16,6 +16,10 @@ content.toml (data only; paths relative to the mod's folder and inside it):
   title  = "Master Chief"                        # optional: its name in every language
   icon   = "assets/icon.png"                     # optional: its picture in the costume list
   store  = "COSTUME_M_MILITARY_GREY_94"          # optional: the item-list entry it copies (where it is listed)
+  model_m = "assets/chief_M.glb"                # optional, with costume =: the mod's own model per gender, fitted
+  model_f = "assets/chief_F.glb"                #   to Steep's skeleton, and its maps per Steep material
+  textures.STP_MF_Costume_016_Jacket_ALL.diffuse = "assets/textures/jacket_d.png"   # (diffuse normal specular mask)
+  embedded = true                               # optional: also the entity's embedded texture set (default)
   grant  = true                                  # optional: every player owns it (else a free store offer)
 
   [[world]]
@@ -46,8 +50,11 @@ import items  # noqa: E402
 
 MAPS = {"Alpes", "Japan", "Alaska", "WhiteRoom"}
 DEFAULT_STORE = "COSTUME_M_MILITARY_GREY_94"  # a plain store costume: listed with the costumes, no unlock token
-LIMITS = {"content.toml": 64 << 10, "icon": 8 << 20, "edits": 16 << 20}
-TOOLS = ("compose.py", "items.py", "loc.py", "texture.py", "world.py", "forge.py", "../trainer/itemlist.py")
+LIMITS = {"content.toml": 64 << 10, "icon": 8 << 20, "edits": 16 << 20, "model": 128 << 20, "map": 32 << 20}
+TOOLS = ("compose.py", "items.py", "loc.py", "texture.py", "world.py", "forge.py", "costume_model.py", "mesh.py",
+         "gltf.py", "../trainer/itemlist.py")
+COSTUME_KEYS = {"name", "like", "costume", "label", "source", "title", "icon", "store", "grant", "model_m", "model_f",
+                "textures", "embedded"}
 
 
 class ModError(Exception):
@@ -89,8 +96,21 @@ def read_mod(mods_dir: str, name: str) -> dict | None:
             raise ModError(f"{what}: name must be 4-100 letters, digits, underscores")
         if bool(t.get("like")) == bool(t.get("costume")):
             raise ModError(f"{what}: give exactly one of like / costume")
-        if set(t) - {"name", "like", "costume", "label", "source", "title", "icon", "store", "grant"}:
-            raise ModError(f"{what}: unknown keys {sorted(set(t) - {'name', 'like', 'costume', 'label', 'source', 'title', 'icon', 'store', 'grant'})}")
+        if set(t) - COSTUME_KEYS:
+            raise ModError(f"{what}: unknown keys {sorted(set(t) - COSTUME_KEYS)}")
+        model = None
+        if t.get("model_m") or t.get("textures"):
+            if not t.get("costume") or not t.get("model_m"):
+                raise ModError(f"{what}: a model needs costume = (the costume it fits) and model_m")
+            tex = t.get("textures", {})
+            if not isinstance(tex, dict) or any(not isinstance(m, dict) or set(m) - {"diffuse", "normal", "specular",
+                                                                                     "mask"} for m in tex.values()):
+                raise ModError(f"{what}: textures.<material>.<diffuse|normal|specular|mask> = \"<png>\"")
+            model = {"models": {g: inside(mod_dir, t[k], f"{what}: {k}", LIMITS["model"])
+                                for g, k in (("M", "model_m"), ("F", "model_f")) if t.get(k)},
+                     "textures": {mat: {k: inside(mod_dir, v, f"{what}: textures", LIMITS["map"])
+                                        for k, v in maps.items()} for mat, maps in tex.items()},
+                     "embedded": bool(t.get("embedded", True))}
         title = t.get("title")
         if title is not None and (not isinstance(title, str) or not 0 < len(title) <= 60):
             raise ModError(f"{what}: title is 1-60 characters")
@@ -100,7 +120,8 @@ def read_mod(mods_dir: str, name: str) -> dict | None:
                                  source_dirs=[inside(mod_dir, s, f"{what}: source") for s in srcs], title=title,
                                  icon=inside(mod_dir, t["icon"], f"{what}: icon", LIMITS["icon"]) if t.get("icon")
                                  else None)
-        costumes.append({"spec": spec, "store": t.get("store"), "grant": bool(t.get("grant", False)), "mod": name})
+        costumes.append({"spec": spec, "store": t.get("store"), "grant": bool(t.get("grant", False)), "mod": name,
+                         "model": model})
     for k, t in enumerate(data.get("world", [])):
         what = f"{name}: world #{k + 1}"
         if t.get("map") not in MAPS:
@@ -139,11 +160,20 @@ def build(game: str, mods: list[dict], dest: str) -> dict:
     os.makedirs(tmp)
     costumes = [c for m in mods for c in m["costumes"]]
     summary = {"costumes": [], "worlds": []}
+    for c in costumes:  # a mod's own model and textures, put into the costume's entries from this install
+        if c["model"]:
+            import costume_model
+            src = os.path.join(tmp, "models", c["spec"].name)
+            print(f"compose: {c['spec'].name}: the mod's model into {c['spec'].costume}")
+            costume_model.build(game, c["spec"].costume, c["model"]["models"], c["model"]["textures"], src,
+                                c["model"]["embedded"])
+            c["spec"].source_dirs = [os.path.join(src, "DataPC_extra_chr")] + c["spec"].source_dirs
     if costumes:
         plans = items.add_costumes(items.Game(game), [c["spec"] for c in costumes], os.path.join(tmp, "costumes"))
         for c, p in zip(costumes, plans):
             summary["costumes"].append({"name": c["spec"].name, "mod": c["mod"], "item": f"{p.item.id:#x}",
                                         "store": c["store"], "like": p.report["like"], "grant": c["grant"]})
+        shutil.rmtree(os.path.join(tmp, "models"), ignore_errors=True)  # cloned from; not needed any more
         for base in os.listdir(os.path.join(tmp, "costumes")):
             if os.path.isdir(os.path.join(tmp, "costumes", base)):
                 os.rename(os.path.join(tmp, "costumes", base), os.path.join(tmp, base))
@@ -199,7 +229,7 @@ def main(argv=None) -> int:
             print(f"compose: {', '.join(m['name'] for m in mods)} unchanged, from the cache ({key})")
         else:
             summary = {"costumes": [], "worlds": []}
-    except (ModError, SystemExit) as e:
+    except (ModError, SystemExit, RuntimeError) as e:
         print(f"compose: {e}", file=sys.stderr)
         return 1
     os.makedirs(a.out, exist_ok=True)
