@@ -69,18 +69,7 @@ codes (fewer for 1% to almost half of a package's strings: Ubisoft's coder does 
 - New strings use the package's own dictionary; a code unit the package lacks gets a new leaf at the end of the
   table (shipped entries keep their numbers, so every shipped string's codes stay valid). "Master Chief" needs no new
   entry in any of the 17 UI packages.
-- **New ids** (`new_string_id`): `0x8000 + crc32(NAME) % 0x4000`, stepped past every id of every package (UI and
-  subtitles), so above every shipped id and the same each time for the same name. `items.py add-costume --title`
-  keys it by the item's name: COSTUME_MF_POWDER_MASTER_CHIEF gets **0x86ef** (34,543). The string lands at the end
-  of each package's last bank (a new bank if it does not fit).
-
-## What the game must accept (open, G)
-
-The game has not yet shown a string we added. Assumed: it finds a string by id through the bank whose first id is
-the largest one not above it, then the bank's records (sorted); a new id above the shipped range is fine there, and
-nothing else (the LocalizationManager, UILocalizationRepository) needs to know UI ids. In the game: the new item's
-name shows as given ("Master Chief") = all of it works. The cloned item's name ("Green Mosaics - Japan Outfit") =
-the bootstrap's item still names the old id, or DataPC_patch_03 was not built (powder-wrap.log). An empty name or a
-placeholder (an id, "MISSING ...") = the item names the new id but the game did not find it in the package: a lookup
-rule above is wrong; try `loc.py set` on an existing id (change a known string) to see whether the patched packages
-are read at all.
+- **New ids** (`new_string_id`): one of the unused ids inside the UI range (6,637..28,500; 3,405 free), picked by
+  crc32(NAME) so the same name gets the same id each time; `items.py add-costume --title` keys it by the item's name
+  (COSTUME_MF_POWDER_MASTER_CHIEF: **0x1f43**). TRIED in-game 2026-10-27: an id past every shipped one (0x86ef,
+  appended to the last bank) crashed the game at start; renaming a shipped id (0x4ed2 -> "MASTER CHIEF") works.

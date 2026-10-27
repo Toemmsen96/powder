@@ -37,7 +37,9 @@ LOC_PACKAGE = 0x6E3C9C6F
 TEXT_CLASS = 0xD28389B5   # the coded text object inside a package
 HEAD = 0x25               # the payload up to the text object's size: id, type, language, class (kept verbatim)
 BANK_MAX = 0xFFFF         # a bank's data length and its string offsets are u16
-NEW_ID_BASE, NEW_ID_SPAN = 0x8000, 0x4000  # new string ids: above every shipped one (the highest is 28,500)
+# new string ids: a free id inside the UI ids' range (6,637..28,500). An id above every shipped one (0x86ef, appended to
+# the last bank) crashed the game at start (2026-10-27); renaming a shipped id works, so new ids go into the gaps.
+UI_ID_RANGE = (6637, 28500)
 
 
 class LocError(ValueError):
@@ -312,12 +314,14 @@ def all_ids(game: str) -> set[int]:
 
 
 def new_string_id(name: str, taken: set[int]) -> int:
-    """A string id for a new text keyed by `name` (e.g. an item's name): above every shipped id, the same each time
-    for the same name, stepped past ids in `taken`."""
-    sid = NEW_ID_BASE + zlib.crc32(name.encode()) % NEW_ID_SPAN
-    while sid in taken:
-        sid += 1
-    return sid
+    """A string id for a new text keyed by `name` (e.g. an item's name): one of the unused ids inside the UI range
+    (`taken` = every shipped id plus the ones already given out), picked by the name's CRC so the same name gets the
+    same id each time."""
+    lo, hi = UI_ID_RANGE
+    free = [i for i in range(lo, hi) if i not in taken]
+    if not free:
+        raise LocError("no free string id left inside the UI range")
+    return free[zlib.crc32(name.encode()) % len(free)]
 
 
 def write_package(folder: str, x: Entry) -> str:

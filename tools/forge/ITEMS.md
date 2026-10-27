@@ -231,8 +231,8 @@ master_chief's entries.
    If the rider shows the default clothes instead, the selector side was not found (registry, list order, or the
    template copies); if the game crashes when the costume is equipped, suspect the entity / material clones.
 4. Name and icon: the source's icon. The name: the source's, or with `--title` a string of its own (2026-10-27,
-   LOCALIZATION.md): the item's LocString names a new string id (`0x8000 + crc32(name) % 0x4000`, past every shipped
-   id; COSTUME_MF_POWDER_MASTER_CHIEF: 0x86ef), whose text `loc.py` adds to every UI language package (the source keeps
+   LOCALIZATION.md): the item's LocString names a new string id (a free id inside the UI range picked by crc32(name);
+   COSTUME_MF_POWDER_MASTER_CHIEF: 0x1f43; an id past every shipped one, 0x86ef, crashed the game at start), whose text `loc.py` adds to every UI language package (the source keeps
    0x4ed2). `check` verifies the item names the new id, no shipped package has it, every UI package was written once
    with the name reading back, the shipped dictionary entries kept (only new leaves appended) and every other string
    unchanged. Not yet seen in the game.

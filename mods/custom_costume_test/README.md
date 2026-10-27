@@ -31,7 +31,7 @@ it for the session; enable it with `POWDER_CLIENT_MODS=custom_costume_test` (res
 `--chief` clones the costume that `mods/master_chief` converts, from that mod's generated entries
 (`mods/master_chief/generate.sh` first, or `CHIEF_SRC`). The new item is `COSTUME_MF_POWDER_MASTER_CHIEF`
 (`CHIEF_NAME`), called **"Master Chief"** in the game (`CHIEF_TITLE`): `items.py --title` gives it a string id of
-its own (0x86ef) and adds the text to all 17 UI language packages, written to `DataPC/` with the bootstrap
+its own (a free id inside the shipped range, 0x1f43 for COSTUME_MF_POWDER_MASTER_CHIEF) and adds the text to all 17 UI language packages, written to `DataPC/` with the bootstrap
 (tools/forge/LOCALIZATION.md). If master_chief converts a bundle costume (costume 005, the penguin), the new item is a
 **jacket** (the penguin bundle draws its body through its jacket item `JACKET_MF_C_Penguin_228`): look for it under
 jackets. Leave the master_chief mod itself off to see Chief only on the new item.
