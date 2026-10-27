@@ -201,9 +201,21 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     if [ "${POWDER_SKIP_INTRO:-1}" = 1 ] && [ -d "$vd" ]; then
         vids=$(mktemp -d) vorig=$(mktemp -d)
         mount --bind "$vd" "$vorig"
+        skip_video() {
+            case ${1##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2) return 0 ;;
+                disclaimer.bk2) return 0 ;; esac   # in the language folders (videos/en/, videos/de/, ...)
+            return 1
+        }
         for f in "$vorig"/*; do
-            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2|disclaimer.bk2) continue ;; esac
-            ln -s "$f" "$vids/${f##*/}"
+            skip_video "$f" && continue
+            if [ -d "$f" ]; then   # a language folder: rebuilt link by link, so its disclaimer stays out
+                mkdir "$vids/${f##*/}"
+                for g in "$f"/*; do
+                    skip_video "$g" || ln -s "$g" "$vids/${f##*/}/${g##*/}"
+                done
+            else
+                ln -s "$f" "$vids/${f##*/}"
+            fi
         done
         mount --bind "$vids" "$vd"
         say "intro logos skipped this session (POWDER_SKIP_INTRO=0 keeps them)"
