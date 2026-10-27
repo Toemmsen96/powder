@@ -63,13 +63,14 @@ class ClientMod:
     dll: bool            # builds or ships an overlay DLL
     assets: bool         # ships or generates asset entries
     session: bool        # has a session step
+    content: bool        # a content mod (content.toml: built together with the others at game start)
     status: str          # "ready" | "build" (native/build.sh mods) | "generate" (its generate.sh)
     entries: set[str]    # "<Base>/<entry id>" of its generated asset entries (to spot two mods changing the same)
 
     @property
     def kinds(self) -> str:
-        return ", ".join(k for k, on in (("overlay DLL", self.dll), ("assets", self.assets),
-                                         ("session step", self.session)) if on)
+        return ", ".join(k for k, on in (("content", self.content), ("overlay DLL", self.dll),
+                                         ("assets", self.assets), ("session step", self.session)) if on)
 
 
 def _newest(paths) -> float:
@@ -90,17 +91,21 @@ def list_client_mods(repo: str) -> list[ClientMod]:
                    for e in base.iterdir()} if forge.is_dir() else set()
         generate = (folder / "generate.sh").is_file()
         session = (folder / "session.sh").is_file()
+        content = (folder / "content.toml").is_file()
         dll = bool(srcs or dlls)
-        if not (dll or entries or generate or session):
+        if not (dll or entries or generate or session or content):
             continue
         if srcs and (not dlls or _newest(srcs) > _newest(dlls)):
             status = "build"
-        elif generate and not entries:
+        elif generate and content and not (folder / "assets").is_dir():
+            status = "generate"
+        elif generate and not content and not entries:
             status = "generate"
         else:
             status = "ready"
         out.append(ClientMod(name=folder.name, description=_description(folder, folder / "mod.lua"), dll=dll,
-                             assets=bool(entries or generate), session=session, status=status, entries=entries))
+                             assets=bool(entries or (generate and not content)), session=session,
+                             content=content, status=status, entries=entries))
     return out
 
 

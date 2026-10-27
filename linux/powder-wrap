@@ -220,11 +220,31 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
         mount --bind "$vids" "$vd"
         say "intro logos skipped this session (POWDER_SKIP_INTRO=0 keeps them)"
     fi
+    # content mods (mods/<name>/content.toml; native/sdk/CONTENT_MODS.md): built together before the server starts,
+    # since it reads the item list, store offers and grants tools/forge/compose.py writes; the built entry folders
+    # (symlinks into compose's cache) join the asset mods in the user stage (POWDER_COMPOSE_OUT). Runs whenever the
+    # game's own item list is known (<data>/game_item_list.json), so the served list always matches the named mods.
+    composed="" cmods=""
+    for m in ${POWDER_CLIENT_MODS//,/ }; do
+        case $m in */*|.*|'') continue ;; esac
+        [ -f "$REPO/mods/$m/content.toml" ] && cmods+="${cmods:+,}$m"
+    done
+    if [ -n "$cmods" ] || [ -f "$(data_dir)/game_item_list.json" ]; then
+        composed=$(mktemp -d)
+        if python3 "$REPO/tools/forge/compose.py" --game "$(steep_dir)" --data "$(data_dir)" --mods "$cmods" \
+                -o "$composed" >> "$LOG" 2>&1; then
+            say "content mods: ${cmods:-none} ready"
+            export POWDER_COMPOSE_OUT="$composed"
+        else
+            say "content mods: ${cmods} could not be built (see $LOG); started without them"
+        fi
+    fi
     port=$(https_port)
     server_command
     "${SERVER_CMD[@]}" -c "$CONFIG" run >> "$LOG" 2>&1 &
     server=$!
-    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"; [ -n "$vids" ] && rm -rf "$vids"' EXIT
+    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"; [ -n "$vids" ] && rm -rf "$vids"
+          [ -n "$composed" ] && rm -rf "$composed"' EXIT
     for _ in $(seq 100); do
         (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
         kill -0 "$server" 2>/dev/null || die "the Powder server stopped; see $LOG"
@@ -378,6 +398,11 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
                 done
             fi
         done
+        if [ -n "${POWDER_COMPOSE_OUT:-}" ]; then   # the content mods' build (namespace stage, compose.py)
+            for d in "$POWDER_COMPOSE_OUT"/*/; do
+                [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+            done
+        fi
         for base in "${!asset_parts[@]}"; do
             out="${base}_patch_03.forge"
             if [ ! -f "$asset_dir/$base.forge" ]; then
