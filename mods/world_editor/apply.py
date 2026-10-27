@@ -15,7 +15,8 @@ fetched is kept in <data dir>/world_editor/edits.json, which is used when the se
 Python server, which runs no Lua mods). Game data is only read (tools/forge/world.py). In a session the cells go
 into powder-wrap's POWDER_MOD_FORGE folder, which it packs into the session's <Map>_patch_03.forge and deletes:
 not into client/, whose files the server publishes to launchers (they are Steep's data and change every session).
-Python 3.10+, stdlib only.
+The list the session starts with also goes to <runtime>/live/session_edits.json, for the live helper (live.py),
+which session.sh starts afterwards. Python 3.10+, stdlib only.
 """
 
 from __future__ import annotations
@@ -203,7 +204,10 @@ def cmd_session(a) -> int:
         return 1
     rc = generate(edits, steep, forge_dir)
     runtime = os.environ.get("POWDER_MOD_RUNTIME")
-    if runtime:
+    if runtime:   # the list this session starts with, for the live helper (live.py)
+        os.makedirs(os.path.join(runtime, "live"), exist_ok=True)
+        with open(os.path.join(runtime, "live", "session_edits.json"), "w", encoding="utf-8") as f:
+            json.dump({"edits": edits}, f)
         maps = [m for m in (os.environ.get("WORLD_EDITOR_MAPS") or ",".join(MAPS)).split(",") if m in MAPS]
         rc |= index(maps, steep, runtime)
     else:

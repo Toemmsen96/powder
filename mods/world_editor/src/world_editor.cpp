@@ -2,8 +2,10 @@
 // the player is (position, map cell), the objects near them (the map's index, which apply.py builds from the
 // player's own install at game start and powder-wrap puts beside this DLL), adding copies of placeable props,
 // moving / turning / scaling / removing objects, and the list of edits with undo. Edits go to the server
-// (mod.lua, /_powder/world_editor/), which keeps them; world cells are loaded from archives, so they show from
-// the next game start on, when the session step writes them into cells. Nothing here writes game memory.
+// (mod.lua, /_powder/world_editor/), which keeps them. World cells are loaded from archives: an edit shows at the
+// next game start (the session step writes the edited cells into a _patch_03), and with the session helper running
+// (live.py) as soon as the game reads its cell again (live.cpp serves the edited cell in place of the archive's
+// bytes; only an edit that makes a cell bigger points the game's index record of that cell elsewhere).
 //
 // "In front" is the direction the rider last moved in (the camera is not part of the mod API).
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +25,7 @@
 #include "imgui.h"
 #include "json.hpp"
 #include "powder_api.h"
+#include "live.h"
 
 using json = nlohmann::json;
 constexpr double PI = 3.14159265358979323846;
@@ -196,6 +199,7 @@ void on_reply(int status, const char *body, size_t len, void *user) {
         g_net_edits.assign(j["edits"].begin(), j["edits"].end());
         g_net_ver++;
         g_status = std::string(what) + ": ok (" + std::to_string(g_net_edits.size()) + " edit(s) stored)";
+        if (strcmp(what, "load") != 0) live::poke();   // the live helper asks for the list now
     } else if (status == 0) {
         g_status = std::string(what) + ": no reply from the server";
     } else {
@@ -627,6 +631,30 @@ const char *describe(const json &e, std::string &out) {
     return out.c_str();
 }
 
+// Live edits (live.cpp): what the session helper has turned into cells, and whether the game has read them yet.
+void draw_live() {
+    live::Status ls = live::status();
+    int newest = 0;
+    for (const json &e : g_edits) if (e.is_object()) newest = std::max(newest, e.value("n", 0));
+    if (!ls.hooked || !ls.helper) {
+        ImGui::TextDisabled("Edits show from the next game start.%s%s", ls.note.empty() ? "" : " ", ls.note.c_str());
+        return;
+    }
+    if (ls.edits < newest)
+        ImGui::TextColored(ImVec4(1, 1, 0.5f, 1), "live: writing the cells of edit #%d... (the helper is at #%d)",
+                           newest, ls.edits);
+    else
+        ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1), "live: %d cell(s) replaced. Ride ~300 m away and back: an "
+                           "edit shows when its cell streams in again.", (int)ls.cells.size());
+    if (!ls.note.empty()) ImGui::TextDisabled("%s", ls.note.c_str());
+    if (ls.cells.empty() || !ImGui::TreeNode("live cells")) return;
+    for (const live::CellState &c : ls.cells)
+        ImGui::BulletText("%s %s (%s): %s", c.map.c_str(), c.name.c_str(),
+                          c.mode == "same" ? "same size" : "bigger: index redirected", c.state.c_str());
+    if (!ls.io.empty()) ImGui::TextDisabled("%s", ls.io.c_str());
+    ImGui::TreePop();
+}
+
 void draw_edits() {
     int count = 0;
     for (const json &e : g_edits) count += e.is_object() && e.value("map", "") == MAPS[g_map];
@@ -667,7 +695,7 @@ void draw_edits() {
         }
     }
     ImGui::EndChild();
-    ImGui::TextDisabled("Edits show from the next game start (the session writes them into the world cells).");
+    draw_live();
     ImGui::TreePop();
 }
 
@@ -750,6 +778,10 @@ extern "C" POWDER_EXPORT int powder_mod_init(const PowderApi *api, PowderMod *mo
     GetModuleFileNameW(me, self, MAX_PATH);
     g_dir = self;
     g_dir = g_dir.substr(0, g_dir.find_last_of(L'\\') + 1) + L"world_editor\\";   // powder_mods\world_editor\ .
+    std::wstring game = g_dir.substr(0, g_dir.size() - 1);                         // ...\powder_mods\world_editor
+    game = game.substr(0, game.find_last_of(L'\\'));                               // ...\powder_mods
+    game = game.substr(0, game.find_last_of(L'\\') + 1);                           // Steep's folder
+    live::init(api, mod, g_dir, game);
     api->add_panel(mod, "World editor", panel, nullptr);
     api->on_frame(mod, frame, nullptr);
     api->log(mod, "World editor panel ready (Mods tab)");

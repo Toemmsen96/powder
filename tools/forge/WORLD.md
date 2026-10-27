@@ -244,7 +244,50 @@ no difference either. The values stay as written until the cell streams out; on 
 the archives again (the writes are gone). So static props are drawn from data built at cell load (GPU instance
 buffers, `FillBatchInstanceBuffer...`), not from these copies. Live edits need either the engine's own
 "transform changed" path for an entity (RE: what dynamic objects call) or the cell's data replaced when it is read
-(a file-read hook in the client serving edited cells as the player rides back in). Not pursued yet.
+(a file-read hook in the client serving edited cells as the player rides back in): the second is what
+mods/world_editor does now (below).
+
+### The archive index in memory (2026-10-27, read from the running game)
+
+- Each open archive keeps its index as **one array of 24-byte records** `u64 offset, u64 entry id, u32 size, u32`
+  (the last u32 is not cleared: padding), all of its tables concatenated in file order, so record k is the entry
+  forge.py numbers k (`Entry.index`; C: all 24,312 records of `DataPC_STP_Alpes.forge`'s 5 tables, and the 7 of a
+  session `_patch_03`, match the file's index one for one). The array is a heap block (an anonymous rw-p mapping;
+  0x46b60000 for the Alps base in that run, so: its address changes per start, the layout is the build's).
+- The archive object points at it as `{ptr, u32 count, u32 capacity | 0xC0000000}` (Ubisoft's array header; the
+  0xC0000000 flags as in other containers), next to a copy of the archive header (entry count, 5000 slots, tables).
+  No file size was found next to it (G: reads are not checked against the file's length).
+- This array is the **only place the game holds an entry's offset** (C: searching the whole process for a cell's
+  u64 offset finds only its record), and the offset never appears without its id and size next to it. Other copies
+  of the id exist (G: the id -> archive lookup), without offset or size. So the record is what a cell read is made
+  from: pointing a record elsewhere (offset and size) moves where the game reads that entry (G, the in-game test).
+- Reads are chunked (4 KB .. 640 KB) and aligned (51,760 of 51,905 archive reads in a trace start and end on 4 KB;
+  the others read headers and index tables, 64 KB from odd offsets, once per archive), the same entry read again
+  each time its cell streams in (`powder_asset_trace.log`). The hook does not depend on the alignment. The game has an `AsyncFileCompletionThread`;
+  Wine opens the archives without O_DIRECT (`/proc/<pid>/fdinfo`). How the reads complete (event, APC, completion
+  port) is not known from outside: world_editor.dll logs it the first time it serves a read.
+
+### Live edits (mods/world_editor, 2026-10-27; not yet tried in-game)
+
+`live.py` (the session helper) turns each change of the server's edit list into complete cell datafiles, and
+`world_editor.dll` (`src/live.cpp`) serves them as the game reads its archives (ntdll `NtReadFile`):
+
+- **same size**: the edited cell, recompressed and padded to exactly its entry's size (README.md "Datafiles"), is
+  copied over the archive's bytes of that entry in every read that overlaps it. No memory of the game changes.
+  Moves, turns, scales and removes fit in every case tried (they keep or shrink the cell; recompression gains
+  ~5 %); an added copy of an object the cell already has often fits too (zstd finds the repetition).
+- **grow**: a cell that does not fit (an added object new to a small cell) gets its record (above) pointed at a slot
+  past the end of the archive (`align_up(size, 1 MiB) + 256 MiB`, 1 MiB slots), whose reads the DLL answers. The
+  record is found once by a read-only scan for `{offset, id, size}` with the neighbouring records as the helper
+  says they are; undone, the record gets its own values back.
+- A patched read is done privately (own event, no APC, no packet) and then completed for the game as the I/O
+  manager would: its event, its APC, or a packet on the handle's completion port (seen bound through
+  `NtSetInformationFile`, or learnt from a packet the game dequeues). Until a handle's port is known, its patched
+  reads complete as the game asked and are patched when the read returns or its packet is dequeued, whichever is
+  first (under a lock, so the game never sees half a patch).
+- Limits: the archive's PrefetchingFileInfos (read at start) is not changed, so a copy from another cell brings no
+  prefetch records live (its meshes may not stream until the next start, G); the cell must be read again (ride
+  ~300 m away and back) for an edit to show; grow needs the record found.
 
 ## Related work
 

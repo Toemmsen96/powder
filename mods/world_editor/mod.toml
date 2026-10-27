@@ -1,4 +1,4 @@
 version = "0.1"
-description = "World editor: add, move, turn, scale and remove objects in the world from the overlay menu (Mods tab); the edits apply at the next game start"
+description = "World editor: add, move, turn, scale and remove objects in the world from the overlay menu (Mods tab); an edit shows when its cell streams in again (live helper) or at the next game start"
 [client]
 inject = ["world_editor.dll"]
