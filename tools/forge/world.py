@@ -180,9 +180,16 @@ class Map:
         return have[0]
 
     def cell(self, index: int, layer: int | None = None) -> Cell:
+        """A cell as the archives hold it; with `keep_cells` (edit, apply) parsed once (edits work on copies)."""
         key = self.key(index, layer)
-        fg, e = self.cells[key]
-        return Cell(index, os.path.basename(fg.path), e, forge.parse_datafile(fg.read(e)).resources, key[0])
+        cache = self.__dict__.setdefault("_cell_cache", {})
+        if key not in cache:
+            fg, e = self.cells[key]
+            c = Cell(index, os.path.basename(fg.path), e, forge.parse_datafile(fg.read(e)).resources, key[0])
+            if not getattr(self, "keep_cells", False):
+                return c
+            cache[key] = c
+        return cache[key]
 
 
 @dataclass
@@ -342,8 +349,19 @@ class Cell:
         return self.entry.name
 
     def objects(self) -> list[Placed]:
-        return [self.decode(self.by_id[i]) if i in self.by_id else Placed(forge.Resource(i, 0, "", b""), "missing")
-                for i in self.block.ids]
+        return [self.placed_object(i) for i in self.block.ids]
+
+    def placed_object(self, i: int) -> Placed:
+        """Listed object `i`, decoded once per cell (a cell's resources do not change; edits copy them)."""
+        cache = self.__dict__.setdefault("_decoded", {})
+        if i not in cache:
+            cache[i] = self.decode(self.by_id[i]) if i in self.by_id else Placed(forge.Resource(i, 0, "", b""),
+                                                                                  "missing")
+        return cache[i]
+
+    def proxies(self) -> list[Placed]:
+        """The listed proxies only (what following a moved object needs: no prop/child scans of the others)."""
+        return [self.placed_object(i) for i in self.block.ids if i in self.by_id and self.by_id[i].type == PROXY]
 
     def prop_names(self, p: bytes, limit: int = 8) -> list[str]:
         props = {r.id: r.name for r in self.resources if r.type == PROP}
@@ -378,11 +396,11 @@ class Cell:
 
     def find(self, spec: str) -> Placed:
         """A listed object by id (0x...) or exact name."""
-        objs = self.objects()
         if re.fullmatch(r"0x[0-9a-fA-F]+", spec):
-            hit = [o for o in objs if o.res.id == int(spec, 16)]
+            hit = [i for i in self.block.ids if i == int(spec, 16)]
         else:
-            hit = [o for o in objs if o.res.name == spec]
+            hit = [i for i in self.block.ids if (self.by_id[i].name if i in self.by_id else "") == spec]
+        hit = [self.placed_object(i) for i in hit]
         if len(hit) != 1:
             sys.exit(f"{self.name}: {len(hit)} listed objects match {spec!r}")
         return hit[0]
@@ -442,7 +460,7 @@ def transform_object(pl: Placed, delta: list[float], rids: set[int]) -> bytes:
 
 
 def proxies_of(cell: Cell, target: int) -> list[Placed]:
-    return [o for o in cell.objects() if o.kind == "proxy" and target in o.targets]
+    return [o for o in cell.proxies() if o.kind == "proxy" and target in o.targets]
 
 
 def merge_prefetch(own: bytes | None, extra: bytes | None, wanted: set[int]) -> bytes | None:
@@ -693,7 +711,7 @@ def edit_proxies(mp: Map, cell: Cell, targets: dict[int, list[float] | None], ra
             continue
         c = mp.cell(idx, cell.layer)
         ce = edits.get((cell.layer, idx)) if edits is not None else None
-        for o in c.objects():
+        for o in c.proxies():
             hit = [t for t in o.targets if t in targets]
             if o.kind != "proxy" or not hit or ce is not None and o.res.id not in ce.res:
                 continue
@@ -912,6 +930,7 @@ def write_edit(mp: Map, ce: CellEdit, out_dir: str) -> None:
 
 def cmd_edit(a):
     mp = Map(a.map)
+    mp.keep_cells = True
     c = mp.cell(a.cell, a.layer)
     warnings = []
 
@@ -1074,6 +1093,7 @@ def cmd_apply(a):
     """A list of world-editor edits (JSON: a list, or {"edits": [...]}) applied to this map: every cell it changes
     (and the neighbours whose proxies follow) written to -o, as `edit` writes them."""
     mp = Map(a.map)
+    mp.keep_cells = True
     with open(a.edits, encoding="utf-8") as f:
         data = json.load(f)
     edits = data.get("edits", []) if isinstance(data, dict) else data
@@ -1140,7 +1160,7 @@ def cmd_apply(a):
             if (sl, sc) not in sources:
                 sources[(sl, sc)] = mp.cell(sc, sl)
             src = sources[(sl, sc)]
-            pl = next((o for o in src.objects() if o.res.id == sid), None)
+            pl = src.placed_object(sid) if sid in src.block.ids else None
             if pl is None:
                 warn(f"{what}: no object {sid:#x} in its source cell {sc}: skipped")
                 continue
