@@ -1,9 +1,16 @@
 # master_chief: a costume from a downloaded model
 
-This mod turns the **military costume** (`COSTUME_M_MILITARY_GREY_94` / `_RED_95`) into Master Chief, for male and
-female riders. A skinned glTF model from Sketchfab is fitted onto Steep's skeleton. Chief replaces the costume's coat
-in all 4 LODs, his textures replace the coat's, and the rest of the set (pants, helmet, harness) shrinks to a point.
-`make_chief.py --target penguin` or `--target urban_japan` puts him on those costumes instead.
+This mod turns the **penguin costume** (`COSTUME_MF_PENGUIN_91`, its own full-body model `STP_M/F_Costume_005`) into
+Master Chief, for male and female riders, and gives the costume a **Chief picture** in the costume list (the menu
+icon `COSTUME_PENGUIN_MF_Map`, rendered from the model by `render_icon.py` when Blender is found). A skinned glTF
+model from Sketchfab is fitted onto Steep's skeleton. The penguin has a model of its own, so no other gear changes.
+`CHIEF_TARGET=military` (the military costume's coat; the rest of that set hidden, shared gear included) or
+`CHIEF_TARGET=urban_japan` (costume 016, not in the store) put him elsewhere.
+
+Why not a new costume item, or the unicorn: a new item is loaded by the game but not listed (it lacks a store GUID,
+see tools/forge/ITEMS.md; tied to an unused item-list entry's name it still did not show, 2026-10-27). The unicorn
+(`COSTUME_MF_UNI_012`) is a set of regular, shared models (`STP_M_Jacket_008`, `STP_M_Pants_007`, ...), so Chief
+there would change other jackets and pants too.
 
 **Model:** "Master Chief High Poly" by HarrisonHag1, licensed CC-BY-4.0
 (https://sketchfab.com/3d-models/master-chief-high-poly-18f5ee1d13904939971601055102c91b). This work is based on it.
@@ -44,7 +51,8 @@ in the store, so nobody could equip it. The penguin version was seen in the game
 |---|---|---|
 | the coat | `STP_M_Jacket_013`, `STP_F_Jacket_010` (entities, LOD0..3) | `mesh.py import --glb`: the whole model into the coat's one submesh; 63,200 vertices, 56,074 triangles in every LOD |
 | the textures | the coat's two colourways (`STP_MF_Jacket_013_T01`, `_T02`: 2 texture sets x 4 maps, with `_Mip0`/`_Mip1`) | `texture.py replace --raw-rows`: armour, suit, helmet and visor packed 2x2. The coat's embedded material holds the shared placeholder set, which stays |
-| the rest of the set | pants, helmet, harness and belts (M and F, 12 entities) | `mesh.py edit --scale 0.001` |
+| the rest of the set (military only) | pants, helmet, harness and belts (M and F, 12 entities) | `mesh.py edit --scale 0.001` |
+| the menu picture | the costume's icon texture (`DataPC_extra_2`, 256 x 256 BC7) | `render_icon.py` (Blender, Cycles on the CPU, a front view on a transparent background), `texture.py replace` |
 
 Every item that uses these models becomes Chief (or vanishes): the coat model in other colourways, the pants,
 helmet and harness on their own.
@@ -55,7 +63,7 @@ run alongside this mod.
 ## What you should see
 
 With Powder's store (no game-data pack, `data/store_items.json` from `tools/trainer/storemap.py`), every costume is a
-free offer. Take the **military** costume (grey or red) under Costumes & Equipments and equip it. The rider becomes Master Chief: green
+free offer. Take the **penguin** costume (its tile now shows Chief) under Costumes & Equipments and equip it. The rider becomes Master Chief: green
 armour, black undersuit and the gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the
 rider's animations (arms, legs, fingers), because his own skin weights were renamed to Steep's bones.
 

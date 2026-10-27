@@ -62,22 +62,25 @@ PRESETS = {
                           "STP_M_Backpack_002", "STP_F_Backpack_002", "STP_M_BackpackBelt_002_Default",
                           "STP_M_BackpackBelt_002_Large", "STP_M_BackpackBelt_NoBellyStrap_002",
                           "STP_F_BackpackBelt_Default_002", "STP_F_BackpackBelt_Large_002",
-                          "STP_F_BackpackBelt_NoBellyStrap_002"]},
+                          "STP_F_BackpackBelt_NoBellyStrap_002"],
+                 "icons": ["STP_ICON_COSTUME_M_MILITARY_GREY_94_00004_Map", "STP_ICON_COSTUME_M_MILITARY_RED_95_00004_Map"]},
     "penguin": {"costumes": {"M": "STP_M_Costume_005", "F": "STP_F_Costume_005"},
                 "layout": {"STP_MF_Costume_005": QUARTERS},
                 "collapse": ["STP_MF_Costume_005_HEAD", "0x9c6dd89793", "0x9c6dd897bb"],  # head, goggle, glass
-                "colourways": {}, "embedded": True, "hide": []},
+                "colourways": {}, "embedded": True, "hide": [], "icons": ["COSTUME_PENGUIN_MF_Map"]},
     "urban_japan": {"costumes": {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"},
                     "layout": {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
                                "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
                                "STP_MF_Costume_016_Helmet_ALL": [("chiefhelmet", (0.0, 0.0, 0.5, 1.0)),
                                                                  ("chiefvisor", (0.5, 0.0, 0.5, 1.0))]},
                     "collapse": ["STP_MF_Glass_ALL"], "embedded": True, "hide": [],
+                    "icons": ["STP_ICON_COSTUME_MF_URBAN_OUTFIT_JAPAN_139_00006_Map"],
                     "colourways": {f"STP_MF_Costume_016_{p}_ALL": rf"STP_MF_Costume_016_{p}_T\d+"
                                    for p in ("Jacket", "Pants", "Helmet")}},
 }
-DEFAULT_TARGET = "military"
+DEFAULT_TARGET = "penguin"
 KEYS = ("costumes", "layout", "collapse", "colourways", "embedded", "hide")
+ICON_BASE = "DataPC_extra_2"  # the costumes' menu pictures (UI textures, 256 x 256)
 COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[DEFAULT_TARGET][k] for k in KEYS)
 SLOTS = {0: "diffuse", 1: "normal", 2: "specular", 7: "mask"}  # TextureSet slot -> map
 FALLBACK = ("Pants", "Glove", "Jacket")  # gear of the same gender searched for bones the costume lacks
@@ -385,6 +388,7 @@ def main():
     ap.add_argument("-o", "--out", default=os.path.join(HERE, "client", "forge"))
     ap.add_argument("--glb", help="also keep the fitted models, <this>_M.glb and <this>_F.glb (to look at in Blender)")
     ap.add_argument("--target", choices=sorted(PRESETS), default=DEFAULT_TARGET, help="the costume Chief replaces")
+    ap.add_argument("--icon", help="the costume's menu picture (PNG, e.g. from render_icon.py)")
     a = ap.parse_args()
     global COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE
     COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[a.target][k] for k in KEYS)
@@ -431,6 +435,10 @@ def main():
                 run(os.path.join(TOOLS, "mesh.py"), "edit", os.path.join(a.game, base + ".forge"), entry,
                     "--scale", "0.001", "-o", os.path.join(a.out, base))
             print(f"  hidden: {name}")
+        for name in PRESETS[a.target]["icons"] if a.icon else []:
+            run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, ICON_BASE + ".forge"), name,
+                "--image", a.icon, "-o", os.path.join(a.out, ICON_BASE))
+            print(f"  picture: {name}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
