@@ -1,5 +1,9 @@
 # Content mods that combine (design, 2026-10-27)
 
+Status: phases 1-2 (several costumes per run, own names and pictures) CONFIRMED in-game; phase 3 `tools/forge/compose.py`
+built and tested outside the game (two costume mods + a world-edit mod in one build, cached, refusals); the
+content.toml keys it reads are in its docstring. Grants: `<data>/content_grants.json` (Rust server).
+
 Goal: mods that **add** things (costumes, gear, world objects, texts) are drop-in folders, and any set of them works
 together, like ReSkate's mod folders for Skate 3. Today an asset mod ships whole copies of the entries it changes
 (`client/forge/<Base>/`): two mods that each add a costume both ship their own copy of Game Bootstrap Settings and the

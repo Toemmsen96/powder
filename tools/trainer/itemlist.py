@@ -41,28 +41,49 @@ def main():
         return
     if not a.add or not len(a.add) == len(a.like) == len(a.id):
         sys.exit("give --add NAME --id 0x... --like ITEM for each item")
-    items = json.load(open(a.game_list))["items"]
+    write(a.game_list, a.data, list(zip(a.add, a.id, a.like)), keep_custom=True)
+
+
+def guid_of(name: str) -> str:
+    return str(uuid.uuid5(NAMESPACE, name))
+
+
+def write(game_list: str, data: str, customs: list[tuple[str, str, str]], grants: list[str] | None = None,
+          keep_custom: bool = False) -> dict[str, str]:
+    """The served item list (`<data>/item_list.json`: the game's list plus each custom item), its store offers
+    (`store_items.json`, entries marked custom) and the grants (`content_grants.json`). customs: (name, resource
+    id "0x...", the item whose list entry it copies); grants: names of customs every player gets. Custom store
+    entries of items no longer given are dropped unless keep_custom. Returns name -> GUID."""
+    items = json.load(open(game_list))["items"]
     by_name = {it["nameId"]: it for it in items}
-    store_path = os.path.join(a.data, "store_items.json")
+    store_path = os.path.join(data, "store_items.json")
     store = json.load(open(store_path)) if os.path.exists(store_path) else {}
-    for name, like, rid in zip(a.add, a.like, a.id):
+    if not keep_custom:
+        store = {k: v for k, v in store.items() if not v.get("custom")}
+    guids = {}
+    for name, rid, like in customs:
         src = by_name.get(like)
         if not src:
             sys.exit(f"{like}: no list entry has this nameId")
-        guid = str(uuid.uuid5(NAMESPACE, name))
         if "gameId" not in src.get("obj", {}):
             sys.exit(f"{like}: its entry has no obj.gameId (read the list with a current storemap.py --item-list)")
+        guid = guids[name] = guid_of(name)
         obj = {**src["obj"], "gameId": int(rid, 16), "price": 0}
         if "Token" in obj:
             obj["Token"] = 0  # the source's unlock token (e.g. a Ubisoft Club reward's) is not the new item's
         items = [it for it in items if it["nameId"] != name] + [{**src, "itemId": guid, "nameId": name, "obj": obj}]
         store[name] = {"guid": guid, "type": "0x3856b74b", "tags": src["tags"], "custom": True}
-        print(f"{name}: {guid} ({src['type']}, obj {obj}), tags {', '.join(src['tags'])}")
+        print(f"  {name}: {guid} (list entry of {like})")
+    out = os.path.join(data, "item_list.json")
     with open(out, "w") as f:
         json.dump({"items": items}, f, indent=1)
     with open(store_path, "w") as f:
         json.dump(store, f, indent=1)
-    print(f"{out}: {len(items)} items; {store_path}: {len(store)} store items (restart the server)")
+    if grants is not None:  # compose.py's; the command line leaves them alone
+        with open(os.path.join(data, "content_grants.json"), "w") as f:
+            json.dump([guids[n] for n in grants if n in guids], f, indent=1)
+    print(f"{out}: {len(items)} items; {len(store)} store items (restart the server)")
+    return guids
 
 
 if __name__ == "__main__":
