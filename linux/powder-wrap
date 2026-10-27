@@ -193,7 +193,7 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     nss=$(mktemp)
     sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
     mount --bind "$nss" /etc/nsswitch.conf
-    # the logo videos and the loading video at start (POWDER_SKIP_INTRO=0 keeps them): for this session only,
+    # the logo, loading and disclaimer videos at start (POWDER_SKIP_INTRO=0 keeps them): for this session only,
     # Steep's videos/ folder is covered by a folder of links to every other video (through a second view of the real
     # folder, so the links do not point into the cover); the game's files stay as they are
     vids="" vorig=""
@@ -202,7 +202,7 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
         vids=$(mktemp -d) vorig=$(mktemp -d)
         mount --bind "$vd" "$vorig"
         for f in "$vorig"/*; do
-            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2) continue ;; esac
+            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2|disclaimer.bk2) continue ;; esac
             ln -s "$f" "$vids/${f##*/}"
         done
         mount --bind "$vids" "$vd"
