@@ -78,11 +78,12 @@ build_overlay() {
 
 # Client mods: each mods/<name>/src/ with C++ sources becomes mods/<name>/client/<name>.dll, linked with its own
 # copy of Dear ImGui (the overlay's version; the mod attaches to the overlay's context, native/sdk/powder_api.h).
+# nlohmann/json (json.hpp, header-only) is on the include path too.
 build_mods() {
     fetch_deps
     local img="$tp/imgui" obj="$bin/obj-mods"
     rm -rf "$obj"; mkdir -p "$obj"
-    local flags=(-O2 -std=c++17 -Wall -I"$img" -I"$here/sdk")
+    local flags=(-O2 -std=c++17 -Wall -I"$img" -I"$here/sdk" -I"$tp/json")   # json.hpp: mods may use it too
     for s in imgui imgui_draw imgui_tables imgui_widgets; do
         cxx "${flags[@]}" -c "$img/$s.cpp" -o "$obj/$s.o"
     done
