@@ -50,6 +50,22 @@ untrusted input: size limits, no paths outside the mod). Mods with code (client 
 master_chief's make_chief.py) keep today's per-player approval; for a content mod such a script runs on the
 author's machine and the mod ships its result (e.g. the fitted .glb).
 
+## The launcher's mod screen
+
+The launcher shows the server's mods before it connects (the server's `/_powder/mods` list, extended):
+
+| per mod | shown |
+|---|---|
+| name, description, author, license, size | from `mod.toml` |
+| what it adds | from `content.toml` ("2 costumes", "world edits in the Alps"), or "code: client DLL" |
+| required / optional | required: content in the server's item list or world (every player needs it, else items are missing for them and riders don't see each other's gear); optional: client-side extras (world editor, tools) |
+| status and next step | download (size), building against your install, ready, update available, needs approval (code) |
+
+Required mods must be ready before the launcher connects. Data-only mods download with one click (or automatically,
+if the player allows that for the server); mods with code always need an explicit approval and stay pinned to the
+approved hashes (today's rule). Linux: powder-wrap runs without a window under Lutris, so it shows the same list in a
+small dialog before the session (zenity/kdialog), and the overlay's Mods tab lists what the session loaded.
+
 ## The session build (`tools/forge/compose.py`, run by the launcher before the asset mods are packed)
 
 1. Read the named mods' `content.toml` in `POWDER_CLIENT_MODS` order; refuse duplicate item names; report two mods
