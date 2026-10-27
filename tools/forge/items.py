@@ -14,7 +14,7 @@ ITEMS.md next to this file.
   items.py show    <Steep folder> COSTUME_MF_URBAN_OUTFIT_JAPAN_139      # fields, tags, who references it, the chain
   items.py costumes <Steep folder>                                       # costume branches: tag -> selector -> entity
   items.py add-costume <Steep folder> --like COSTUME_MF_URBAN_OUTFIT_JAPAN_139 --name COSTUME_MF_POWDER_TEST_01 \
-           -o mods/<mod>/client/forge [--source-dir DIR]...
+           -o mods/<mod>/client/forge [--source-dir DIR]... [--title "Name in the game"]
 
 Archives are only read. `_patch_NN` archives past `_patch_02` are left out (they are asset mods' session archives,
 not the game's). Needs Python 3.10+ and forge.py's zstd module.
@@ -33,6 +33,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forge  # noqa: E402
+import loc  # noqa: E402
 
 # resource types
 ITEM, GEAR_LIST, TAG_REGISTRY, SELECTOR, TEMPLATE = 0x3856B74B, 0x5F0A43A7, 0xFFC5A970, 0x22ECBE63, 0x971A842E
@@ -127,6 +128,7 @@ def parse_item(b: bytes) -> dict:
     d["loc_obj"], c, d["loc"], n = struct.unpack_from("<QIII", b, o)
     if c != LOC_STRING:
         raise ValueError("no LocString at 0x13")
+    d["loc_off"] = o + 12  # the name's string id (loc.py)
     o += 20
     d["debug_name"] = b[o:o + 2 * n].decode("utf-16-le") if n else ""
     o += 2 * n + 2 if n else 0
@@ -510,6 +512,11 @@ def cmd_add_costume(a):
     if not a.keep_price:
         struct.pack_into("<I", p, d["price_off"], 0)
         p[d["default_off"]] = 1  # G: set on the stock riders' starter gear (see ITEMS.md)
+    title_id = None
+    if a.title:  # a name of its own: a new string id, its text added to every UI language package (loc.py)
+        title_id = loc.new_string_id(name, loc.all_ids(game.folder))
+        struct.pack_into("<I", p, d["loc_off"], title_id)
+        report.update(title=a.title, loc=f"{title_id:#x}", loc_was=f"{d['loc']:#x}")
     item_map = {src.id: item_id}
     for v in nested_ids(bytes(p), resource_ids):
         item_map[v] = ids.new(v)
@@ -637,6 +644,10 @@ def cmd_add_costume(a):
     os.makedirs(out_chr, exist_ok=True)
     written = []
     written.append(write_datafile(out_dc, BOOTSTRAP_ID, "Game Bootstrap Settings", new_bres, a.level))
+    if title_id is not None:
+        pk = loc.set_strings(game.folder, {title_id: a.title}, out_dc)
+        written += pk
+        report["loc_packages"] = len(pk)
     for base, tids in TEMPLATE_IDS.items():
         for tid in tids:
             _, res = game.datafile(base, tid)
@@ -672,6 +683,9 @@ def cmd_add_costume(a):
         print(f"  {w}")
     print(f"{name}: item {item_id:#x} in {gear_list}, tag {new_tag:#010x} (was {model_tag:#010x}), "
           f"{len(new_sels)} selectors, {len(plan)} cloned entries -> {a.out}")
+    if title_id is not None:
+        print(f"  name {a.title!r}: string id {title_id:#x} (was {d['loc']:#x}) in {report['loc_packages']} "
+              "language packages")
 
 
 def cmd_check(a):
@@ -717,6 +731,31 @@ def cmd_check(a):
     need(gear.payload.count(struct.pack("<Q", item_id)) == 1, "gear list: item not listed once")
     reg = nb[REGISTRY_ID].payload
     need(reg.count(struct.pack("<II", REG_ENTRY, new_tag)) == 1, "registry: new tag not registered once")
+
+    # the name: the source's string id, or (--title) a new one whose text every UI language package gained
+    src_item = next((r for r in orig if r.name == rep["like"]), None)
+    if item is not None and src_item is not None:
+        loc_id, src_loc = parse_item(item.payload)["loc"], parse_item(src_item.payload)["loc"]
+        if "loc" not in rep:
+            need(loc_id == src_loc, "item: string id differs from its source's")
+        elif need(loc_id == int(rep["loc"], 16) and loc_id != src_loc, "item: LocString does not name the new id"):
+            shipped = loc.packages(game.folder, subtitles=None)
+            need(all(loc_id not in x.package.strings for x in shipped), f"string id {loc_id:#x} is a shipped one")
+            for x in shipped:
+                if x.name.endswith("_Subtitles"):
+                    continue
+                hit = [h for h in glob.glob(os.path.join(out, "DataPC", f"{x.entry.id:016x}_*"))
+                       if h.endswith(".datafile") or os.path.isdir(h)]
+                if not need(len(hit) == 1, f"{x.name}: not written once"):
+                    continue
+                q = loc.Package.parse(load(hit[0])[0].payload)
+                e0 = x.package.entries
+                need(q.head == x.package.head and q.b1 == x.package.b1, f"{x.name}: header changed")
+                need(q.entries[:len(e0)] == e0 and all(y == 0 for _, y in q.entries[len(e0):]),
+                     f"{x.name}: dictionary entries changed (only new leaves may be appended)")
+                need(loc_id in q.strings and q.text(loc_id) == rep["title"], f"{x.name}: the name does not read back")
+                need({k: v for k, v in q.strings.items() if k != loc_id} == x.package.strings,
+                     f"{x.name}: other strings changed")
 
     # the templates: the new branch, the new selectors, the lists; shared resources identical in every copy
     sel_new = {int(v, 16) for v in rep["selectors"].values()}
@@ -914,6 +953,8 @@ def main(argv=None):
                         "instead of the game's copy, by entry id")
     p.add_argument("--keep-price", action="store_true", help="keep the source's price and flags (default: price 0, "
                    "default-item flag set)")
+    p.add_argument("--title", help="the item's name in the game, e.g. \"Master Chief\": a new string id in every UI "
+                   "language package (default: the source's name)")
     p.add_argument("--level", type=int, default=9, help="zstd level for the patched datafiles")
     p.add_argument("-o", "--out", required=True, help="output: <out>/DataPC/ and <out>/DataPC_extra_chr/")
     p.set_defaults(fn=cmd_add_costume)

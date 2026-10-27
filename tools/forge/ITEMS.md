@@ -11,6 +11,7 @@ items.py show      <Steep> COSTUME_MF_URBAN_OUTFIT_JAPAN_139  # fields, tags, li
 items.py costumes  <Steep>                                # STP_M/F_Clothing: tag -> costume selector -> entity, items
 items.py add-costume <Steep> --like ITEM | --costume STP_M_Costume_NNN --name NEW_NAME -o mods/<mod>/client/forge
                      [--source-dir <another mod's client/forge/DataPC_extra_chr>]... [--keep-price] [--label L]
+                     [--title "Name in the game"]
 items.py check     <Steep> mods/<mod>/client/forge/NEW_NAME.json [--source-dir ...]
 ```
 
@@ -62,7 +63,7 @@ items (95%) with this layout (C); the other 124 (Olympics / freestyle / "OG" ite
 |---|---|---|
 | 0x00 | u64 id, u32 class 0x3856B74B | C |
 | 0x0C | 7 bytes `01 01 00 ff ff ff ff` (`01 00 00 ...` on NONE_ITEM_TOOL) | G |
-| 0x13 | LocString object: u64 id, class 0x81A7045D, u32 **string id** (the localized name), u32 n, n UTF-16 chars + NUL (a debug name, e.g. "Military Jacket 01"; empty on most) | C layout, G meaning |
+| 0x13 | LocString object: u64 id, class 0x81A7045D, u32 **string id** (the localized name: 0x4ed2 = "GREEN MOSAICS - JAPAN OUTFIT", LOCALIZATION.md), u32 n, n UTF-16 chars + NUL (a debug name, e.g. "Military Jacket 01"; empty on most) | C |
 | | u8 3, u32 n, n links: **unlock conditions** (0x79BECE6D, e.g. "Kevin Rolland Scarf Unlock Condition") | C |
 | | item block: u64 id, class 0x72873A8E, 96 bytes | C size |
 | block+0x08 | u8: 1, except 0 on the OG/Olympics items and the `*_NONE_EMPTY` items | G: shown in the shop |
@@ -163,7 +164,7 @@ needs it).
 
 | folder | entries |
 |---|---|
-| `DataPC/` | `Game Bootstrap Settings` (the new item after its source, the GEAR list, the tag registry), `STP_M_NPC_Template`, `STP_F_NPC_Template` as packed `.datafile`s (146 MB uncompressed; packed once here, so the session build only copies them) |
+| `DataPC/` | `Game Bootstrap Settings` (the new item after its source, the GEAR list, the tag registry), `STP_M_NPC_Template`, `STP_F_NPC_Template` as packed `.datafile`s (146 MB uncompressed; packed once here, so the session build only copies them); with `--title` the 17 UI `LocalizationPackage_*` with the name added |
 | `DataPC_extra_chr/` | `STP_MF_Template`, `STP_F_Template` (`.datafile`); one unpacked folder per cloned entry (entities, materials, textures), each with its prefetch blob and a `clone` note in `datafile.json` |
 | `<name>.json` | the report: tags, ids (old -> new), selectors, entities |
 
@@ -229,5 +230,10 @@ master_chief's entries.
 3. **Drawing it.** The new tag -> new Clothing branch -> new selector -> new entity in DataPC_extra_chr_patch_03.
    If the rider shows the default clothes instead, the selector side was not found (registry, list order, or the
    template copies); if the game crashes when the costume is equipped, suspect the entity / material clones.
-4. Name and icon: the source's (localization is not decoded; type 0x6E3C9C6F G).
+4. Name and icon: the source's icon. The name: the source's, or with `--title` a string of its own (2026-10-27,
+   LOCALIZATION.md): the item's LocString names a new string id (`0x8000 + crc32(name) % 0x4000`, past every shipped
+   id; COSTUME_MF_POWDER_MASTER_CHIEF: 0x86ef), whose text `loc.py` adds to every UI language package (the source keeps
+   0x4ed2). `check` verifies the item names the new id, no shipped package has it, every UI package was written once
+   with the name reading back, the shipped dictionary entries kept (only new leaves appended) and every other string
+   unchanged. Not yet seen in the game.
 5. A save that holds the new item id after the mod is removed: unknown. Un-equip it before turning the mod off.
