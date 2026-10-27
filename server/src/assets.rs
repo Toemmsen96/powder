@@ -283,6 +283,34 @@ pub fn synthetic_offer(item_id: &str) -> Option<Value> {
                             "items": [{"itemId": item_id, "quantity": 1}]}))
 }
 
+/// The store items the game itself knows, as free shop offers. tools/trainer/storemap.py reads them out of the
+/// running game into `<data>/store_items.json` (item name -> {guid, tags, ...}); without a game-data pack the store
+/// is otherwise empty, and the game's gear menus ask for offers by tag (`offers?tags=COSUTME`, `JACKET`, ...).
+/// Each item with tags becomes a "shop" offer with its synthetic id (synthetic_offer), so a purchase grants it
+/// through apply_offer's synthetic path without stored state.
+pub fn local_store(path: &Path) -> OfferCatalog {
+    let Ok(raw) = std::fs::read(path) else { return OfferCatalog::default() };
+    let items = match serde_json::from_slice::<Value>(&raw) {
+        Ok(Value::Object(items)) => items,
+        _ => {
+            log::warn!(target: "powder.economy", "{}: not an object of items, left out", path.display());
+            return OfferCatalog::default();
+        }
+    };
+    let mut offers = vec![];
+    for v in items.values() {
+        let (Some(guid), Some(tags)) = (v.get("guid").and_then(Value::as_str), v.get("tags").and_then(Value::as_array))
+        else { continue };
+        let Some(mut offer) = synthetic_offer(guid) else { continue };
+        offer["type"] = Value::from("shop");
+        offer["spaceId"] = Value::from(crate::constants::SPACE_ID);
+        offer["tags"] = Value::Array(tags.clone());
+        offers.push(offer);
+    }
+    log::info!(target: "powder.economy", "{}: {} store items as free offers", path.display(), offers.len());
+    OfferCatalog::new(offers)
+}
+
 /// The item of a synthetic offer id (see synthetic_offer).
 pub fn synthetic_item(offer_id: &str) -> Option<String> {
     xor_uuid(offer_id)
@@ -323,6 +351,8 @@ pub struct Assets {
     pub http: HttpFixtures,
     pub rmc: RmcFixtures,
     pub catalog: OfferCatalog,
+    /// Without a pack: the game's own store items as free offers (local_store).
+    pub local_store: OfferCatalog,
     pub actions: Vec<Value>,
     pub connect_http: HttpFixtures,
     pub products: ConnectProducts,
@@ -460,6 +490,28 @@ mod tests {
         assert_eq!(f.lookup("GET", "h", "/v1/profiles/aaaaaaaa-1111-2222-3333-444455556666/x").unwrap().1, "normalized");
         assert!(f.lookup("GET", "h", "/v1/spaces/s/offers?offset=100").is_none());
         assert_eq!(f.entries[1].content_type, "application/json");
+    }
+
+    #[test]
+    fn local_store_offers_the_tagged_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store_items.json");
+        let costume = "28b58162-91b9-4030-905c-05da7f5b6549";
+        std::fs::write(&path, json!({
+            "COSTUME_M_MILITARY_GREY_94": {"guid": costume, "id": "0xecf0fb13f8", "type": "0x3856b74b",
+                                           "tags": ["HELMET", "GEAR", "COSTUME_M_MILITARY_GREY_94", "COSUTME", "BASIC"]},
+            "CHALLENGE_MEDAL_BRONZE_X": {"guid": "487bd3df-5bfc-41e0-bd84-9f9017114aa5", "id": "0x1", "type": "0x2"},
+        }).to_string()).unwrap();
+        let store = local_store(&path);
+        assert_eq!(store.len(), 1); // the medal has no tags: not a store item
+        let found = store.query(Some("COSUTME"), None, None, 0, 10);
+        assert_eq!(found.len(), 1);
+        let offer = &found[0];
+        assert_eq!(offer["type"], "shop");
+        assert_eq!(offer["items"][0]["itemId"], costume);
+        assert_eq!(synthetic_item(offer["offerId"].as_str().unwrap()).as_deref(), Some(costume));
+        assert!(store.query(Some("COSUTME"), Some("progression"), None, 0, 10).is_empty());
+        assert!(local_store(&dir.path().join("missing.json")).is_empty());
     }
 
     #[test]

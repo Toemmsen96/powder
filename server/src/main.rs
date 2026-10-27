@@ -432,7 +432,11 @@ async fn run(config: Config) -> Result<()> {
     let db = Arc::new(Db::open(&Services::move_legacy_db(config.data_dir())?)?);
     db.migrate()?;
     log::info!(target: "powder", "data: {} (schema v{})", config.data_dir().display(), db.version()?);
-    let assets = Arc::new(if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() });
+    let mut assets = if config.server.use_gamedata { Assets::load(config.gamedata_dir()) } else { Assets::default() };
+    if assets.synthesizes_offers() {
+        assets.local_store = powder_server::assets::local_store(&config.data_dir().join("store_items.json"));
+    }
+    let assets = Arc::new(assets);
     let repos = Arc::new(Repos::new(db));
     let mods = Arc::new(parking_lot::Mutex::new(ModHost::load(&config, repos.clone())));
     let services = Arc::new(Services::new(config.clone(), assets.clone(), repos.clone(), Some(mods.clone())));

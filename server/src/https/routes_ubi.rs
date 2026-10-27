@@ -365,6 +365,9 @@ fn get_offers(c: &Ctx) -> Reply {
         grant_onboarding_token(c, ids);
     }
     let mut all = c.state.assets.catalog.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX);
+    if c.state.assets.synthesizes_offers() && q.get("tags").is_some() {
+        all.extend(c.state.assets.local_store.query(q.get("tags"), q.get("type"), q.get("itemIds"), 0, usize::MAX));
+    }
     if c.state.assets.synthesizes_offers() && q.get("tags").is_none() && q.get("type").is_none() {
         for item in q.get("itemIds").unwrap_or("").split(',').filter(|s| !s.is_empty()) {
             let granted = all.iter().any(|o| o.get("items").and_then(Value::as_array).is_some_and(|items| {

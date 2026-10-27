@@ -10,6 +10,9 @@ Owning an item = having its GUID in the inventory: `powder-server admin grant <G
 tab -> Grant.
 
   storemap.py <pid> <Steep folder> [-o out.json] [-g NAME]...   (-g: print only names containing NAME)
+
+Without a game-data pack, the server serves the catalogue items (those with tags) as free store offers when
+`<data>/store_items.json` exists: `storemap.py <pid> <Steep folder> -o data/store_items.json`.
 """
 
 import argparse
@@ -69,7 +72,7 @@ def items(game: str) -> dict[int, tuple[int, str]]:
 SPACE = b"a20f75db-9175-4df6-b1b3-ba42e291166c\x00"  # Steep's space id
 
 
-def catalogue(mem, pid: int, names: dict) -> dict[str, str]:
+def catalogue(mem, pid: int, names: dict) -> dict[str, tuple[str, list]]:
     """The game's item catalogue: per item a list of tags (std::string records, 48 bytes each, one of them the
     item's own name), then its GUID and the space id (as strings, then again as inline text). Anchored on the
     inline space-id text: the GUID's text sits 0x30 before it, the last tag 0xb0 before it."""
@@ -100,7 +103,7 @@ def catalogue(mem, pid: int, names: dict) -> dict[str, str]:
                     tags.append(s)
                 for t in tags:
                     if t in names:
-                        out.setdefault(t, guid.decode())
+                        out.setdefault(t, (guid.decode(), tags[::-1]))
             i = buf.find(SPACE, i + 1)
     return out
 
@@ -137,10 +140,10 @@ def main():
         out[name] = {"guid": sorted(gs)[0] if len(gs) == 1 else sorted(gs), "id": f"{oid:#x}", "type": f"{typ:#x}"}
     print(f"{len(out)} progression objects with a store GUID", file=sys.stderr)
     names = {n: (oid, typ) for oid, (typ, n) in known.items()}
-    for name, guid in catalogue(mem, a.pid, names).items():
+    for name, (guid, tags) in catalogue(mem, a.pid, names).items():
         if name not in out:
             oid, typ = names[name]
-            out[name] = {"guid": guid, "id": f"{oid:#x}", "type": f"{typ:#x}"}
+            out[name] = {"guid": guid, "id": f"{oid:#x}", "type": f"{typ:#x}", "tags": tags}
     print(f"{len(out)} game objects with a store GUID in all", file=sys.stderr)
     for name, v in out.items():
         if not a.grep or any(g.lower() in name.lower() for g in a.grep):
