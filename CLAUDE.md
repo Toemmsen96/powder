@@ -266,8 +266,12 @@ API. Everything below is on `rework/rust-server`.
   skeleton by make_chief.py (bone map, per-bone fit to the target's rest pose, weights renamed, back faces added).
   The first version replaced the default jacket: CONFIRMED in-game that added bones (38) and the fit work (issues:
   Mask1 R=255 turns dark cloth pale cream; single-sided shells were see-through). The user wants costumes, as
-  additions if possible: a new item is not possible yet (TODO), so it now replaces costume 016 (camo soldier, M+F,
-  3 texture sets, glass submesh shrunk; not yet confirmed in-game). The rider faces -Y (left = +X).
+  additions if possible: a new item is not possible yet (TODO), so it replaces a costume: now the penguin
+  (STP_M/F_Costume_005, in the store; --target urban_japan = 016, whose items are not in the store). Costume
+  model per item: STP_M/F_Clothing records [class 0xb332698e, item tag u32] -> costume selector -> entity
+  (README table). Store unlock CONFIRMED 2026-10-27: data/store_items.json (storemap.py from the running game)
+  -> free shop offers; offers need public/partitionIndex/nameId/lastModified/dynamicItemsGroups or the game drops
+  the connection (DE-010-05). The rider faces -Y (left = +X).
 - **Tools:** tools/forge (forge.py archives + swap + where, texture.py, mesh.py + gltf.py, TEXTURES.md, MESHES.md,
   BLENDER.md),
   tools/savegame (save format, XOR key per account), tools/trainer (findpos/correlate/findauth2, watch.py and

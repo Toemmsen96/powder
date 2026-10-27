@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Master Chief as costume 016 (male and female): converts a skinned glTF onto Steep's skeleton and writes this mod's
-.forge entries (client/forge/<Base>/).
+"""Master Chief as a costume (male and female; --target, default the penguin costume, which is in the store):
+converts a skinned glTF onto Steep's skeleton and writes this mod's .forge entries (client/forge/<Base>/).
 
 The model is "Master Chief High Poly" by HarrisonHag1 (CC-BY-4.0,
 https://sketchfab.com/3d-models/master-chief-high-poly-18f5ee1d13904939971601055102c91b), unpacked into
@@ -10,12 +10,12 @@ off while one is worn. What this does:
    LeftArm, LeftHandIndex1, ...). Each bone is turned to point along Steep's bone and moved onto Steep's joint (the
    costume's own rest pose, for each gender); the vertices follow by their own weights. Both stand in an A-pose
    facing -Y, so the changes are small. The weights are renamed to Steep's bones.
-2. Parts: the armor goes into the costume's jacket submesh, the suit into its pants, helmet and visor share its
-   helmet; each with its own texture set (diffuse, normal, specular, mask), so armor and suit keep 2048 pixels. The
-   glass submesh (its material is shared with other gear) shrinks to a speck. Every triangle gets a back face,
-   since the model's materials are double-sided and Steep draws front faces only.
+2. Parts (PRESETS): the model's materials go into the costume's submeshes and texture sets (penguin: all four
+   packed 2x2 into the body's; urban_japan: armor, suit and helmet into its own sets); the costume's other
+   submeshes (head, goggle, glass) shrink to a speck. Every triangle gets a back face, since the model's materials
+   are double-sided and Steep draws front faces only.
 3. Out: `mesh.py import --glb` into every LOD of both costumes (bones they lack are added), `texture.py replace`
-   for the costume's 3 texture sets (the male and female costume share them).
+   for the costume's texture sets (the male and female costume share them).
 Needs numpy and Pillow (the textures are JPEG).
 """
 
@@ -39,14 +39,33 @@ import mesh  # noqa: E402
 import texture  # noqa: E402
 
 BASE = "DataPC_extra_chr"
-COSTUMES = {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"}
-# Steep material -> the model's materials it takes, each with its rectangle of the textures (x, y, w, h in UV units,
-# v pointing down as in the upright image)
-LAYOUT = {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
-          "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
-          "STP_MF_Costume_016_Helmet_ALL": [("chiefhelmet", (0.0, 0.0, 0.5, 1.0)),
-                                            ("chiefvisor", (0.5, 0.0, 0.5, 1.0))]}
-COLLAPSE = ["STP_MF_Glass_ALL"]  # shared with goggles and more: only its geometry goes, its textures stay
+# Which costume Chief replaces (--target). A costume's model is picked by the character template's
+# STP_M_Clothing / STP_F_Clothing selector from a tag of the costume's item (tools/forge ITEMS notes):
+#   penguin     STP_M/F_Costume_005, items JACKET_MF_C_Penguin_228 / COSTUME_MF_PENGUIN_91 (in the store)
+#   urban_japan STP_M/F_Costume_016, items COSTUME_MF_URBAN_OUTFIT_JAPAN_139..141 (not in the game's store)
+# layout: Steep material -> the model's materials it takes, each with its rectangle of the textures (x, y, w, h in
+# UV units, v pointing down as in the upright image); collapse: submeshes shrunk to a speck (by material name, or
+# 0x<id> for materials of other datafiles - those are shared with other gear, so their textures stay); colourways:
+# per layout material, a pattern of the colourway materials whose texture sets get the same maps.
+QUARTERS = [("chiefarmor", (0.0, 0.0, 0.5, 0.5)), ("chiefsuit", (0.5, 0.0, 0.5, 0.5)),
+            ("chiefhelmet", (0.0, 0.5, 0.5, 0.5)), ("chiefvisor", (0.5, 0.5, 0.5, 0.5))]
+PRESETS = {
+    "penguin": {"costumes": {"M": "STP_M_Costume_005", "F": "STP_F_Costume_005"},
+                "layout": {"STP_MF_Costume_005": QUARTERS},
+                "collapse": ["STP_MF_Costume_005_HEAD", "0x9c6dd89793", "0x9c6dd897bb"],  # head, goggle, glass
+                "colourways": {}},
+    "urban_japan": {"costumes": {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"},
+                    "layout": {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
+                               "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
+                               "STP_MF_Costume_016_Helmet_ALL": [("chiefhelmet", (0.0, 0.0, 0.5, 1.0)),
+                                                                 ("chiefvisor", (0.5, 0.0, 0.5, 1.0))]},
+                    "collapse": ["STP_MF_Glass_ALL"],
+                    "colourways": {f"STP_MF_Costume_016_{p}_ALL": rf"STP_MF_Costume_016_{p}_T\d+"
+                                   for p in ("Jacket", "Pants", "Helmet")}},
+}
+DEFAULT_TARGET = "penguin"
+COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS = (PRESETS[DEFAULT_TARGET][k] for k in ("costumes", "layout", "collapse",
+                                                                              "colourways"))
 SLOTS = {0: "diffuse", 1: "normal", 2: "specular", 7: "mask"}  # TextureSet slot -> map
 FALLBACK = ("Pants", "Glove", "Jacket")  # gear of the same gender searched for bones the costume lacks
 SIZE, PAD = 2048, 6 / 2048
@@ -225,9 +244,9 @@ def texture_sets(game: str) -> dict:
     for mat in LAYOUT:
         payload = by_name[mat].payload
         sets = [slots(next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload))]
-        part = mat.rsplit("_", 1)[0]  # STP_MF_Costume_016_Jacket
-        for e in fg.entries:
-            if e.type == 0x85C817C3 and re.fullmatch(re.escape(part) + r"_T\d+", e.name):
+        pattern = COLOURWAYS.get(mat)
+        for e in fg.entries if pattern else ():
+            if e.type == 0x85C817C3 and re.fullmatch(pattern, e.name):
                 newest, entry = mesh.game_entry(arch, f"{e.id:#x}")
                 for r in forge.parse_datafile(newest.read(entry)).resources:
                     if r.type == 0xD70E6670 and slots(r) not in sets:
@@ -351,7 +370,11 @@ def main():
     ap.add_argument("--model", default=os.path.join(HERE, "..", "..", "models", "master_chief_high_poly"))
     ap.add_argument("-o", "--out", default=os.path.join(HERE, "client", "forge"))
     ap.add_argument("--glb", help="also keep the fitted models, <this>_M.glb and <this>_F.glb (to look at in Blender)")
+    ap.add_argument("--target", choices=sorted(PRESETS), default=DEFAULT_TARGET, help="the costume Chief replaces")
     a = ap.parse_args()
+    global COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS
+    COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS = (PRESETS[a.target][k] for k in ("costumes", "layout", "collapse",
+                                                                            "colourways"))
     g = gltf.load(os.path.join(a.model, "scene.gltf"))
     steep, skin, mpos = model_bones(g)
     parts = model_geometry(g, skin)

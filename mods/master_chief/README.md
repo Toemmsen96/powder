@@ -1,8 +1,8 @@
 # master_chief: a costume from a downloaded model
 
-This mod turns costume 016 (the camo soldier with gas mask and helmet) into Master Chief, for male and female
-riders. A skinned glTF model from Sketchfab is fitted onto Steep's skeleton and replaces the costume's mesh in all
-4 LODs, and its textures replace the costume's. A costume is a whole-body item: the game takes the rest of the
+This mod turns the **penguin costume** into Master Chief, for male and female riders. A skinned glTF model from
+Sketchfab is fitted onto Steep's skeleton and replaces the costume's mesh in all 4 LODs, and its textures replace the
+costume's. A costume is a whole-body item: the game takes the rest of the
 outfit off while it is worn, so nothing else is touched.
 
 **Model:** "Master Chief High Poly" by HarrisonHag1, licensed CC-BY-4.0
@@ -19,26 +19,50 @@ The model is not in git (`models/` is ignored). Download it as glTF and unpack i
 
 Most of those formats are not decoded.
 
+## Which costume
+
+A costume's model is chosen by the character template (`STP_MF_Template`): its `STP_M_Clothing` / `STP_F_Clothing`
+selectors map a tag of the item to the costume's own selector, which names the entity. Read from the data
+(2026-10-27; * = in the game's store):
+
+| model (entity) | items |
+|---|---|
+| `STP_M/F_Costume_001` | Halloween 2018*, sumo jackets* |
+| `_002` | banana* |
+| `_003` | T-Rex* (5 colours) |
+| `_005` | **penguin*** (`JACKET_MF_C_Penguin_228`, costume `COSTUME_MF_PENGUIN_91`) |
+| `_010` | spandex* (5 colours) |
+| `_011`, `_013` | Olympic jackets, mascot |
+| `_014` | urban outfit bib* |
+| `_016` | urban outfit Japan (`COSTUME_MF_URBAN_OUTFIT_JAPAN_139..141`), not in the store |
+| `_017` | 90s* |
+
+The first costume version replaced 016 on the guess that it was the military costume. It is not: the military
+costume is made of regular gear (coat, pants, gloves, harness, helmet). And 016's items are not in the store, so
+nobody could equip it. The penguin is in the store and covers the head. `make_chief.py --target urban_japan` still
+builds the 016 version.
+
 ## What changes
 
 | what | entries (all in `DataPC_extra_chr`) | how |
 |---|---|---|
-| the male costume | `STP_M_Costume_016` (entity) with LOD0..3 | `mesh.py import --glb`: armor -> the jacket submesh, undersuit -> the pants submesh, helmet and visor -> the helmet submesh, the glass submesh shrunk to one 1 mm triangle; 63,203 vertices, 56,075 triangles in every LOD |
-| the female costume | `STP_F_Costume_016` with LOD0..3 | the same, fitted to the female skeleton |
-| the textures | all 3 colourways (the costume's items pick `_T01`..`_T03` materials): 9 texture sets x 4 maps, and their `_Mip0`/`_Mip1` | `texture.py replace`: armor and suit at 2048, helmet and visor side by side; every colourway the same |
+| the male costume | `STP_M_Costume_005` (entity) with LOD0..3 | `mesh.py import --glb`: the whole model into the body submesh (`STP_MF_Costume_005`); the head, the goggle and the glass submeshes shrunk to one 1 mm triangle each; 63,200 vertices, 56,074 triangles in every LOD |
+| the female costume | `STP_F_Costume_005` with LOD0..3 | the same, fitted to the female skeleton |
+| the textures | the penguin's texture set (4 maps, with `_Mip0`/`_Mip1`) | `texture.py replace`: armour, suit, helmet and visor packed 2x2 |
 
-The glass material (`STP_MF_Glass_ALL`) is shared with goggles and other gear, so its textures stay as they are and
-only the costume's glass geometry goes. Every costume 016 a rider wears becomes Master Chief.
+The goggle and glass materials are shared with other gear (`STP_MF_Goggle_001_T15`, `STP_MF_Glass_T23`), so their
+textures stay as they are and only the costume's geometry goes. Every penguin costume a rider wears becomes Master
+Chief.
 
 `mods/shoulder_pads`, `mods/mesh_edit` and `mods/custom_texture` change the jacket, not this costume, so they can
 run alongside this mod.
 
 ## What you should see
 
-Equip costume 016 under Costumes & Equipments: the camo soldier with gas mask and helmet, most likely the items
-`COSTUME_M_MILITARY_GREY_94` / `_RED_95` (in the game: a military costume; every colourway shows Chief). The rider becomes Master Chief: green armour, black undersuit and the
-gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the rider's animations (arms, legs,
-fingers), because his own skin weights were renamed to Steep's bones.
+With Powder's store (no game-data pack, `data/store_items.json` from `tools/trainer/storemap.py`), every costume is a
+free offer. Take the **penguin** under Costumes & Equipments and equip it. The rider becomes Master Chief: green
+armour, black undersuit and the gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the
+rider's animations (arms, legs, fingers), because his own skin weights were renamed to Steep's bones.
 
 ## How it was made (`make_chief.py`)
 
@@ -50,7 +74,7 @@ fingers), because his own skin weights were renamed to Steep's bones.
    weights. The rest pose is the costume's own. The bones it lacks come from the same gender's default gear:
    `Reference` and the forearms. The feet are squashed in height so the soles end on the floor.
 3. **Weights.** The model's own weights, renamed to Steep's bones: up to 4 per vertex. A rebuilt submesh gets a
-   fresh bone map (the armor needs 15 bones, the suit 47, the helmet 1: the head).
+   fresh bone map (47 bones for the whole model).
 4. **Back faces.** The model's materials are double-sided, but Steep draws front faces only. 318 triangles wound
    against their normals are turned round, and every triangle gets a back face.
 5. **Textures.** Per texture set:
@@ -70,9 +94,10 @@ replaces nothing the rider wears every day.
 ## Verified vs assumed
 
 Verified with tools, without running the game:
-- both costumes' 8 meshes pass `mesh.py check`;
+- both penguin costumes' 8 meshes pass `mesh.py check`;
 - the session archive (`DataPC_extra_chr_patch_03`) builds and passes `forge.py verify --decompress`;
-- both fitted models in Blender (5.2.3, through its MCP bridge), textured with the new maps, look right.
+- the fitted models looked right in Blender (5.2.3, through its MCP bridge) for the 016 version; the fit and
+  textures are the same for the penguin.
 
 Confirmed in the game with the jacket version: the bone mapping, the fit, added bones and the texture layout.
 
@@ -82,5 +107,5 @@ Assumed:
 
 ## Regenerating and undo
 
-`mods/master_chief/generate.sh [<Steep folder>] [<model folder>]` takes about 6 minutes. Turn the mod off by leaving
+`mods/master_chief/generate.sh [<Steep folder>] [<model folder>]` takes about 2 minutes (`--target urban_japan` for the 016 version). Turn the mod off by leaving
 it out of `POWDER_CLIENT_MODS`; the installed game files and the save are never changed.
