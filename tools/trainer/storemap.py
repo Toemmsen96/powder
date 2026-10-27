@@ -110,38 +110,65 @@ def catalogue(mem, pid: int, names: dict) -> dict[str, tuple[str, list]]:
     return out
 
 
-def item_list(mem, pid: int) -> list[dict]:
-    """Every record of the game's space item list (the list items/all serves; the game keeps a copy and downloads
-    it only when the server's fingerprint differs): {itemId, spaceId, tags}, in memory order. One tag is the game
-    object's name, which is how the game ties a GUID to its object."""
+ITEM_RECORD = 0x320D000E  # a u64 in the SDK's item records (0x88 bytes each, in arrays), offsets relative to it
 
-    def string(rec: bytes) -> str | None:
+
+def item_list(mem, pid: int) -> list[dict]:
+    """The game's copy of the space's item list (what items/all serves; the game keeps an encrypted cache of it and
+    downloads it only when the server's fingerprint differs), from the UbiServices SDK's item records:
+      -0x30 itemId  -0x28 spaceId  -0x20 type ("GEAR", "PROGRESSION_TOKEN", ...)  -0x18 nameId (the game object's
+      name: how the game ties the GUID to its object)    (each a pointer to a string element: string at +0x10)
+      -0x10 u32 ?, u32 revision   -0x08 u32 ?, u32 date (day << 24 | month << 16 | year)
+      +0x00 u64 0x320D000E   +0x08 tags: vector of pointers to string elements   +0x40 obj (JSON)
+    Returns {itemId, spaceId, type, nameId, revision, lastModified, tags} per item, in memory order."""
+
+    def read(a: int, n: int) -> bytes | None:
+        try:
+            mem.seek(a)
+            return mem.read(n)
+        except (OSError, ValueError, OverflowError):
+            return None
+
+    def string(elem: int) -> str | None:
+        rec = read(elem + 0x10, 32)
+        if not rec or len(rec) < 32:
+            return None
         size, cap = struct.unpack_from("<QQ", rec, 16)
         if cap == 15 and size <= 15:
             return rec[:size].decode("latin1")
-        if size > 256 or cap < size:
+        if size > 512 or cap < size:
             return None
-        try:
-            mem.seek(struct.unpack_from("<Q", rec)[0])
-            return mem.read(size).decode("latin1")
-        except (OSError, ValueError, OverflowError):
-            return None
+        b = read(struct.unpack_from("<Q", rec)[0], size)
+        return b.decode("latin1") if b is not None and len(b) == size else None
+
     out, seen = [], set()
+    key = np.uint64(ITEM_RECORD)
     for off, buf in chunks(mem, pid, writable=True):
-        i = buf.find(SPACE)
-        while i >= 0:
-            guid = buf[i - 0x30:i - 0x30 + 36]
-            if i >= 0x400 and GUID.fullmatch(guid + b"\x00") and guid not in seen and guid != SPACE[:36]:
-                tags = []
-                for k in range(0xb0, 0xb0 + 0x30 * 40, 0x30):
-                    s = string(buf[i - k:i - k + 48])
-                    if not s or not s.isprintable() or GUID.fullmatch(s.encode() + b"\x00"):
-                        break
-                    tags.append(s)
-                if tags:
-                    seen.add(guid)
-                    out.append({"itemId": guid.decode(), "spaceId": SPACE[:-1].decode(), "tags": tags[::-1]})
-            i = buf.find(SPACE, i + 1)
+        arr = np.frombuffer(buf[:len(buf) // 8 * 8], dtype=np.uint64)
+        for k in np.nonzero(arr == key)[0]:
+            o = int(k) * 8
+            if o < 0x30 or o + 0x18 > len(buf):
+                continue
+            tb, te = struct.unpack_from("<QQ", buf, o + 8)
+            ptrs = struct.unpack_from("<4Q", buf, o - 0x30)
+            fields = [string(p) for p in ptrs]
+            item_id, space = fields[0], fields[1]
+            if not item_id or not GUID.fullmatch(item_id.encode() + b"\x00") or item_id in seen:
+                continue
+            if not space or not GUID.fullmatch(space.encode() + b"\x00") or not 0 <= te - tb <= 8 * 64:
+                continue
+            raw = read(tb, te - tb) if te > tb else b""
+            if raw is None:
+                continue
+            tags = [string(p) for p in struct.unpack(f"<{len(raw) // 8}Q", raw)]
+            if any(t is None for t in tags):
+                continue
+            _, revision, _, date = struct.unpack_from("<IIII", buf, o - 0x10)
+            seen.add(item_id)
+            out.append({"itemId": item_id, "spaceId": space, "type": fields[2] or "", "nameId": fields[3] or "",
+                        "revision": revision,
+                        "lastModified": f"{date & 0xFFFF:04d}-{(date >> 16) & 0xFF:02d}-{date >> 24:02d}T00:00:00.000Z",
+                        "tags": tags})
     return out
 
 

@@ -203,9 +203,17 @@ master_chief's entries.
    revision, lastModified, tags, obj}` (+ optional `maximumQuantity`; the parser's field table, 0x1b996e0 in the
    2026-10-26 dump). The game's cache is AES-like encrypted (size a multiple of 16), so the original list cannot be
    read from it. Served by the Rust server when `<data>/item_list.json` exists (assets::item_list; fingerprint =
-   sha256/md5 of the JSON, G); `tools/trainer/itemlist.py` adds custom items to it and to the store. NOT yet tried:
-   the base list must be the game's complete list, and `storemap.py --item-list` (a heuristic walk) lost the name tag
-   of 522 records (387 medals) and picked up offers, so it needs a structural reader first (with the game running).
+   sha256/md5 of the JSON, G); `tools/trainer/itemlist.py` adds custom items to it and to the store.
+   **The game's copy, read structurally** (`storemap.py --item-list`, 2026-10-27): the SDK keeps 0x88-byte records
+   (a u64 0x320D000E inside; itemId, spaceId, **type**, **nameId**, revision, date before it, the tags vector and obj
+   after it): 3,840 items (2,178 GEAR, 1,648 PROGRESSION_TOKEN, 10 TOURNAMENT_REWARD, 4 TICKET), every one with its
+   nameId = the game object's name (e.g. `COSTUME_M_MILITARY_GREY_94`, tags SMT_GEN STEEP COSUTME HELMET JACKET PANT
+   GLOVE BACKPACK BASIC). The earlier heuristic dump mistook type and nameId for tags. The beaver test failed with
+   type PROGRESSION_TOKEN (an entry of the game's own list); a custom entry is a copy of a similar GEAR entry.
+   NOT yet tried in-game: `COSTUME_MF_POWDER_MASTER_CHIEF` (custom_costume_test --chief) in data/item_list.json.
+   If the game takes a custom list it replaces its cached copy: keep serving a list from then on (without the file
+   the server sends Ubisoft's fingerprint, the game downloads, and the empty reply logs it out), or restore the
+   backed-up cache folder.
    Back up `Documents/My Games/STEEP/Default/tmp/` before the game first takes a custom list (it overwrites its copy).
 3. **Drawing it.** The new tag -> new Clothing branch -> new selector -> new entity in DataPC_extra_chr_patch_03.
    If the rider shows the default clothes instead, the selector side was not found (registry, list order, or the

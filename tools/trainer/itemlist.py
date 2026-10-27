@@ -2,9 +2,9 @@
 """Custom items in the space's item list: the list the server serves at items/all (<data>/item_list.json), and a free
 offer for each in the store (<data>/store_items.json). See server/src/assets.rs item_list and tools/forge/ITEMS.md.
 
-The game ties a list entry's GUID to its own object by a tag holding the object's name, and the store and menus go
-by the entry's tags. A custom item (e.g. one made by `items.py add-costume`) takes the tags of the item it is like,
-with that item's name tag swapped for its own; its GUID is derived from its name (stable across runs).
+The game ties a list entry's GUID to its own object by the entry's nameId (the object's name) and type ("GEAR" for
+gear), and the store and menus go by the entry's tags. A custom item (e.g. one made by `items.py add-costume`) is a
+copy of the entry of the item it is like, under its own nameId and a GUID derived from its name (stable across runs).
 
   itemlist.py <game list.json> <data dir> --add NAME --like ITEM [--add NAME --like ITEM ...]
   itemlist.py <game list.json> <data dir> --remove        (stop serving a list: the game falls back to its own,
@@ -40,19 +40,17 @@ def main():
     if len(a.add) != len(a.like) or not a.add:
         sys.exit("give --add NAME --like ITEM pairs")
     items = json.load(open(a.game_list))["items"]
-    by_tag = {t: it for it in items for t in it["tags"]}
+    by_name = {it["nameId"]: it for it in items}
     store_path = os.path.join(a.data, "store_items.json")
     store = json.load(open(store_path)) if os.path.exists(store_path) else {}
     for name, like in zip(a.add, a.like):
-        src = by_tag.get(like)
+        src = by_name.get(like)
         if not src:
-            sys.exit(f"{like}: no list entry carries this name")
+            sys.exit(f"{like}: no list entry has this nameId")
         guid = str(uuid.uuid5(NAMESPACE, name))
-        tags = [name if t == like else t for t in src["tags"]]
-        items = [it for it in items if name not in it["tags"]] + [{"itemId": guid, "spaceId": src["spaceId"],
-                                                                   "tags": tags}]
-        store[name] = {"guid": guid, "type": "0x3856b74b", "tags": tags, "custom": True}
-        print(f"{name}: {guid}, tags {', '.join(tags)}")
+        items = [it for it in items if it["nameId"] != name] + [{**src, "itemId": guid, "nameId": name}]
+        store[name] = {"guid": guid, "type": "0x3856b74b", "tags": src["tags"], "custom": True}
+        print(f"{name}: {guid} ({src['type']}), tags {', '.join(src['tags'])}")
     with open(out, "w") as f:
         json.dump({"items": items}, f, indent=1)
     with open(store_path, "w") as f:
