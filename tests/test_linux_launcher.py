@@ -18,6 +18,23 @@ sys.path.insert(0, str(REPO / "linux"))
 from launcher import launch as launch_mod  # noqa: E402
 from launcher.model import Server, Settings  # noqa: E402
 from launcher.mods import list_server_mods  # noqa: E402
+from launcher import game as game_mod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_real_game(monkeypatch):
+    """Never let a test find (and so start) the real game: detection comes back empty with a problem, and no
+    session is running."""
+    monkeypatch.setattr(game_mod, "detect", lambda *a, **k: game_mod.Detected(problems=["test: no game"]))
+    monkeypatch.setattr(launch_mod, "running_session", lambda: False)
+
+
+def scratch_repo(tmp_path: Path) -> Path:
+    """A repo stand-in for the generated config (written beside its config.toml): the real example config."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config.example.toml").write_text((REPO / "config.example.toml").read_text())
+    return repo
 
 
 def test_settings_roundtrip(tmp_path):
@@ -70,17 +87,19 @@ def test_list_server_mods_finds_admin_skips_example():
 
 def test_write_server_config_valid_toml(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    s = Settings(repo=str(REPO), enabled_mods=["admin", "fun"])
+    repo = scratch_repo(tmp_path)
+    s = Settings(repo=str(repo), enabled_mods=["admin", "fun"])
     path = launch_mod.write_server_config(s)
-    assert path == tmp_path / "powder" / "linux-launcher-config.toml"
+    assert path == repo / "config.launcher.toml"  # beside config.toml: its relative paths resolve the same
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
     assert data["mods"]["enabled"] == ["admin", "fun"]
+    assert data["server"]["data_dir"] == "data"  # the rest of the player's config is kept
 
 
 def test_write_server_config_star(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    s = Settings(repo=str(REPO), enabled_mods=["*", "admin"])
+    s = Settings(repo=str(scratch_repo(tmp_path)), enabled_mods=["*", "admin"])
     path = launch_mod.write_server_config(s)
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
@@ -89,18 +108,19 @@ def test_write_server_config_star(tmp_path, monkeypatch):
 
 def test_build_env(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    s = Settings(repo=str(REPO), server_impl="rust")
+    s = Settings(repo=str(scratch_repo(tmp_path)), server_impl="rust", client_mods=["a", "b"])
     env = launch_mod.build_env(s)
     assert env["POWDER_SERVER"] == "rust"
     assert "POWDER_CONFIG" in env
     assert Path(env["POWDER_CONFIG"]).exists()
-    assert "POWDER_OVERLAY" not in env
+    assert env["POWDER_OVERLAY"] == "0"
+    assert env["POWDER_CLIENT_MODS"] == "a,b"
     assert "POWDER_STEEP_DIR" not in env
 
 
 def test_build_env_overlay_and_steep(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    s = Settings(repo=str(REPO), overlay=True, steep_dir="/games/steep")
+    s = Settings(repo=str(scratch_repo(tmp_path)), overlay=True, steep_dir="/games/steep")
     env = launch_mod.build_env(s)
     assert env["POWDER_OVERLAY"] == "1"
     assert env["POWDER_STEEP_DIR"] == "/games/steep"
