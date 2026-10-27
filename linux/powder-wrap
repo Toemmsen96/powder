@@ -318,11 +318,37 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     fi
     if [ -n "${POWDER_CLIENT_MODS:-}" ] && [ -n "$asset_dir" ] && [ -d "$asset_dir" ]; then
         declare -A asset_parts=()
+        session_forge=()
         for m in ${POWDER_CLIENT_MODS//,/ }; do
             case $m in */*|.*|'') continue ;; esac
             for d in "$REPO/mods/$m/client/forge"/*/; do
                 [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
             done
+            # ---- a mod's session step: mods/<name>/session.sh (repo code, run only for mods the player named)
+            # makes this session's files, at most 10 minutes, as the user. It gets POWDER_STEEP_DIR (the game's
+            # folder, to read), POWDER_DATA_DIR, POWDER_CONFIG, POWDER_HTTPS_PORT (the server is up),
+            # POWDER_MOD_FORGE (an empty folder: its <Base>/ subfolders are added to the asset mods above, then
+            # deleted) and POWDER_MOD_RUNTIME (powder_mods/<name>/ beside the game, for its client DLL to read;
+            # removed with the session; empty without the overlay). Example: mods/world_editor.
+            if [ -f "$REPO/mods/$m/session.sh" ]; then
+                mf=$(mktemp -d)
+                session_forge+=("$mf")
+                rt=""
+                if [ -n "$helper" ] && [ -d "$helper/powder_mods" ]; then
+                    rt="$helper/powder_mods/$m"
+                    mkdir -p "$rt"
+                fi
+                if POWDER_STEEP_DIR="$asset_dir" POWDER_DATA_DIR="$(data_dir)" POWDER_CONFIG="$CONFIG" \
+                        POWDER_HTTPS_PORT="$(https_port)" POWDER_MOD_FORGE="$mf" POWDER_MOD_RUNTIME="$rt" \
+                        timeout 600 bash "$REPO/mods/$m/session.sh" >> "$LOG" 2>&1; then
+                    say "mod $m: session step done"
+                else
+                    say "mod $m: session step failed (see $LOG)"
+                fi
+                for d in "$mf"/*/; do
+                    [ -d "$d" ] && asset_parts[$(basename "$d")]+="$d"$'\n'
+                done
+            fi
         done
         for base in "${!asset_parts[@]}"; do
             out="${base}_patch_03.forge"
@@ -346,6 +372,7 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
             fi
             rm -rf "$tmp_forge"
         done
+        if [ ${#session_forge[@]} -gt 0 ]; then rm -rf "${session_forge[@]}"; fi
     fi
 
     cleanup() {
