@@ -7,6 +7,10 @@ Phase 4 CONFIRMED in-game 2026-10-27: powder-wrap runs compose before the server
 (mods/costume_pack_test from the Linux launcher): both costumes listed with their names and pictures, Chief owned
 through the server's grant. Old-style asset mods that add items get no list entries any more (compose writes the
 list from the content mods): use content mods for new items.
+Phase 6 (2026-10-27): a costume may bring its own model (`model_m`/`model_f`/`textures`); tools/forge/costume_model.py
+builds the costume's entries from the player's install, so a mod ships only its own files. mods/master_chief_costume
+is the first such mod (built byte-identical to the confirmed Chief); mods/_template_costume is the starting point for
+mod authors (commented content.toml + README).
 
 Goal: mods that **add** things (costumes, gear, world objects, texts) are drop-in folders, and any set of them works
 together, like ReSkate's mod folders for Skate 3. Today an asset mod ships whole copies of the entries it changes

@@ -1,0 +1,32 @@
+# A content mod: what it adds, as data. Powder builds every enabled content mod together at game start, against
+# each player's own Steep install (tools/forge/compose.py), so the mod ships only its own files (in assets/).
+# Copy this folder to mods/<your_mod>/ and edit. Paths are relative to the mod's folder and must stay inside it.
+
+# --- 1. The simplest new costume: a copy of a game costume with its own name and picture ---------------------------
+[[costume]]
+name  = "COSTUME_MF_MYMOD_OVERALLS"          # unique item name: letters, digits, _ (every id derives from it)
+like  = "COSTUME_MF_URBAN_OUTFIT_BIB_131"    # the game costume it copies (items.py costumes lists them; sources
+                                             # with an unlock condition - Ubisoft Club rewards - are refused)
+title = "My Overalls"                        # its name in the costume list, every language (1-60 characters)
+icon  = "assets/icon.png"                    # its picture (PNG, any size; 256x256, figure on transparency is best)
+# store = "COSTUME_M_MILITARY_GREY_94"       # optional: whose store listing it copies (default: its source's)
+# grant = true                               # optional: every player owns it (default: a free offer in the store)
+
+# --- 2. A costume with your own model (uncomment) ------------------------------------------------------------------
+# [[costume]]
+# name    = "COSTUME_MF_MYMOD_ROBOT"
+# costume = "STP_M_Costume_016"              # the game costume whose slots it fills (male; the female follows)
+# title   = "Robot"
+# icon    = "assets/robot.png"
+# model_m = "assets/robot_M.glb"             # your model per gender, on Steep's skeleton, one mesh part per
+# model_f = "assets/robot_F.glb"             # material of the costume, named like the material (README.md)
+# textures.STP_MF_Costume_016_Jacket_ALL.diffuse  = "assets/textures/jacket_diffuse.png"
+# textures.STP_MF_Costume_016_Jacket_ALL.normal   = "assets/textures/jacket_normal.png"
+# textures.STP_MF_Costume_016_Jacket_ALL.specular = "assets/textures/jacket_specular.png"
+# textures.STP_MF_Costume_016_Jacket_ALL.mask     = "assets/textures/jacket_mask.png"
+# (the same for the costume's other materials: STP_MF_Costume_016_Pants_ALL, STP_MF_Costume_016_Helmet_ALL)
+
+# --- 3. Objects placed in the world (uncomment) --------------------------------------------------------------------
+# [[world]]
+# map   = "Alpes"                            # Alpes, Japan, Alaska, WhiteRoom (the main menu's scene)
+# edits = "assets/my_park.json"              # an edit list as the World editor stores it (README.md)
