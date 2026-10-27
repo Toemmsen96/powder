@@ -23,7 +23,7 @@ python3 tools/forge/items.py show "$G" COSTUME_MF_URBAN_OUTFIT_BIB_131   # one i
 
 Items with an `unlock condition` (Ubisoft Club rewards) are refused: their copies crash the game. The picture goes
 over the source's own backdrop (the menu ignores transparency), so a figure on a transparent background looks best;
-`mods/master_chief/render_icon.py` renders one from a glTF model with Blender.
+`mods/master_chief_costume/render_icon.py` renders one from a glTF model with Blender.
 
 ## 2. Your own model
 
@@ -42,7 +42,7 @@ the model is split, and each material gets your maps.
 
 The first game start with a new model builds it (several minutes for a detailed model); later starts use the cache.
 `mods/master_chief_costume` is a worked example (its `generate.sh` fits a downloaded model to Steep's skeleton
-automatically: `mods/master_chief/make_chief.py --export-assets`).
+automatically: `mods/master_chief_costume/make_chief.py --export-assets`).
 
 ## 3. World edits
 

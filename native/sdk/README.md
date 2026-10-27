@@ -31,9 +31,9 @@ Example: `mods/asset_trace` (hooks ntdll's file calls, a panel, a log). Finding 
 
 Extract an entry (`tools/forge/forge.py extract <archive> <id>`), change it, put the `.datafile` (or unpacked
 folder) in `mods/<name>/client/forge/<Base>/`. powder-wrap builds `<Base>_patch_03.forge` from all named mods'
-entries for the session and removes it afterwards (confirmed in-game: mods/model_swap). Textures are decoded
-and re-encoded by `tools/forge/texture.py` (format: `tools/forge/TEXTURES.md`; example: mods/custom_texture);
+entries for the session and removes it afterwards (confirmed in-game: mods/model_swap (removed 2026-10-27, in git history)). Textures are decoded
+and re-encoded by `tools/forge/texture.py` (format: `tools/forge/TEXTURES.md`; example: mods/custom_texture (removed 2026-10-27, in git history));
 meshes by `tools/forge/mesh.py` (both confirmed in-game 2026-10-26) (OBJ export/import, also with a new topology; `tools/forge/MESHES.md`; example:
-mods/mesh_edit). Models from Blender: `mesh.py export -o x.glb` / `import --glb` with armature and weights
-(`tools/forge/BLENDER.md`; example: mods/shoulder_pads). Which datafiles hold a mesh or texture:
-`forge.py where <game folder> --id <resource id>`. Swapping whole entries/resources: `forge.py swap` (mods/model_swap).
+mods/mesh_edit (removed 2026-10-27, in git history)). Models from Blender: `mesh.py export -o x.glb` / `import --glb` with armature and weights
+(`tools/forge/BLENDER.md`; example: mods/shoulder_pads (removed 2026-10-27, in git history)). Which datafiles hold a mesh or texture:
+`forge.py where <game folder> --id <resource id>`. Swapping whole entries/resources: `forge.py swap` (mods/model_swap (removed 2026-10-27, in git history)).

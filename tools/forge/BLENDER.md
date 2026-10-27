@@ -28,7 +28,7 @@ python3 $M import "$G/DataPC_STP_Alpes.forge" 0x7a5374f895 --glb jacket_new.glb 
 
 Then add a `mod.toml` and enable the mod (`POWDER_CLIENT_MODS=my_jacket` with powder-wrap). The session builds
 `<Base>_patch_03.forge` from `client/forge/<Base>/`, and the game loads the newest copy of each entry
-(`native/sdk/README.md`, "Asset mods"). `mods/shoulder_pads` is a worked example.
+(`native/sdk/README.md`, "Asset mods"). `mods/shoulder_pads` (removed 2026-10-27, in git history) is a worked example.
 
 ## The Blender add-on (no terminal needed)
 
@@ -80,7 +80,7 @@ Blender inside its container. Everything they print goes to the *Powder log* tex
 | a rigid part (helmet visor, badge, horn) | a separate object either *Parent to Bone* (Ctrl+P > Bone), or named `<anything>@<Bone>` (`visor@Head`) |
 | weights to a bone the item does not have | export with `--rig <item that has it>`. The bone is added to the mesh with its rest pose from the file |
 | one model for every LOD | delete LOD1..3, rename the object you keep (e.g. `jacket`) and import with `--to LOD`. An object named after no mesh goes into every `--to` mesh, while one still named `..._LOD0` goes only to LOD0 |
-| add pieces and keep the original | export only your new objects, import with `--add --to LOD` (`mods/shoulder_pads`) |
+| add pieces and keep the original | export only your new objects, import with `--add --to LOD` (`mods/shoulder_pads` (removed 2026-10-27, in git history)) |
 
 - **Keep the material names.** A material picks the submesh. If the mesh has a single submesh, any one material
   goes to it.
@@ -139,8 +139,8 @@ have no armature.
   the same; the only ones left out are 35 heads (format 1) and 3 scarves (format 3).
 - **Renders:** the jacket rendered in Blender with the embedded texture shows the panels where they belong.
 
-**Seen in the game:** same-topology edits (`mods/mesh_edit`) and a rebuilt topology with explicit weights
-(`mods/shoulder_pads`). **Not yet seen:** added bones or a grown bone map (no mod tests them yet).
+**Seen in the game:** same-topology edits (`mods/mesh_edit` (removed 2026-10-27, in git history)) and a rebuilt topology with explicit weights
+(`mods/shoulder_pads` (removed 2026-10-27, in git history)). **Not yet seen:** added bones or a grown bone map (no mod tests them yet).
 
 ## Still open
 

@@ -4,7 +4,7 @@ Status: phases 1-2 (several costumes per run, own names and pictures) CONFIRMED 
 built and tested outside the game (two costume mods + a world-edit mod in one build, cached, refusals); the
 content.toml keys it reads are in its docstring. Grants: `<data>/content_grants.json` (Rust server).
 Phase 4 CONFIRMED in-game 2026-10-27: powder-wrap runs compose before the server for the named content mods
-(mods/costume_pack_test from the Linux launcher): both costumes listed with their names and pictures, Chief owned
+(mods/costume_pack_test (removed 2026-10-27, in git history) from the Linux launcher): both costumes listed with their names and pictures, Chief owned
 through the server's grant. Old-style asset mods that add items get no list entries any more (compose writes the
 list from the content mods): use content mods for new items.
 Phase 6 (2026-10-27): a costume may bring its own model (`model_m`/`model_f`/`textures`); tools/forge/costume_model.py
@@ -96,4 +96,4 @@ they use the same name, which step 1 refuses. The server serves whatever list th
 changes with the set of mods, so the game downloads it again when mods are added or removed.
 
 Order of work: `items.py add-costume` for several items in one run (shared resources patched once); loc.py for
-titles; compose.py; powder-wrap's step; mods/custom_costume_test rewritten as the first content mod.
+titles; compose.py; powder-wrap's step; mods/custom_costume_test (removed 2026-10-27, in git history) rewritten as the first content mod.

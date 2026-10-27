@@ -420,7 +420,7 @@ void draw_position(const float me[3], bool have_pos, bool have_heading, float he
 
 void draw_add(const float me[3], bool have_pos, bool have_heading, float heading) {
     if (!ImGui::TreeNodeEx("Add an object (experimental)", ImGuiTreeNodeFlags_DefaultOpen)) return;
-    // copies of firs (mods/world_test) render, but with a stray white bar across the scene (2026-10-27, unknown
+    // copies of firs (mods/world_test (removed 2026-10-27, in git history)) render, but with a stray white bar across the scene (2026-10-27, unknown
     // cause); moves, turns, scales and removes are written independently of them
     ImGui::TextColored(ImVec4(1, 0.75f, 0.35f, 1), "Experimental: copies may show visual artifacts. Moves, turns, "
                        "scales and removes do not depend on them (WORLD_EDITOR_ADDS=0 leaves copies out).");

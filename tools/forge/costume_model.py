@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A costume's own model and textures put into the game's costume entries, from the player's install: the generic half
-of mods/master_chief/make_chief.py, so a content mod ships only its own files (native/sdk/CONTENT_MODS.md).
+of mods/master_chief_costume/make_chief.py, so a content mod ships only its own files (native/sdk/CONTENT_MODS.md).
 
 Inputs: per gender a glTF (.glb) already fitted to Steep's skeleton - bone names are Steep's, one primitive per Steep
 material of the costume (its name is the material's), as `mesh.py export --rig` / make_chief.py --export-assets write

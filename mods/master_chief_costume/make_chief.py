@@ -347,7 +347,7 @@ def write_glb(parts: list, xf: dict, rest: dict, path: str) -> tuple[int, int]:
         prims[mat] = {"pos": [chest, chest + [0.001, 0, 0], chest + [0, 0, 0.001]], "nrm": [np.array([0, -1.0, 0])] * 3,
                       "uv": [(0.5, 0.5)] * 3, "js": [(bi["Spine2"], 0, 0, 0)] * 3, "ws": [(1.0, 0, 0, 0)] * 3,
                       "idx": [0, 1, 2]}
-    b = gltf.Builder("powder mods/master_chief/make_chief.py")
+    b = gltf.Builder("powder mods/master_chief_costume/make_chief.py")
     root = b.add("nodes", {"name": "Steep_Rig"})
     jn = [b.add("nodes", {"name": name, **gltf.trs(gltf.mat_to_gl(rest[name][1]))}) for name in bones]
     b.doc["nodes"][root]["children"] = jn

@@ -239,7 +239,7 @@ stacks. Feed the folder to `build`. The swap does this:
 - Different entry types are refused (`--force` overrides).
 
 This is meant for swaps within one family: another colourway's material of the same mesh, for example. That is
-what `mods/model_swap/` does, and its README shows how an item in the save leads to its material through the
+what `mods/model_swap/` did (removed 2026-10-27, in git history); its README showed how an item in the save leads to its material through the
 character template. Checked on 3 jacket materials (1242 bytes each): the results equal the source except for
 the 7 retargeted ids, and the archives built from them pass `verify --decompress`. The game has not loaded them
 yet.

@@ -49,9 +49,9 @@ material entry (0x85C817C3) -> its TextureSet (0xD70E6670) -> 4 TextureMaps -> t
 - **C** Costume 016 is drawn only by `COSTUME_MF_URBAN_OUTFIT_JAPAN_139/140/141` (T01/T02/T03: their texture tags
   0xa9af2d6d / 0x30a67cd7 / 0x47a14c41 pick the colourway). None of the three has a store GUID in the running game's
   catalogue (`build/store_items.json` from `tools/trainer/storemap.py`), so they are probably not obtainable in the
-  game, which matters for `mods/master_chief` (it replaced costume 016).
+  game, which matters for `mods/master_chief` (removed 2026-10-27, in git history) (it replaced costume 016).
 - **C** For jackets the item's model tag picks the mesh entity in `STP_M_Jackets`, and its texture tag picks the
-  material in `STP_M_Jacket_NNN_Textures` (mods/model_swap/README.md).
+  material in `STP_M_Jacket_NNN_Textures` (mods/model_swap/README.md, in git history).
 
 ## Item (resource type 0x3856B74B, 2,438 in Game Bootstrap Settings)
 
@@ -203,7 +203,7 @@ master_chief's entries.
 
 1. **DataPC_patch_03.** CONFIRMED 2026-10-27: the game loads it; the new item sits in the game's in-memory costume
    list right after the three URBAN_OUTFIT_JAPAN items it was cloned from.
-2. **The item in the menu.** Not seen in the menu or the store (2026-10-27, mods/custom_costume_test): the menu
+2. **The item in the menu.** Not seen in the menu or the store (2026-10-27, mods/custom_costume_test (removed 2026-10-27, in git history)): the menu
    follows the store, and a new item has no GUID. How the game ties GUIDs to items (read from the running game,
    `tools/trainer/storemap.py --item-list`): the **space's item list** (UbiServices `GET
    /v1/spaces/<space>/items/all`), 3,936 records `{itemId, spaceId, tags}`, one tag being the game object's name

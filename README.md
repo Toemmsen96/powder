@@ -698,17 +698,15 @@ cannot push code to its players.**
 | `mods/_example` | a server mod skeleton | - |
 | `mods/admin` | the [admin page](#admin-page) | - |
 | `mods/asset_trace` | a client mod: hooks ntdll's file calls, a panel, a log | ✅ |
-| `mods/custom_texture` | a new texture on the menu rider's jacket | ✅ |
-| `mods/mesh_edit` | the jacket's mesh changed (same topology, all 4 LODs) | ✅ |
-| `mods/model_swap` | a material swap | ✅ |
-| `mods/shoulder_pads` | new geometry modelled in Blender, with its own weights: the pads follow the arms | ✅ |
-| `mods/master_chief` | a costume from a downloaded model (CC-BY), fitted onto Steep's skeleton; replaces costume 016 | not yet in this version |
+| `mods/master_chief_costume` | a content mod: Master Chief as a new costume with its own name and picture (model CC-BY) | ✅ |
+| `mods/_template_costume` | a starting point for content mods (new costumes, world edits) | - |
+| `mods/world_editor` | a client mod: place, move and remove world objects from the overlay | ✅ |
 
-Asset mods built from the game's own data are generated from your install by each mod's `generate.sh`;
-nothing of Ubisoft's is committed.
+Content mods carry only their own files and are built against your install at game start; nothing of
+Ubisoft's is committed. The earlier replacement mods (custom_texture, mesh_edit, model_swap, shoulder_pads,
+master_chief) were removed on 2026-10-27 and are in git history.
 
-**Still open:** new items with their own ids (today a model replaces an existing item), and decoding the
-skeleton resource (the bone hierarchy).
+**Still open:** decoding the skeleton resource (the bone hierarchy).
 
 <details>
 <summary><b>Server mods (Lua)</b></summary>

@@ -3,7 +3,7 @@
 `world.py` reads how a map places things: the world resource's cell tables, the cell datafiles, and the objects
 each cell places (props, buildings, collision stand-ins, scatter data). It finds every placement of a prop and
 writes a modified cell, with an object moved, turned, scaled, removed or copied, as an unpacked datafile folder.
-`forge.py build --like <map>` packs such folders into a `_patch_03`, the way asset mods ship (see `mods/world_test`).
+`forge.py build --like <map>` packs such folders into a `_patch_03`, the way asset mods ship (see `mods/world_test` (removed 2026-10-27, in git history)).
 It uses `forge.py` from the same folder and the standard library. Archives are only read, and the newest copy of
 each entry is used, as the game loads it.
 
@@ -44,7 +44,7 @@ $ world.py edit "$G/DataPC_STP_WhiteRoom.forge" 36 -o mods/x/client/forge/DataPC
 
 **C** = confirmed: holds on every cell of the four maps (`world.py check`, numbers at the end) or on the samples
 named. **G** = a guess, or an observation whose meaning is unknown. Nothing here has been tried in the game yet:
-`mods/world_test` is the first test. All integers little-endian, positions in metres, Z up.
+`mods/world_test` (removed 2026-10-27, in git history) is the first test. All integers little-endian, positions in metres, Z up.
 
 ## The picture
 
@@ -205,7 +205,7 @@ ordinary entities and groups.
   `forge.py build` of it gives a datafile whose decompressed header and body equal the shipped ones (C on WhiteRoom
   Cell00035). `edit` checks every result parses, packs and keeps the placed prefix free of data objects.
 - The output folders are named `<entry id>_<name>` (the entry id tells the two tables' same-named cells apart), go
-  under `mods/<mod>/client/forge/<map base>/`, and the session builds the `_patch_03` (CLAUDE.md, mods/world_test).
+  under `mods/<mod>/client/forge/<map base>/`, and the session builds the `_patch_03` (CLAUDE.md, mods/world_test (removed 2026-10-27, in git history)).
 
 ## `world.py check` (2026-10-27)
 
@@ -220,7 +220,7 @@ In every cell the placed objects come first, and the placed count equals the num
 
 ## Open questions and next experiments
 
-1. **In-game**: does `mods/world_test` show the moved boulder and the two new firs (see its README)? That decides
+1. **In-game**: does `mods/world_test` (removed 2026-10-27, in git history) show the moved boulder and the two new firs (see its README)? That decides
    whether the game takes edited cells, new ids and longer object lists.
 2. A **new instance in the open world**: copy a hand-placed prop (a bench, a sign, a rock `STP_GEN_ROCK_*`) next to
    a well-known spot in the Alps with `--copy` (or `--source` from a cell that already places it), ride into it,

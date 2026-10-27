@@ -1,5 +1,8 @@
 # Powder - working notes (history, state, findings)
 
+The example and test mods named here (master_chief, custom_costume_test, costume_pack_test, model_swap,
+custom_texture, mesh_edit, shoulder_pads, world_test) were removed on 2026-10-27; they are in git history.
+
 Moved out of CLAUDE.md on 2026-10-27 to keep every session's start small; read the part you need. Newer
 findings live in the tool docs (tools/forge/*.md, native/sdk/*.md, mods/*/README.md) and in commit messages.
 

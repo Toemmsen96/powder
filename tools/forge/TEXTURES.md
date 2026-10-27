@@ -144,7 +144,7 @@ u8 0, u64 id (G: an editor object; mostly the set's own id - 1, which is in no a
 ```
 
 The slot index equals the texture's usage field: 0 diffuse, 1 normal, 2 specular, 7 mask1 on every jacket
-material. A material's datafile embeds its TextureSet, and many materials share one (see `mods/model_swap`).
+material. A material's datafile embeds its TextureSet, and many materials share one (see `mods/model_swap` (removed 2026-10-27, in git history)).
 The material refers to the set, so a material swap changes which textures are drawn, while replacing a texture
 changes its pixels for every material that uses it.
 
@@ -155,4 +155,4 @@ changes its pixels for every material that uses it.
 - Whether the engine needs the Mip entries next to a TextureMap copy, or finds them in any loaded archive (the
   shipped data relies on the latter: two of the three jacket copies have no Mips beside them).
 - Whether the menu draws the TextureMap's inline levels or streams Mip0/Mip1, and from which archive copy.
-  `mods/custom_texture` replaces all of them, so either way the result should show.
+  `mods/custom_texture` (removed 2026-10-27, in git history) replaces all of them, so either way the result should show.

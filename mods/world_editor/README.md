@@ -118,7 +118,7 @@ By hand (outside a session): `apply.py generate --edits <edits.json> [-o DIR]` w
    (26, 63) or a rock; restart; it is gone. Then **Move** a rock next to the rider, **Turn** and **Scale** it.
    `WORLD_EDITOR_ADDS=0` keeps any added objects out of this test.
 3. **Add** (experimental): add a fir (`Sapin_Medium`) 6 m in front in the WhiteRoom, restart. Copies of firs render
-   (mods/world_test, 2026-10-27) but showed a long thin white diagonal bar across the menu scene whose cause is not
+   (mods/world_test (removed 2026-10-27, in git history), 2026-10-27) but showed a long thin white diagonal bar across the menu scene whose cause is not
    known yet: expect it with copies until world_test's bisecting finds it.
 4. **Open world**: a remove or move of a hand-placed prop (a bench, a sign, a `STP_GEN_ROCK_*` rock) in the Alps,
    ride to it after a restart; then an add of a kicker or bench, and whether you collide with it.

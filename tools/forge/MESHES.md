@@ -174,7 +174,7 @@ payload passes `check`. Tested on the jacket: LOD0 subdivided (5854 -> 21165 ver
 LOD0 replaced by LOD3's geometry (226 vertices), and the unchanged OBJ (the same triangles, positions, UVs and
 skinning; only the normals' bytes differ, because they are renormalised). Also tested on a goggle submesh (empty
 section 2) and a ski-box submesh (subset draw list). The archives built from these pass `forge.py verify
---decompress`. The game loads a rebuilt topology (confirmed in-game with `mods/shoulder_pads`).
+--decompress`. The game loads a rebuilt topology (confirmed in-game with `mods/shoulder_pads` (removed 2026-10-27, in git history)).
 
 A vertex that is an original vertex (the same position, UV and normal; at seams the best match among the vertices
 at that position) keeps that vertex's bytes, so an unchanged file gives back every position, UV, normal and
@@ -209,7 +209,7 @@ topology, and `--glb` carries real skin weights. Still to do:
    one.
 4. **All LODs.** Each LOD is its own mesh. Either build four, or reuse one geometry four times.
 5. **New ids.** Today a model replaces an existing id. A brand-new item needs a new entity, a selector entry in
-   the character template (`STP_MF_Template`, see `mods/model_swap/README.md`), an item in Game Bootstrap
+   the character template (`STP_MF_Template`, see `mods/model_swap/README.md` in git history), an item in Game Bootstrap
    Settings and prefetch entries.
 6. **Unknowns that may matter**:
    - the per-vertex w on skinned positions (cloth/wind?);
@@ -219,8 +219,8 @@ topology, and `--glb` carries real skin weights. Still to do:
    - draw lists of the "other" form;
    - whether the engine checks section 2 against section 1. Section 2 is written as a plain copy, not
      reordered.
-7. **In-game:** same-topology edits are confirmed (`mods/mesh_edit`), and so is new geometry with explicit
-   weights (`mods/shoulder_pads`).
+7. **In-game:** same-topology edits are confirmed (`mods/mesh_edit` (removed 2026-10-27, in git history)), and so is new geometry with explicit
+   weights (`mods/shoulder_pads` (removed 2026-10-27, in git history)).
 
 ## Results of `mesh.py check` (all 27 archives, 2026-10-26)
 

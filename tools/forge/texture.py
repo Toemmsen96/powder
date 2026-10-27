@@ -687,7 +687,7 @@ def _box_blur(img: np.ndarray, r: int) -> np.ndarray:
 def icon_payload(t: Texture, picture: np.ndarray) -> bytes:
     """A menu icon (a TextureMap with every level inline) showing `picture` (RGBA, upright). The menu draws an icon's
     colours and ignores its alpha (shipped icons hide a backdrop under alpha 0), so the picture goes over this icon's
-    own backdrop with its subject painted out (the clear pixels' mean colour, smoothed) - as mods/master_chief does."""
+    own backdrop with its subject painted out (the clear pixels' mean colour, smoothed) - as mods/master_chief_costume does."""
     if t.links or t.dim != 1 or t.fmt not in FORMATS:
         raise ValueError("icon_payload: an icon with every level inline, 2D, a supported format")
     size0 = level_size(t.fmt, t.width, t.height)
