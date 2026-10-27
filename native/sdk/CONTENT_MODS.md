@@ -3,6 +3,10 @@
 Status: phases 1-2 (several costumes per run, own names and pictures) CONFIRMED in-game; phase 3 `tools/forge/compose.py`
 built and tested outside the game (two costume mods + a world-edit mod in one build, cached, refusals); the
 content.toml keys it reads are in its docstring. Grants: `<data>/content_grants.json` (Rust server).
+Phase 4 CONFIRMED in-game 2026-10-27: powder-wrap runs compose before the server for the named content mods
+(mods/costume_pack_test from the Linux launcher): both costumes listed with their names and pictures, Chief owned
+through the server's grant. Old-style asset mods that add items get no list entries any more (compose writes the
+list from the content mods): use content mods for new items.
 
 Goal: mods that **add** things (costumes, gear, world objects, texts) are drop-in folders, and any set of them works
 together, like ReSkate's mod folders for Skate 3. Today an asset mod ships whole copies of the entries it changes
