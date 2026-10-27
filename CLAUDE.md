@@ -291,7 +291,12 @@ API. Everything below is on `rework/rust-server`.
    `check` verifies it. mods/custom_costume_test in-game 2026-10-27: DataPC_patch_03 loads and the item is in the
    game's costume list, but not in the menu/store (no GUID). GUIDs come from the space's item list (items/all;
    the game keeps an encrypted copy and only checks the fingerprint), tied to items by their name tag
-   (ITEMS.md, `storemap.py --item-list`); next: serve the whole list + the new item under a new fingerprint. Costume 016 is only the
+   (ITEMS.md, `storemap.py --item-list`). CONFIRMED in-game 2026-10-27: a NEW costume (Master Chief, item
+   COSTUME_MF_POWDER_MASTER_CHIEF) listed, owned and worn, through a custom space item list the Rust server
+   serves at items/all (`<data>/item_list.json`: `{"items": [...]}` root, each item's obj {gameId, Token, price},
+   gameId = the item's resource id). Once the game took a custom list, keep serving one (or restore its cache,
+   Documents/My Games/STEEP/Default/tmp/f6849c62/74c57e6b.dat, backed up in build/backup_steep_tmp). Open: the new
+   item's own name (localization not decoded), Python parity. Costume 016 is only the
    COSTUME_MF_URBAN_OUTFIT_JAPAN_139-141 items, which have no store GUID (not the military costume).
 3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
    unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the

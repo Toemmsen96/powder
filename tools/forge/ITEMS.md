@@ -216,7 +216,12 @@ master_chief's entries.
    tree: `{"gameId": <the object's resource id>, "Token": 0, "price": <credits>}` (e.g. COSTUME_M_MILITARY_GREY_94:
    gameId 1017655268344 = 0xecf0fb13f8, price 56000) - **gameId is the link from the GUID to the game object**, not
    nameId. storemap.py --item-list now reads obj (3,830 of 3,840 items have a gameId); itemlist.py --id sets the
-   custom item's gameId (price 0). Next try: the list with real objs + COSTUME_MF_POWDER_MASTER_CHIEF.
+   custom item's gameId (price 0). The last cause: the download's JSON root is `{"items": [...]}` (a bare array
+   made the game log out even with Ubisoft's own list). **CONFIRMED in-game 2026-10-27:** with the list served as
+   `{"items": [...]}`, every item's real obj, and COSTUME_MF_POWDER_MASTER_CHIEF (gameId = its new resource id,
+   price 0, granted), the game stays online and lists the new costume next to the game's own (named after the
+   costume it was cloned from, "Green Mosaics - Japan Outfit"; Chief's picture); equipping it shows Chief. New items
+   work end to end: `items.py add-costume` + `storemap.py --item-list` + `itemlist.py --add/--id/--like`.
    If the game takes a custom list it replaces its cached copy: keep serving a list from then on (without the file
    the server sends Ubisoft's fingerprint, the game downloads, and the empty reply logs it out), or restore the
    backed-up cache folder.
