@@ -172,7 +172,9 @@ both listed (one granted, one bought free in the store) and worn. Sources with a
 rewards such as COSTUME_MF_C_Spandex_Gold_142) crash the game when cloned; add-costume refuses them.
 **Pictures:** `icon = "x.png"` in a `[[costume]]` clones the source's icon entry (DataPC_extra_2, a TextureMap with
 every level inline) under a new id, with the picture over the source icon's backdrop (texture.icon_payload: the
-menu ignores alpha), and points the item's first icon slot at it; `check` verifies both. Not yet tried in-game.
+menu ignores alpha), and points the item's first icon slot at it; `check` verifies both. CONFIRMED in-game
+2026-10-27: Chief and a Bib clone from one run, each with its own name and picture, originals unchanged. Names show
+as written (the shipped ones are stored in capitals).
 
 ## What add-costume writes
 
