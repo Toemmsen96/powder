@@ -323,13 +323,15 @@ pub fn local_store(path: &Path) -> OfferCatalog {
 /// game's whole list (`storemap.py --item-list`, read from the running game) plus custom items. Steep keeps its own
 /// copy of the list (an encrypted cache) and asks only for the list's version (`?fields=lastModified,sha256,md5`);
 /// when that differs from its copy it downloads the list: `{compressedItems, lastModified, sha256, md5}`, all
-/// strings, `compressedItems` = base64(zlib(JSON array of items)) (the UbiServices SDK's JobGetDataAll and
+/// strings, `compressedItems` = base64(zlib(`{"items": [...]}`)) (the UbiServices SDK's JobGetDataAll and
 /// JobGetDataDecompressed: base64Decode, zlibInit, decompressData, extractData). An item is
 /// `{itemId, spaceId, type, nameId, duration, revision, lastModified, tags, obj}` (+ optional maximumQuantity);
 /// the game ties an item to its own object by a tag (the object's name). Without the file the server answers with
 /// the fingerprint of Ubisoft's list (builtin/http.rs), so the game keeps its own copy.
-/// G: the array root (extractData names no key), what sha256/md5 are taken over (here the JSON), and that the game
-/// takes a list that is not Ubisoft's ({} made it log out).
+/// The root is an object holding the array under "items": the offers' twin (0x1bc4e60 in the 2026-10-26 dump) looks
+/// for a 6-letter key "offers" with an array value; a bare array made the game log out, Ubisoft's own list included.
+/// zlib: inflateInit2 with windowBits 47 (zlib or gzip), output buffer 15x the compressed size.
+/// G: what sha256/md5 are taken over (here the JSON).
 pub struct ItemList {
     pub version: Value,
     pub full: Value,
@@ -365,7 +367,7 @@ pub fn item_list(path: &Path) -> Option<ItemList> {
         }
         Some(it)
     }).collect();
-    let json = serde_json::to_vec(&full).ok()?;
+    let json = serde_json::to_vec(&serde_json::json!({"items": full})).ok()?;
     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
     z.write_all(&json).ok()?;
     let compressed = base64::engine::general_purpose::STANDARD.encode(z.finish().ok()?);
@@ -610,8 +612,8 @@ mod tests {
         let mut json = vec![];
         flate2::read::ZlibDecoder::new(&z[..]).read_to_end(&mut json).unwrap();
         assert_eq!(full["sha256"], hex::encode_upper(sha2::Sha256::digest(&json)));
-        let items: Value = serde_json::from_slice(&json).unwrap();
-        let items = items.as_array().unwrap();
+        let root: Value = serde_json::from_slice(&json).unwrap();
+        let items = root["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         for field in ["itemId", "spaceId", "type", "nameId", "duration", "revision", "lastModified", "tags", "obj"] {
             assert!(items[0].get(field).is_some(), "the game requires {field}");
