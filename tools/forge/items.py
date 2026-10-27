@@ -472,6 +472,7 @@ class CostumeSpec:
     source_dirs: list[str] = field(default_factory=list)  # entries to clone from instead of the game's (a mod's model)
     keep_price: bool = False
     title: str | None = None
+    icon: str | None = None  # a picture (PNG) for the costume list: the source's icon is cloned with it
 
 
 @dataclass
@@ -494,6 +495,7 @@ class CostumePlan:
     newkey: str
     title_id: int | None
     report: dict
+    icon: tuple | None = None  # (source icon entry id, new id) in DataPC_extra_2
 
 
 def plan_costume(game: Game, ctx: dict, spec: CostumeSpec) -> CostumePlan:
@@ -554,6 +556,14 @@ def plan_costume(game: Game, ctx: dict, spec: CostumeSpec) -> CostumePlan:
         struct.pack_into("<I", p, d["loc_off"], title_id)
         report.update(title=spec.title, loc=f"{title_id:#x}", loc_was=f"{d['loc']:#x}")
     item_map = {src.id: item_id}
+    icon = None
+    if spec.icon:  # a picture of its own: the icon entry (DataPC_extra_2) the item's first icon slot names, cloned
+        src_icon = next((ic[3] for ic in d["icons"] if ic[3]), None)
+        if not src_icon or not game.entry("DataPC_extra_2", src_icon):
+            sys.exit(f"{like}: no icon entry in DataPC_extra_2 to clone")
+        icon = (src_icon, ids.new(src_icon))
+        item_map[src_icon] = icon[1]
+        report["icon"] = f"{icon[1]:#x}"
     for v in nested_ids(bytes(p), resource_ids):
         item_map[v] = ids.new(v)
     new_item = forge.Resource(item_id, ITEM, name, remap(bytes(p), item_map), src.flag, src.pre, src.extra)
@@ -647,7 +657,7 @@ def plan_costume(game: Game, ctx: dict, spec: CostumeSpec) -> CostumePlan:
     report["source_dirs"] = [os.path.abspath(x) for x in spec.source_dirs]
     report["ids"] = {f"{s:#x}": f"{d:#x}" for s, d in sorted(clone_map.items())}
     return CostumePlan(spec, src, new_item, model_tag, new_tag, costume_sel, clothing, tex_of, clone_map, new_sels,
-                       branch_ids, plan, entities, key, newkey, title_id, report)
+                       branch_ids, plan, entities, key, newkey, title_id, report, icon)
 
 
 def patch_template(res: list[forge.Resource], c: CostumePlan) -> list[forge.Resource]:
@@ -746,6 +756,22 @@ def add_costumes(game: Game, specs: list[CostumeSpec], out: str, level: int = 9)
                 more["prefetch"] = blob.hex()
             forge.write_unpacked(dest, nid, new_res[0].name, new_res[0].type, new_res, **more)
             written.append(dest)
+        if c.icon:  # its picture: the source's icon entry under the new id, the picture encoded into it
+            import texture
+            old, new = c.icon
+            _, ires = game.datafile("DataPC_extra_2", old)
+            t = texture.parse_texture(ires[0].payload)
+            pl = remap(texture.icon_payload(t, texture.read_image(c.spec.icon)), {old: new})
+            iname = f"STP_ICON_{c.spec.name}_Map"
+            dest = os.path.join(out, "DataPC_extra_2", f"{new:016x}_{forge.safe_name(iname)}")
+            more = {"clone": {"from": f"{old:#x}", "from_name": ires[0].name, "source": "icon", "item": c.spec.name}}
+            blob = remap_prefetch(game.prefetch("DataPC_extra_2", old), {old: new})
+            if blob is not None:
+                more["prefetch"] = blob.hex()
+            ir = ires[0]
+            forge.write_unpacked(dest, new, iname, ir.type, [forge.Resource(new, ir.type, iname, pl, ir.flag, ir.pre,
+                                                                            ir.extra)], **more)
+            written.append(dest)
         c.report["batch"] = names
         with open(os.path.join(out, f"{c.spec.name}.json"), "w") as f:
             json.dump(c.report, f, indent=1)
@@ -762,7 +788,7 @@ def add_costumes(game: Game, specs: list[CostumeSpec], out: str, level: int = 9)
 
 def read_specs(path: str) -> list[CostumeSpec]:
     """`[[costume]]` tables of a TOML file: name, like or costume, label, source (a folder or a list, relative to the
-    file), title, keep_price."""
+    file), title, keep_price, icon (a PNG, relative to the file)."""
     import tomllib
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -775,7 +801,8 @@ def read_specs(path: str) -> list[CostumeSpec]:
             sys.exit(f"{path}: {t.get('name')}: give exactly one of like / costume")
         specs.append(CostumeSpec(name=t["name"], like=t.get("like"), costume=t.get("costume"), label=t.get("label"),
                                  source_dirs=[os.path.join(here, x) for x in srcs],
-                                 keep_price=bool(t.get("keep_price", False)), title=t.get("title")))
+                                 keep_price=bool(t.get("keep_price", False)), title=t.get("title"),
+                                 icon=os.path.join(here, t["icon"]) if t.get("icon") else None))
     if not specs:
         sys.exit(f"{path}: no [[costume]] tables")
     return specs
@@ -843,6 +870,12 @@ def cmd_check(a):
     need(gear.payload.count(struct.pack("<Q", item_id)) == 1, "gear list: item not listed once")
     reg = nb[REGISTRY_ID].payload
     need(reg.count(struct.pack("<II", REG_ENTRY, new_tag)) == 1, "registry: new tag not registered once")
+
+    # the picture: a cloned icon entry the item names instead of the source's
+    if "icon" in rep and item is not None:
+        hit = glob.glob(os.path.join(out, "DataPC_extra_2", f"{int(rep['icon'], 16):016x}_*"))
+        need(len(hit) == 1, "icon: the cloned icon entry is missing")
+        need(struct.pack("<Q", int(rep["icon"], 16)) in item.payload, "icon: the item does not name its icon")
 
     # the name: the source's string id, or (--title) a new one whose text every UI language package gained
     src_item = next((r for r in orig if r.name == rep["like"]), None)

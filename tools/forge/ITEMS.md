@@ -170,6 +170,9 @@ Chief (016 + its model) and a gold spandex clone (010) in one run, `check` 0 pro
 CONFIRMED in-game 2026-10-27: Chief + a clone of COSTUME_MF_URBAN_OUTFIT_BIB_131 ("Lava Overalls") from one run,
 both listed (one granted, one bought free in the store) and worn. Sources with an **unlock condition** (Ubisoft Club
 rewards such as COSTUME_MF_C_Spandex_Gold_142) crash the game when cloned; add-costume refuses them.
+**Pictures:** `icon = "x.png"` in a `[[costume]]` clones the source's icon entry (DataPC_extra_2, a TextureMap with
+every level inline) under a new id, with the picture over the source icon's backdrop (texture.icon_payload: the
+menu ignores alpha), and points the item's first icon slot at it; `check` verifies both. Not yet tried in-game.
 
 ## What add-costume writes
 

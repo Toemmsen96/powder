@@ -673,6 +673,36 @@ def pattern(name: str, w: int, h: int, text: str = "POWDER") -> np.ndarray:
 
 # --- finding textures and their mips ---------------------------------------------------------------------------
 
+def _box_blur(img: np.ndarray, r: int) -> np.ndarray:
+    """A separable box blur of radius r (edges clamped), float in, float out."""
+    for axis in (0, 1):
+        pad = [(r, r) if k == axis else (0, 0) for k in range(img.ndim)]
+        c = np.cumsum(np.pad(img, pad, mode="edge"), axis=axis, dtype=np.float64)
+        c = np.concatenate([np.zeros_like(c.take([0], axis=axis)), c], axis=axis)
+        n = img.shape[axis]
+        img = (c.take(range(2 * r + 1, n + 2 * r + 1), axis=axis) - c.take(range(0, n), axis=axis)) / (2 * r + 1)
+    return img
+
+
+def icon_payload(t: Texture, picture: np.ndarray) -> bytes:
+    """A menu icon (a TextureMap with every level inline) showing `picture` (RGBA, upright). The menu draws an icon's
+    colours and ignores its alpha (shipped icons hide a backdrop under alpha 0), so the picture goes over this icon's
+    own backdrop with its subject painted out (the clear pixels' mean colour, smoothed) - as mods/master_chief does."""
+    if t.links or t.dim != 1 or t.fmt not in FORMATS:
+        raise ValueError("icon_payload: an icon with every level inline, 2D, a supported format")
+    size0 = level_size(t.fmt, t.width, t.height)
+    orig = decode_level(t.fmt, t.data[:size0], t.width, t.height)[::-1].astype(np.float64)  # stored bottom-up
+    clear = orig[..., 3] == 0
+    fill = orig[..., :3][clear].mean(axis=0) if clear.any() else np.array([190.0, 210, 230])
+    back = _box_blur(np.where(clear[..., None], orig[..., :3], fill), 4)
+    top = resize(picture, t.width, t.height).astype(np.float64)
+    a = top[..., 3:4] / 255
+    out = np.concatenate([top[..., :3] * a + back * (1 - a), top[..., 3:4]], axis=-1)
+    img = np.clip(out + 0.5, 0, 255).astype(np.uint8)[::-1]
+    chain = mip_chain(img, chain_length(t.width, t.height))
+    return t.payload(b"".join(encode_level(t.fmt, chain[lv]) for lv in t.levels()))
+
+
 def open_forge(path: str, cache: dict) -> forge.Forge:
     if path not in cache:
         cache[path] = forge.Forge(path)
