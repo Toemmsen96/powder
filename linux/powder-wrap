@@ -193,16 +193,16 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     nss=$(mktemp)
     sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
     mount --bind "$nss" /etc/nsswitch.conf
-    # the logo videos at start (POWDER_SKIP_INTRO=0 keeps them): for this session only, Steep's videos/ folder is
-    # covered by a folder of links to every video but the logos (through a second view of the real folder, so the
-    # links do not point into the cover); the game's files stay as they are
+    # the logo videos and the loading video at start (POWDER_SKIP_INTRO=0 keeps them): for this session only,
+    # Steep's videos/ folder is covered by a folder of links to every other video (through a second view of the real
+    # folder, so the links do not point into the cover); the game's files stay as they are
     vids="" vorig=""
     vd="$(steep_dir)/videos"
     if [ "${POWDER_SKIP_INTRO:-1}" = 1 ] && [ -d "$vd" ]; then
         vids=$(mktemp -d) vorig=$(mktemp -d)
         mount --bind "$vd" "$vorig"
         for f in "$vorig"/*; do
-            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2) continue ;; esac
+            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2|loading_logo.bk2) continue ;; esac
             ln -s "$f" "$vids/${f##*/}"
         done
         mount --bind "$vids" "$vd"
@@ -415,6 +415,15 @@ user)   # ---- the user's id again: CA into the prefix, the command, CA out ----
     }
     trap cleanup EXIT
     set +e
+    # which video the game plays when, for the first 3 minutes (to see where startup time goes): one log line per
+    # newly opened .bk2, seconds since the command started
+    ( start=$SECONDS last=""
+      while [ $((SECONDS - start)) -lt 180 ]; do
+          now=$(for p in $(pgrep -x steep.exe); do ls -l "/proc/$p/fd" 2>/dev/null; done | grep -io '[^/]*\.bk2' | sort -u | tr '\n' ' ')
+          [ -n "$now" ] && [ "$now" != "$last" ] && printf 'powder-wrap: +%ss video: %s\n' $((SECONDS - start)) "$now" >> "$LOG"
+          last=$now
+          sleep 0.5
+      done ) &
     "$@"
     rc=$?
     exit $rc
