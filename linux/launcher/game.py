@@ -53,8 +53,10 @@ class Detected:
         # process in the prefix ended - Ubisoft Connect's first exe exits at once and leaves upc.exe running, and
         # the default verb returned there, ending the session (server stopped, CA removed) under a starting Connect;
         # STORE=ubisoft makes umu apply its Ubisoft Connect fixes
+        # PROTON_USE_XALIA=0: no Xalia (GE-Proton's controller accessibility helper; it only printed exceptions
+        # into the console when Connect closed)
         e = {"WINEPREFIX": self.prefix, "GAMEID": "umu-default", "STORE": "ubisoft",
-             "PROTON_VERB": "waitforexitandrun"} if self.prefix else {}
+             "PROTON_VERB": "waitforexitandrun", "PROTON_USE_XALIA": "0"} if self.prefix else {}
         if self.proton:
             e["PROTONPATH"] = self.proton
         return e
