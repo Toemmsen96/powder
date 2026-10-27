@@ -226,3 +226,13 @@ In every cell the placed objects come first, and the placed count equals the num
    per-cell u16 after each table, the 0x8DEEB8AD object (one per map, in the root cell).
 7. Far LODs: whether a moved object also lives in baked far-LOD data (`LodData`, 4 MB in the Alps world datafile,
    `STP_ProxyLOD`), so that it would still show at its old place from afar.
+
+## Related work
+
+- Sean Shmulevich's [steep-gameplay-research](https://github.com/Sean-Shmulevich/steep-gameplay-research) (gameplay
+  physics, animation, a native mod host) imports specifications of the **terrain** files `PC*_terrainlin*.tbf`:
+  the height/class/material codec, the node lookup and FloorHeightData
+  (`docs/reconstruction/MAP_DECODING_UPDATE.md` and `docs/reconstruction/studio-map/`), with reported bit-exact
+  decoding of 1,541 tiles. world.py covers placed objects, not terrain. A terrain reader or editor for the map
+  builder should start from those specifications. That repository has no reuse license (its NOTICE.md): read it as
+  a reference and credit it; don't copy its code.
