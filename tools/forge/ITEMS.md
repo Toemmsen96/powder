@@ -167,6 +167,9 @@ run's copy would replace the first's), each costume's own entries are cloned und
 own `<name>.json`. `check` reads every report in the output folder, so the other costumes' additions count as
 expected. `add-costume` is the one-item case (its output is byte-identical to before, 2026-10-27). Tested: Master
 Chief (016 + its model) and a gold spandex clone (010) in one run, `check` 0 problems for both.
+CONFIRMED in-game 2026-10-27: Chief + a clone of COSTUME_MF_URBAN_OUTFIT_BIB_131 ("Lava Overalls") from one run,
+both listed (one granted, one bought free in the store) and worn. Sources with an **unlock condition** (Ubisoft Club
+rewards such as COSTUME_MF_C_Spandex_Gold_142) crash the game when cloned; add-costume refuses them.
 
 ## What add-costume writes
 
