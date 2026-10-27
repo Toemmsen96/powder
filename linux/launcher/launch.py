@@ -99,7 +99,40 @@ def build_command(s: Settings, d: "game.Detected | None" = None) -> list[str]:
     return [str(Path(s.repo) / "linux" / "powder-wrap"), *cmd]
 
 
+def session_log() -> Path:
+    """Where powder-wrap writes its session log (the same rule as linux/powder-wrap)."""
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    if run:
+        return Path(run) / "powder-wrap.log"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "powder" / "powder-wrap.log"
+
+
+def running_session() -> bool:
+    """True while a powder-wrap session runs (its game is closed when it ends)."""
+    try:
+        out = subprocess.run(["pgrep", "-f", "linux/powder-wrap"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return any(pid.strip() and int(pid) != os.getpid() for pid in out.split())
+
+
+def last_step() -> str:
+    """powder-wrap's latest status line ("powder-wrap: ..."), for the launcher's progress display."""
+    try:
+        lines = session_log().read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if line.startswith("powder-wrap: ") or line.startswith("world_editor: "):
+            return line.split(": ", 1)[1]
+        if "product 3279 started" in line:
+            return "Steep started"
+    return ""
+
+
 def launch(s: Settings) -> "subprocess.Popen":
+    if running_session():
+        raise ValueError("A Powder session is already running (close the game and Ubisoft Connect first).")
     d = game.detect(s.wine_prefix, s.proton)
     if not s.game_command and d.problems:
         raise ValueError("Cannot start the game yet:\n" + "\n".join(d.problems))

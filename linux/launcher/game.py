@@ -49,7 +49,12 @@ class Detected:
         return [self.umu, self.connect_exe, STEEP_LAUNCH] if self.umu and self.prefix else []
 
     def env(self) -> dict[str, str]:
-        e = {"WINEPREFIX": self.prefix, "GAMEID": "umu-default"} if self.prefix else {}
+        # as Lutris runs it: waitforexitandrun keeps umu-run (and so the powder-wrap session) alive until every
+        # process in the prefix ended - Ubisoft Connect's first exe exits at once and leaves upc.exe running, and
+        # the default verb returned there, ending the session (server stopped, CA removed) under a starting Connect;
+        # STORE=ubisoft makes umu apply its Ubisoft Connect fixes
+        e = {"WINEPREFIX": self.prefix, "GAMEID": "umu-default", "STORE": "ubisoft",
+             "PROTON_VERB": "waitforexitandrun"} if self.prefix else {}
         if self.proton:
             e["PROTONPATH"] = self.proton
         return e

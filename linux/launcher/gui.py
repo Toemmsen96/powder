@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 
 from . import game
-from .launch import launch as do_launch
+from .launch import last_step, launch as do_launch
 from .model import Server, Settings
 from .mods import conflicts, list_client_mods
 
@@ -151,7 +151,11 @@ class LauncherWindow:
         g_steep.add(self.cmd_row)
 
         g_go = Adw.PreferencesGroup()
+        self.status_row = Adw.ActionRow(title="Session", subtitle="not running")
+        self.status_row.set_subtitle_lines(2)
+        g_go.add(self.status_row)
         launch_btn = Gtk.Button(label="Launch game")
+        self.launch_btn = launch_btn
         launch_btn.add_css_class("suggested-action")
         launch_btn.add_css_class("pill")
         launch_btn.set_halign(Gtk.Align.CENTER)
@@ -198,8 +202,23 @@ class LauncherWindow:
 
     def _on_launch(self, _btn):
         try:
-            do_launch(self.s)
-            self._toast("launching the game through powder-wrap...")
+            proc = do_launch(self.s)
+            self._toast("starting: the first start of a session prepares the mods and can take a few minutes")
+            self.launch_btn.set_sensitive(False)
+            self.launch_btn.set_label("Running...")
+
+            def poll():
+                step = last_step()
+                rc = proc.poll()
+                if rc is None:
+                    self.status_row.set_subtitle(self.GLib.markup_escape_text(step or "starting..."))
+                    return True
+                self.status_row.set_subtitle(f"ended (exit code {rc})")
+                self.launch_btn.set_sensitive(True)
+                self.launch_btn.set_label("Launch game")
+                return False
+
+            self.GLib.timeout_add(1000, poll)
         except ValueError as exc:
             self._error_dialog("Cannot start the game", str(exc))
         except OSError as exc:
