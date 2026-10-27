@@ -317,6 +317,6 @@ API. Everything below is on `rework/rust-server`.
    (tools/forge/world.py + WORLD.md): the world's cell tables (quadtree, 128 m cells, finest level first, two
    tables per open-world map), the cell list, entities/groups with their world matrix, proxies (collision
    stand-ins in neighbour cells), the prop -> LOD mesh / shape links; `world.py edit` moves/turns/removes objects
-   (and their proxies) and copies entities under fresh ids. NOT yet tried in-game: mods/world_test (two firs added
-   and a boulder moved next to the menu rider, WhiteRoom). Open: open-world vegetation is baked in
+   (and their proxies) and copies entities under fresh ids. CONFIRMED in-game 2026-10-27 (WORLD_TEST=big): copied firs
+   render next to the menu rider (WhiteRoom), so new instances in a cell work. Open: open-world vegetation is baked in
    `HAS_PackedInstance` groups (not decoded); copies get no proxies yet; group copies not done.
