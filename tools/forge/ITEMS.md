@@ -182,13 +182,20 @@ master_chief's entries.
 
 ## What the game must accept (open, in the order to test)
 
-1. **DataPC_patch_03.** `_patch_03` is confirmed for nothing yet but asset mods in DataPC_extra_chr* and the map
-   archives (README.md). Game Bootstrap Settings lives in DataPC and is loaded at start; if the game ignores a
-   DataPC_patch_03, nothing of the new item exists (the costume list is unchanged, nothing breaks).
-2. **The item in the menu.** Does the gear menu list GEAR_COSTUMES, or only items the store catalogue knows (the
-   catalogue comes with GUIDs, which a new item lacks)? If the item is listed but locked, the default flag / price 0
-   guess is wrong; the next experiment is a server-side inventory entry (needs a GUID the game would map to the
-   item: the catalogue maps the item's name tag to a GUID, so the catalogue entry would have to be added too).
+1. **DataPC_patch_03.** CONFIRMED 2026-10-27: the game loads it; the new item sits in the game's in-memory costume
+   list right after the three URBAN_OUTFIT_JAPAN items it was cloned from.
+2. **The item in the menu.** Not seen in the menu or the store (2026-10-27, mods/custom_costume_test): the menu
+   follows the store, and a new item has no GUID. How the game ties GUIDs to items (read from the running game,
+   `tools/trainer/storemap.py --item-list`): the **space's item list** (UbiServices `GET
+   /v1/spaces/<space>/items/all`), 3,936 records `{itemId, spaceId, tags}`, one tag being the game object's name
+   (e.g. `28b58162-... ['HELMET', 'GEAR', 'COSTUME_M_MILITARY_GREY_94', 'SMT_GEN', 'STEEP', 'COSUTME', ...]`). The
+   GUIDs are in none of the archives (decompressed), the exe dump, or the game folder: the game keeps the list in
+   an encrypted cache (most likely `Documents/My Games/STEEP/Default/tmp/f6849c62/74c57e6b.dat`, 308 KB, written in
+   the first session) and asks the server only for its fingerprint (`items/all?fields=lastModified,sha256,md5`,
+   builtin/http.rs); it downloads the list only when the fingerprint differs. Earlier tries served `{}`, which
+   logged the game out. Next experiment: serve the **whole** list (this dump) plus one record for the new item
+   (a fresh GUID, tags `COSTUME_MF_POWDER_TEST_01`, `COSUTME`, `GEAR`, ...) under a new fingerprint, and a free
+   offer for it; the download's exact format (and whether sha256/md5 must match the body) is unknown.
 3. **Drawing it.** The new tag -> new Clothing branch -> new selector -> new entity in DataPC_extra_chr_patch_03.
    If the rider shows the default clothes instead, the selector side was not found (registry, list order, or the
    template copies); if the game crashes when the costume is equipped, suspect the entity / material clones.

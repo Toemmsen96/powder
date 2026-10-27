@@ -288,8 +288,10 @@ API. Everything below is on `rework/rust-server`.
    2026-10-27: decoded and tooled (tools/forge/items.py + ITEMS.md): item -> tag -> STP_M/F_Clothing branch ->
    costume selector -> entity / texture selector -> materials; `items.py add-costume` clones a costume under new
    ids (item in GEAR_COSTUMES, tag registry, branches + selectors in all 4 templates, entities/materials/textures),
-   `check` verifies it. Test mod mods/custom_costume_test (NOT yet tried in-game; first questions: does the game
-   load DataPC_patch_03, and does the menu list an item without a store GUID). Costume 016 is only the
+   `check` verifies it. mods/custom_costume_test in-game 2026-10-27: DataPC_patch_03 loads and the item is in the
+   game's costume list, but not in the menu/store (no GUID). GUIDs come from the space's item list (items/all;
+   the game keeps an encrypted copy and only checks the fingerprint), tied to items by their name tag
+   (ITEMS.md, `storemap.py --item-list`); next: serve the whole list + the new item under a new fingerprint. Costume 016 is only the
    COSTUME_MF_URBAN_OUTFIT_JAPAN_139-141 items, which have no store GUID (not the military costume).
 3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
    unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the

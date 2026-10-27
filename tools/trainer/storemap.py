@@ -10,6 +10,7 @@ Owning an item = having its GUID in the inventory: `powder-server admin grant <G
 tab -> Grant.
 
   storemap.py <pid> <Steep folder> [-o out.json] [-g NAME]...   (-g: print only names containing NAME)
+  storemap.py <pid> <Steep folder> --item-list items.json       (the space's item list itself, see item_list)
 
 Without a game-data pack, the server serves the catalogue items (those with tags) as free store offers when
 `<data>/store_items.json` exists: `storemap.py <pid> <Steep folder> -o data/store_items.json`.
@@ -109,13 +110,56 @@ def catalogue(mem, pid: int, names: dict) -> dict[str, tuple[str, list]]:
     return out
 
 
+def item_list(mem, pid: int) -> list[dict]:
+    """Every record of the game's space item list (the list items/all serves; the game keeps a copy and downloads
+    it only when the server's fingerprint differs): {itemId, spaceId, tags}, in memory order. One tag is the game
+    object's name, which is how the game ties a GUID to its object."""
+
+    def string(rec: bytes) -> str | None:
+        size, cap = struct.unpack_from("<QQ", rec, 16)
+        if cap == 15 and size <= 15:
+            return rec[:size].decode("latin1")
+        if size > 256 or cap < size:
+            return None
+        try:
+            mem.seek(struct.unpack_from("<Q", rec)[0])
+            return mem.read(size).decode("latin1")
+        except (OSError, ValueError, OverflowError):
+            return None
+    out, seen = [], set()
+    for off, buf in chunks(mem, pid, writable=True):
+        i = buf.find(SPACE)
+        while i >= 0:
+            guid = buf[i - 0x30:i - 0x30 + 36]
+            if i >= 0x400 and GUID.fullmatch(guid + b"\x00") and guid not in seen and guid != SPACE[:36]:
+                tags = []
+                for k in range(0xb0, 0xb0 + 0x30 * 40, 0x30):
+                    s = string(buf[i - k:i - k + 48])
+                    if not s or not s.isprintable() or GUID.fullmatch(s.encode() + b"\x00"):
+                        break
+                    tags.append(s)
+                if tags:
+                    seen.add(guid)
+                    out.append({"itemId": guid.decode(), "spaceId": SPACE[:-1].decode(), "tags": tags[::-1]})
+            i = buf.find(SPACE, i + 1)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("pid", type=int)
     ap.add_argument("game")
     ap.add_argument("-o", "--out", help="write {name: {guid, id, type}} as JSON")
     ap.add_argument("-g", "--grep", action="append", help="print only names containing this")
+    ap.add_argument("--item-list", metavar="OUT", help="only write the space's whole item list ({itemId, spaceId, "
+                    "tags} per item) as JSON")
     a = ap.parse_args()
+    if a.item_list:
+        listed = item_list(open(f"/proc/{a.pid}/mem", "rb", 0), a.pid)
+        with open(a.item_list, "w") as f:
+            json.dump({"items": listed}, f, indent=1)
+        print(f"{len(listed)} items", file=sys.stderr)
+        return
     known = items(a.game)
     mem = open(f"/proc/{a.pid}/mem", "rb", 0)
     guids: dict[int, str] = {}
