@@ -20,7 +20,8 @@
 # rust; without a Rust build it falls back to python), POWDER_WINE (the prefix's wine; default from PROTONPATH or the prefix's Proton version),
 # POWDER_OVERLAY=1 (the in-game overlay, native/overlay/), POWDER_CLIENT_MODS=name,name (with the overlay: load
 # these client mods of this repo, mods/<name>/client/*.dll built by native/build.sh mods - your choice, nothing
-# loads unless named).
+# loads unless named), POWDER_SKIP_INTRO=0 (keep the Ubisoft/Steep logo videos at start; skipped by default, for
+# the session only: the game's files are not changed).
 # Log: $XDG_RUNTIME_DIR/powder-wrap.log, without XDG_RUNTIME_DIR ${XDG_CACHE_HOME:-~/.cache}/powder/powder-wrap.log.
 # Close Ubisoft Connect before starting: a Connect already running outside the session would be reused.
 set -euo pipefail
@@ -192,11 +193,26 @@ net)    # ---- namespace root: loopback, hosts, the server; then back to the use
     nss=$(mktemp)
     sed -E 's/^hosts:.*/hosts: files myhostname/' /etc/nsswitch.conf > "$nss"
     mount --bind "$nss" /etc/nsswitch.conf
+    # the logo videos at start (POWDER_SKIP_INTRO=0 keeps them): for this session only, Steep's videos/ folder is
+    # covered by a folder of links to every video but the logos (through a second view of the real folder, so the
+    # links do not point into the cover); the game's files stay as they are
+    vids="" vorig=""
+    vd="$(steep_dir)/videos"
+    if [ "${POWDER_SKIP_INTRO:-1}" = 1 ] && [ -d "$vd" ]; then
+        vids=$(mktemp -d) vorig=$(mktemp -d)
+        mount --bind "$vd" "$vorig"
+        for f in "$vorig"/*; do
+            case ${f##*/} in ubisoft_logo.bk2|steep_logo_splash*.bk2|LOGO_STEEP_UBI_*.bk2) continue ;; esac
+            ln -s "$f" "$vids/${f##*/}"
+        done
+        mount --bind "$vids" "$vd"
+        say "intro logos skipped this session (POWDER_SKIP_INTRO=0 keeps them)"
+    fi
     port=$(https_port)
     server_command
     "${SERVER_CMD[@]}" -c "$CONFIG" run >> "$LOG" 2>&1 &
     server=$!
-    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"' EXIT
+    trap 'kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; rm -f "$hosts" "$nss"; [ -n "$vids" ] && rm -rf "$vids"' EXIT
     for _ in $(seq 100); do
         (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
         kill -0 "$server" 2>/dev/null || die "the Powder server stopped; see $LOG"
