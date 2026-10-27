@@ -23,32 +23,35 @@ mods/custom_costume_test/generate.sh [<Steep folder>]            # the clone of 
 mods/custom_costume_test/generate.sh --chief [<Steep folder>]    # Master Chief as a new item (see below)
 ```
 
-It writes about 220 MB into `client/forge/` (gitignored): `DataPC/` (the bootstrap and the two NPC templates, packed)
-and `DataPC_extra_chr/` (the two templates, packed, and 41 cloned entries). Then `items.py check` re-reads it against
-the game (0 problems expected). powder-wrap builds `DataPC_patch_03.forge` and `DataPC_extra_chr_patch_03.forge` from
+It writes about 220 MB into `client/forge/` (gitignored): `DataPC/` (the bootstrap and the two NPC templates, packed;
+with `--chief` also the 17 language packages) and `DataPC_extra_chr/` (the two templates, packed, and 41 cloned
+entries). Then `items.py check` re-reads it against the game (0 problems expected). powder-wrap builds `DataPC_patch_03.forge` and `DataPC_extra_chr_patch_03.forge` from
 it for the session; enable it with `POWDER_CLIENT_MODS=custom_costume_test` (restart Lutris after changing it).
 
 `--chief` clones the costume that `mods/master_chief` converts, from that mod's generated entries
-(`mods/master_chief/generate.sh` first). The new item is called `POWDER_MASTER_CHIEF`. If master_chief converts a
-bundle costume (costume 005, the penguin), the new item is a **jacket** (the penguin bundle draws its body through
-its jacket item `JACKET_MF_C_Penguin_228`): look for it under jackets. Leave the master_chief mod itself off to see
-Chief only on the new item.
+(`mods/master_chief/generate.sh` first, or `CHIEF_SRC`). The new item is `COSTUME_MF_POWDER_MASTER_CHIEF`
+(`CHIEF_NAME`), called **"Master Chief"** in the game (`CHIEF_TITLE`): `items.py --title` gives it a string id of
+its own (0x86ef) and adds the text to all 17 UI language packages, written to `DataPC/` with the bootstrap
+(tools/forge/LOCALIZATION.md). If master_chief converts a bundle costume (costume 005, the penguin), the new item is a
+**jacket** (the penguin bundle draws its body through its jacket item `JACKET_MF_C_Penguin_228`): look for it under
+jackets. Leave the master_chief mod itself off to see Chief only on the new item.
 
-## Master Chief as a new, owned costume (2026-10-27)
+## Master Chief as a new, owned costume (CONFIRMED 2026-10-27)
 
-The plain clone never showed up: the menu and store list only items with a store GUID, and the GUIDs come from
-Ubisoft's item list (ITEMS.md), whose entries name their game object by a tag. The list has entries no game object
-uses; `--chief` now names the new item after one of them, `PROGRESSION_TOKEN_BEAVER_COSTUME_ULC_CONDITION_ULC_4026690459`
-(GUID `077f575a-e943-4d28-8cc4-7d637a54dce0`), so the game should tie that GUID to it (G). Made with
+The menu and store list only items that the space's item list (served by the server, ITEMS.md) ties to a game object
+by `obj.gameId`. Made with
 
 ```
 mods/master_chief/make_chief.py --game <Steep> --target urban_japan -o build/chief_016   # a full costume model
 CHIEF_SRC=build/chief_016 mods/custom_costume_test/generate.sh --chief
-powder-server admin grant <player> 077f575a-e943-4d28-8cc4-7d637a54dce0 1                # own it
+tools/trainer/itemlist.py <game list.json> <data> --add COSTUME_MF_POWDER_MASTER_CHIEF --id 0x1f08c6ef000 \
+    --like COSTUME_M_MILITARY_GREY_94          # a list entry + free offer, copied from a costume that has one
 ```
 
-and a free offer in `data/store_items.json`. In the game, with only this mod on (master_chief off, so the military
-costume looks normal): Costumes should list one more costume (the urban outfit's name and icon, Chief's body).
+In the game (only this mod on, master_chief off) Costumes lists one more costume next to the game's own, with
+Chief's picture; equipping it shows Chief (confirmed). Its name: "Green Mosaics - Japan Outfit" (the clone's) before
+`--title`; with it, **"Master Chief"** (not yet seen in the game). If the name is empty or a placeholder, the game
+does not find the new string in the patched packages: see LOCALIZATION.md, "What the game must accept".
 
 ## What to check in the game, in order
 
