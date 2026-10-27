@@ -158,6 +158,16 @@ needs it).
 - Not remapped (G): ids inside mesh bodies other than the mesh's own id and its material links; a TextureSet's last
   u64 (TEXTURES.md: an editor object, id - 1, in no archive) keeps the source's value.
 
+## Several costumes in one run (`add-costumes`)
+
+`items.py add-costumes <Steep> spec.toml -o <out>` adds every `[[costume]]` of the file (`name`, `like` or
+`costume`, `label`, `source` = a folder of entries to clone from, `title`, `keep_price`) in one go: Game Bootstrap
+Settings, the language packages and the four character templates are patched **once** with all of them (a second
+run's copy would replace the first's), each costume's own entries are cloned under its own ids, and each gets its
+own `<name>.json`. `check` reads every report in the output folder, so the other costumes' additions count as
+expected. `add-costume` is the one-item case (its output is byte-identical to before, 2026-10-27). Tested: Master
+Chief (016 + its model) and a gold spandex clone (010) in one run, `check` 0 problems for both.
+
 ## What add-costume writes
 
 `-o mods/<mod>/client/forge` gets the folders powder-wrap builds into `_patch_03` archives:

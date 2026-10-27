@@ -30,6 +30,7 @@ import re
 import struct
 import sys
 import zlib
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forge  # noqa: E402
@@ -461,34 +462,63 @@ def cmd_costumes(a):
             print(f"  tag {br['tag']:#010x} -> {', '.join(kids)}; items: {', '.join(items) or '-'}")
 
 
-def cmd_add_costume(a):
-    game = Game(a.game)
-    name = a.name
-    if not re.fullmatch(r"[A-Za-z0-9_]{4,100}", name):
-        sys.exit("--name: 4-100 letters, digits, underscores")
-    label = a.label or re.sub(r"^COSTUMES?_(MF?_|F_)?", "", name).title().replace("_", "")[:24]
-    print("reading the archives' resource ids (about 15 s)")
-    resource_ids = game.all_resource_ids()
-    ids = Ids(name, set(resource_ids))
-    out_dc, out_chr = os.path.join(a.out, "DataPC"), os.path.join(a.out, "DataPC_extra_chr")
-    report: dict = {"name": name, "like": a.like}
+@dataclass
+class CostumeSpec:
+    """One costume to add: a clone of `like` (an item) or of the item drawing `costume` (a costume selector)."""
+    name: str
+    like: str | None = None
+    costume: str | None = None
+    label: str | None = None
+    source_dirs: list[str] = field(default_factory=list)  # entries to clone from instead of the game's (a mod's model)
+    keep_price: bool = False
+    title: str | None = None
 
-    # 1. the item, the costume list, the tag registry (Game Bootstrap Settings)
-    arch, bres = load_bootstrap(game)
-    if not a.like:
-        a.like = item_for_costume(game, bres, a.costume)
-        print(f"  {a.costume}: cloning {a.like}")
-        report["like"] = a.like
-    src = by_name(bres, a.like)
+
+@dataclass
+class CostumePlan:
+    """What adding one costume changes, worked out before anything is written (so several share one write)."""
+    spec: CostumeSpec
+    src: forge.Resource                    # the source item
+    item: forge.Resource                   # the new item
+    model_tag: int
+    new_tag: int
+    costume_sel: dict                      # gender -> the source's costume selector
+    clothing: dict                         # gender -> the STP_<g>_Clothing selector (shipped copy)
+    tex_of: dict                           # gender -> texture selector ids of that costume
+    clone_map: dict[int, int]
+    new_sels: dict[int, forge.Resource]    # source selector id -> its clone
+    branch_ids: dict
+    plan: dict                             # entry id -> (source, resources) of the entries cloned
+    entities: dict
+    key: str
+    newkey: str
+    title_id: int | None
+    report: dict
+
+
+def plan_costume(game: Game, ctx: dict, spec: CostumeSpec) -> CostumePlan:
+    """The changes for one costume; `ctx` holds what every costume of a run shares and reserves (ids, tags,
+    string ids, the shipped bootstrap and template)."""
+    name = spec.name
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,100}", name):
+        sys.exit(f"{name}: a name is 4-100 letters, digits, underscores")
+    label = spec.label or re.sub(r"^COSTUMES?_(MF?_|F_)?", "", name).title().replace("_", "")[:24]
+    resource_ids, bres, tres, tby = ctx["resource_ids"], ctx["bres"], ctx["tres"], ctx["tby"]
+    ids = Ids(name, ctx["taken"])
+    report: dict = {"name": name, "like": spec.like}
+    like = spec.like
+    if not like:
+        like = item_for_costume(game, bres, spec.costume)
+        print(f"  {spec.costume}: cloning {like}")
+        report["like"] = like
+    src = by_name(bres, like)
     if any(r.name == name for r in bres):
         sys.exit(f"{name}: an item of that name exists")
     d = parse_item(src.payload)
     if d["category"] != COSTUME_CATEGORY:  # e.g. JACKET_MF_C_Penguin_228, the part of a costume bundle that draws it
-        print(f"  note: {a.like} is no costume item (category {d['category']}); the new item gets its category")
-    _, tres = game.datafile("DataPC_extra_chr", TEMPLATE_IDS["DataPC_extra_chr"][0])
-    tby = {r.id: r for r in tres}
+        print(f"  note: {like} is no costume item (category {d['category']}); the new item gets its category")
     item_tags = {t for lst in d["tags"] for t in lst}
-    clothing = {g: next(r for r in tres if r.name == f"STP_{g}_Clothing") for g in "MF"}
+    clothing = ctx["clothing"]
     model_tag, costume_sel = None, {}
     for g, sel in clothing.items():
         for br in selector_branches(sel.payload, sel.id)[2]:
@@ -497,11 +527,12 @@ def cmd_add_costume(a):
                 if kid:
                     model_tag, costume_sel[g] = br["tag"], tby[kid]
     if not model_tag or set(costume_sel) != {"M", "F"}:
-        sys.exit(f"{a.like}: none of its tags selects a costume in both STP_M_Clothing and STP_F_Clothing")
-    taken_tags = {t for r in bres if r.type == ITEM for t in _item_tags(r.payload)}
+        sys.exit(f"{like}: none of its tags selects a costume in both STP_M_Clothing and STP_F_Clothing")
     new_tag = zlib.crc32(f"POWDER:{name}".encode())
-    while new_tag in taken_tags or struct.pack("<I", new_tag) in by_name(bres, f"{REGISTRY_ID:#x}").payload:
+    registry = by_name(bres, f"{REGISTRY_ID:#x}").payload
+    while new_tag in ctx["taken_tags"] or struct.pack("<I", new_tag) in registry:
         new_tag = (new_tag + 1) & 0xFFFFFFFF
+    ctx["taken_tags"].add(new_tag)
     report["model_tag"], report["new_tag"] = f"{model_tag:#010x}", f"{new_tag:#010x}"
 
     item_id = ids.new(src.id)
@@ -509,38 +540,27 @@ def cmd_add_costume(a):
     for o in d["tag_offs"]:
         if u32(p, o) == model_tag:
             struct.pack_into("<I", p, o, new_tag)
-    if not a.keep_price:
+    if not spec.keep_price:
         struct.pack_into("<I", p, d["price_off"], 0)
         p[d["default_off"]] = 1  # G: set on the stock riders' starter gear (see ITEMS.md)
     title_id = None
-    if a.title:  # a name of its own: a new string id, its text added to every UI language package (loc.py)
-        title_id = loc.new_string_id(name, loc.all_ids(game.folder))
+    if spec.title:  # a name of its own: a new string id, its text added to every UI language package (loc.py)
+        title_id = loc.new_string_id(name, ctx["loc_taken"])
+        ctx["loc_taken"].add(title_id)
         struct.pack_into("<I", p, d["loc_off"], title_id)
-        report.update(title=a.title, loc=f"{title_id:#x}", loc_was=f"{d['loc']:#x}")
+        report.update(title=spec.title, loc=f"{title_id:#x}", loc_was=f"{d['loc']:#x}")
     item_map = {src.id: item_id}
     for v in nested_ids(bytes(p), resource_ids):
         item_map[v] = ids.new(v)
     new_item = forge.Resource(item_id, ITEM, name, remap(bytes(p), item_map), src.flag, src.pre, src.extra)
     parse_item(new_item.payload)
     report["item"] = f"{item_id:#x}"
+    report["gear_list"] = next((r.name for r in bres if r.type == GEAR_LIST and struct.pack("<Q", src.id) in r.payload),
+                               None)
+    if not report["gear_list"]:
+        sys.exit(f"{like}: in no GEAR_* list")
 
-    new_bres = []
-    gear_list = None
-    for r in bres:
-        if r.type == GEAR_LIST and struct.pack("<Q", src.id) in r.payload:
-            gear_list = r.name
-            r = forge.Resource(r.id, r.type, r.name, append_gear(r.payload, item_id), r.flag, r.pre, r.extra)
-        elif r.id == REGISTRY_ID:
-            r = forge.Resource(r.id, r.type, r.name, register_tag(r.payload, model_tag, new_tag), r.flag, r.pre,
-                               r.extra)
-        new_bres.append(r)
-        if r.id == src.id:
-            new_bres.append(new_item)
-    if not gear_list:
-        sys.exit(f"{a.like}: in no GEAR_* list")
-    report["gear_list"] = gear_list
-
-    # 2. the template side: new costume selectors (M, F) and texture selector, a new branch per Clothing selector
+    # the template side: new costume selectors (M, F) and texture selector, a new branch per Clothing selector
     sel_map: dict[int, int] = {}
     tex_sel, tex_of = {}, {"M": [], "F": []}  # costume 016 has one texture selector for both, 010 one per gender
     for g, s in costume_sel.items():
@@ -581,7 +601,7 @@ def cmd_add_costume(a):
         fg, e = found
         if eid not in entities and not own.search(e.name):
             continue  # shared (e.g. STP_MF_Glass_ALL): referenced as it is
-        over = source_override(a.source_dir, eid)
+        over = source_override(spec.source_dirs, eid)
         res = over if over is not None else game.datafile("DataPC_extra_chr", eid)[1]
         plan[eid] = ("source-dir" if over is not None else os.path.basename(fg.path), res)
         for r in res:  # entries it refers to: a material's textures, a texture's Mips (links near the start)
@@ -594,8 +614,8 @@ def cmd_add_costume(a):
                     f2 = game.entry("DataPC_extra_chr", v)
                     if f2 and own.search(f2[1].name):
                         todo.append(v)
-    if a.source_dir and not any(how == "source-dir" for how, _ in plan.values()):
-        sys.exit(f"--source-dir holds none of the entries {costume_sel['M'].name} is made of")
+    if spec.source_dirs and not any(how == "source-dir" for how, _ in plan.values()):
+        sys.exit(f"{name}: its source dirs hold none of the entries {costume_sel['M'].name} is made of")
     clone_map: dict[int, int] = dict(sel_map)
     for eid, (_, res) in plan.items():
         for r in res:
@@ -618,74 +638,153 @@ def cmd_add_costume(a):
                 for s in list(costume_sel.values()) + list(tex_sel.values())}
     report["selectors"] = {v.name: f"{v.id:#x}" for v in new_sels.values()}
     branch_ids = {g: (ids.new(), ids.new()) for g in "MF"}  # the same in every template copy
+    report["entities"] = {f"{clone_map[e]:#x}": plan[e][1][0].name.replace(key, newkey) for e in entities}
+    report["cloned_entries"] = len(plan)
+    report["source_dirs"] = [os.path.abspath(x) for x in spec.source_dirs]
+    report["ids"] = {f"{s:#x}": f"{d:#x}" for s, d in sorted(clone_map.items())}
+    return CostumePlan(spec, src, new_item, model_tag, new_tag, costume_sel, clothing, tex_of, clone_map, new_sels,
+                       branch_ids, plan, entities, key, newkey, title_id, report)
 
-    def patch_template(res: list[forge.Resource]) -> list[forge.Resource]:
-        out = []
-        for r in res:
-            pl = r.payload
-            for g in "MF":  # lists may name selectors this datafile lacks (STP_MF_Parts in the M NPC template)
-                s, c = costume_sel[g], clothing[g]
-                if r.id == c.id:
-                    pl = add_branch(pl, c.id, model_tag, new_tag, s.id, clone_map[s.id], branch_ids[g])
-                add = [clone_map[s.id]] + [clone_map[t] for t in dict.fromkeys(tex_of[g])]  # depth first
-                span = set(closure_list(c.payload)) | {c.id}
-                for count_off, lst in link_lists_with(pl, s.id):
-                    if r.id == s.id:
-                        continue
-                    at = max(k for k, v in enumerate(lst) if v in span) + 1
-                    pl = insert_links(pl, count_off, at, [v for v in add if v not in lst])
-            out.append(forge.Resource(r.id, r.type, r.name, pl, r.flag, r.pre, r.extra) if pl is not r.payload else r)
-            for old, new in new_sels.items():
-                if r.id == old:
-                    out.append(new)
-        return out
 
+def patch_template(res: list[forge.Resource], c: CostumePlan) -> list[forge.Resource]:
+    """A character template datafile with one costume's branch, selectors and list entries added."""
+    out = []
+    for r in res:
+        pl = r.payload
+        for g in "MF":  # lists may name selectors this datafile lacks (STP_MF_Parts in the M NPC template)
+            s, cl = c.costume_sel[g], c.clothing[g]
+            if r.id == cl.id:
+                pl = add_branch(pl, cl.id, c.model_tag, c.new_tag, s.id, c.clone_map[s.id], c.branch_ids[g])
+            add = [c.clone_map[s.id]] + [c.clone_map[t] for t in dict.fromkeys(c.tex_of[g])]  # depth first
+            span = set(closure_list(cl.payload)) | {cl.id}
+            for count_off, lst in link_lists_with(pl, s.id):
+                if r.id == s.id:
+                    continue
+                at = max(k for k, v in enumerate(lst) if v in span) + 1
+                pl = insert_links(pl, count_off, at, [v for v in add if v not in lst])
+        out.append(forge.Resource(r.id, r.type, r.name, pl, r.flag, r.pre, r.extra) if pl is not r.payload else r)
+        for old, new in c.new_sels.items():
+            if r.id == old:
+                out.append(new)
+    return out
+
+
+def add_costumes(game: Game, specs: list[CostumeSpec], out: str, level: int = 9) -> list[CostumePlan]:
+    """Add every costume of `specs` in one go: the shared resources (Game Bootstrap Settings, the language
+    packages, the four character templates) are patched once with all of them, each costume's own entries are
+    cloned under its own ids. Writes `<out>/DataPC/`, `<out>/DataPC_extra_chr/` and a `<name>.json` per costume."""
+    names = [sp.name for sp in specs]
+    if len(set(names)) != len(names):
+        sys.exit(f"the same item name twice: {sorted({n for n in names if names.count(n) > 1})}")
+    print("reading the archives' resource ids (about 15 s)")
+    resource_ids = game.all_resource_ids()
+    _, bres = load_bootstrap(game)
+    _, tres = game.datafile("DataPC_extra_chr", TEMPLATE_IDS["DataPC_extra_chr"][0])
+    ctx = {"resource_ids": resource_ids, "taken": set(resource_ids), "bres": bres, "tres": tres,
+           "tby": {r.id: r for r in tres},
+           "clothing": {g: next(r for r in tres if r.name == f"STP_{g}_Clothing") for g in "MF"},
+           "taken_tags": {t for r in bres if r.type == ITEM for t in _item_tags(r.payload)},
+           "loc_taken": loc.all_ids(game.folder) if any(sp.title for sp in specs) else set()}
+    plans = [plan_costume(game, ctx, sp) for sp in specs]
+
+    # 1. Game Bootstrap Settings: the new items (each after its source), the gear lists, the tag registry
+    new_bres = []
+    for r in bres:
+        pl = r.payload
+        for c in plans:
+            if r.type == GEAR_LIST and r.name == c.report["gear_list"]:
+                pl = append_gear(pl, c.item.id)
+            elif r.id == REGISTRY_ID:
+                pl = register_tag(pl, c.model_tag, c.new_tag)
+        new_bres.append(r if pl is r.payload else forge.Resource(r.id, r.type, r.name, pl, r.flag, r.pre, r.extra))
+        new_bres += [c.item for c in plans if c.src.id == r.id]
+    out_dc, out_chr = os.path.join(out, "DataPC"), os.path.join(out, "DataPC_extra_chr")
     os.makedirs(out_dc, exist_ok=True)
     os.makedirs(out_chr, exist_ok=True)
-    written = []
-    written.append(write_datafile(out_dc, BOOTSTRAP_ID, "Game Bootstrap Settings", new_bres, a.level))
-    if title_id is not None:
-        pk = loc.set_strings(game.folder, {title_id: a.title}, out_dc)
+    written = [write_datafile(out_dc, BOOTSTRAP_ID, "Game Bootstrap Settings", new_bres, level)]
+
+    # 2. the names: every title in one rewrite of each language package
+    titles = {c.title_id: c.spec.title for c in plans if c.title_id is not None}
+    if titles:
+        pk = loc.set_strings(game.folder, titles, out_dc)
         written += pk
-        report["loc_packages"] = len(pk)
+        for c in plans:
+            if c.title_id is not None:
+                c.report["loc_packages"] = len(pk)
+
+    # 3. the character templates, each patched with every costume
     for base, tids in TEMPLATE_IDS.items():
         for tid in tids:
             _, res = game.datafile(base, tid)
-            if not any(r.id in (costume_sel["M"].id, costume_sel["F"].id) for r in res):
+            mine = [c for c in plans if any(r.id in (c.costume_sel["M"].id, c.costume_sel["F"].id) for r in res)]
+            if not mine:
                 continue
-            written.append(write_datafile(out_dc if base == "DataPC" else out_chr, tid, res[0].name,
-                                          patch_template(res), a.level))
+            for c in mine:
+                res = patch_template(res, c)
+            written.append(write_datafile(out_dc if base == "DataPC" else out_chr, tid, res[0].name, res, level))
 
-    # 3. the cloned entries (entities, materials, textures), each under its new id, with its prefetch blob
-    for eid, (srcname, res) in sorted(plan.items()):
-        new_res = []
-        for r in res:  # shared resources carried along (e.g. STP_MF_Glass_ALL) stay as they are
-            nid = clone_map.get(r.id, r.id)
-            if nid == r.id:
-                new_res.append(r)
-                continue
-            new_res.append(forge.Resource(nid, r.type, r.name.replace(key, newkey), remap(r.payload, clone_map),
-                                          r.flag, r.pre, r.extra))
-        blob = remap_prefetch(game.prefetch("DataPC_extra_chr", eid), clone_map)
-        nid = clone_map[eid]
-        out = os.path.join(out_chr, f"{nid:016x}_{forge.safe_name(new_res[0].name)}")
-        more = {"clone": {"from": f"{eid:#x}", "from_name": res[0].name, "source": srcname}}
-        if blob is not None:
-            more["prefetch"] = blob.hex()
-        forge.write_unpacked(out, nid, new_res[0].name, new_res[0].type, new_res, **more)
-        written.append(out)
-    report["entities"] = {f"{clone_map[e]:#x}": plan[e][1][0].name.replace(key, newkey) for e in entities}
-    report["cloned_entries"] = len(plan)
-    report["ids"] = {f"{s:#x}": f"{d:#x}" for s, d in sorted(clone_map.items())}
-    with open(os.path.join(a.out, f"{name}.json"), "w") as f:
-        json.dump(report, f, indent=1)
+    # 4. each costume's cloned entries (entities, materials, textures) under its new ids, with their prefetch blobs
+    for c in plans:
+        for eid, (srcname, res) in sorted(c.plan.items()):
+            new_res = []
+            for r in res:  # shared resources carried along (e.g. STP_MF_Glass_ALL) stay as they are
+                nid = c.clone_map.get(r.id, r.id)
+                if nid == r.id:
+                    new_res.append(r)
+                    continue
+                new_res.append(forge.Resource(nid, r.type, r.name.replace(c.key, c.newkey),
+                                              remap(r.payload, c.clone_map), r.flag, r.pre, r.extra))
+            blob = remap_prefetch(game.prefetch("DataPC_extra_chr", eid), c.clone_map)
+            nid = c.clone_map[eid]
+            dest = os.path.join(out_chr, f"{nid:016x}_{forge.safe_name(new_res[0].name)}")
+            more = {"clone": {"from": f"{eid:#x}", "from_name": res[0].name, "source": srcname, "item": c.spec.name}}
+            if blob is not None:
+                more["prefetch"] = blob.hex()
+            forge.write_unpacked(dest, nid, new_res[0].name, new_res[0].type, new_res, **more)
+            written.append(dest)
+        c.report["batch"] = names
+        with open(os.path.join(out, f"{c.spec.name}.json"), "w") as f:
+            json.dump(c.report, f, indent=1)
     for w in written:
         print(f"  {w}")
-    print(f"{name}: item {item_id:#x} in {gear_list}, tag {new_tag:#010x} (was {model_tag:#010x}), "
-          f"{len(new_sels)} selectors, {len(plan)} cloned entries -> {a.out}")
-    if title_id is not None:
-        print(f"  name {a.title!r}: string id {title_id:#x} (was {d['loc']:#x}) in {report['loc_packages']} "
-              "language packages")
+    for c in plans:
+        print(f"{c.spec.name}: item {c.item.id:#x} in {c.report['gear_list']}, tag {c.new_tag:#010x} "
+              f"(was {c.model_tag:#010x}), {len(c.new_sels)} selectors, {len(c.plan)} cloned entries")
+        if c.title_id is not None:
+            print(f"  name {c.spec.title!r}: string id {c.title_id:#x} in {c.report['loc_packages']} language packages")
+    print(f"{len(plans)} costume(s) -> {out}")
+    return plans
+
+
+def read_specs(path: str) -> list[CostumeSpec]:
+    """`[[costume]]` tables of a TOML file: name, like or costume, label, source (a folder or a list, relative to the
+    file), title, keep_price."""
+    import tomllib
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    here = os.path.dirname(os.path.abspath(path))
+    specs = []
+    for t in data.get("costume", []):
+        srcs = t.get("source", [])
+        srcs = [srcs] if isinstance(srcs, str) else list(srcs)
+        if bool(t.get("like")) == bool(t.get("costume")):
+            sys.exit(f"{path}: {t.get('name')}: give exactly one of like / costume")
+        specs.append(CostumeSpec(name=t["name"], like=t.get("like"), costume=t.get("costume"), label=t.get("label"),
+                                 source_dirs=[os.path.join(here, x) for x in srcs],
+                                 keep_price=bool(t.get("keep_price", False)), title=t.get("title")))
+    if not specs:
+        sys.exit(f"{path}: no [[costume]] tables")
+    return specs
+
+
+def cmd_add_costume(a):
+    add_costumes(Game(a.game), [CostumeSpec(name=a.name, like=a.like, costume=a.costume, label=a.label,
+                                            source_dirs=a.source_dir, keep_price=a.keep_price, title=a.title)],
+                 a.out, a.level)
+
+
+def cmd_add_costumes(a):
+    add_costumes(Game(a.game), read_specs(a.spec), a.out, a.level)
 
 
 def cmd_check(a):
@@ -694,6 +793,15 @@ def cmd_check(a):
     with open(a.report) as f:
         rep = json.load(f)
     out = os.path.dirname(os.path.abspath(a.report))
+    others = []  # the other costumes written in the same run (add-costumes): their additions are expected too
+    for path in glob.glob(os.path.join(out, "*.json")):
+        if os.path.abspath(path) != os.path.abspath(a.report):
+            with open(path) as f:
+                o = json.load(f)
+            if isinstance(o, dict) and "item" in o and "ids" in o:
+                others.append(o)
+    every = [rep] + others
+    source_dirs = rep.get("source_dirs") or a.source_dir
     idmap = {int(s, 16): int(d, 16) for s, d in rep["ids"].items()}
     inv = {d: s for s, d in idmap.items()}
     new_ids = set(idmap.values())
@@ -714,7 +822,7 @@ def cmd_check(a):
     # the bootstrap: item, list, registry; everything else unchanged
     _, orig = load_bootstrap(game)
     new = load(glob.glob(os.path.join(out, "DataPC", f"{BOOTSTRAP_ID:016x}_*"))[0])
-    need(len(new) == len(orig) + 1, "bootstrap: not exactly one resource more")
+    need(len(new) == len(orig) + len(every), f"bootstrap: not exactly {len(every)} resource(s) more")
     nb = {r.id: r for r in new}
     item = nb.get(item_id)
     if need(item is not None, "bootstrap: no new item"):
@@ -724,8 +832,8 @@ def cmd_check(a):
         need(not any(i in item.payload for i in (struct.pack("<Q", s) for s in idmap if s != item_id)),
              "item: still holds an id of the source's own objects")
     changed = [r.id for r in orig if nb[r.id].payload != r.payload]
-    gear_id = next(r.id for r in orig if r.name == rep["gear_list"])
-    need(sorted(changed) == sorted([gear_id, REGISTRY_ID]), f"bootstrap: changed {[hex(c) for c in changed]}")
+    gear_ids = {next(r.id for r in orig if r.name == o["gear_list"]) for o in every}
+    need(set(changed) == gear_ids | {REGISTRY_ID}, f"bootstrap: changed {[hex(c) for c in changed]}")
     gear = next(r for r in new if r.name == rep["gear_list"])
     append_gear(gear.payload, 0)  # still parses
     need(gear.payload.count(struct.pack("<Q", item_id)) == 1, "gear list: item not listed once")
@@ -754,11 +862,13 @@ def cmd_check(a):
                 need(q.entries[:len(e0)] == e0 and all(y == 0 for _, y in q.entries[len(e0):]),
                      f"{x.name}: dictionary entries changed (only new leaves may be appended)")
                 need(loc_id in q.strings and q.text(loc_id) == rep["title"], f"{x.name}: the name does not read back")
-                need({k: v for k, v in q.strings.items() if k != loc_id} == x.package.strings,
+                titled = {int(o["loc"], 16) for o in every if "loc" in o}
+                need({k: v for k, v in q.strings.items() if k not in titled} == x.package.strings,
                      f"{x.name}: other strings changed")
 
     # the templates: the new branch, the new selectors, the lists; shared resources identical in every copy
     sel_new = {int(v, 16) for v in rep["selectors"].values()}
+    sel_all = {int(v, 16) for o in every for v in o["selectors"].values()}
     copies: dict[int, bytes] = {}
     for base, tids in TEMPLATE_IDS.items():
         for tid in tids:
@@ -769,7 +879,7 @@ def cmd_check(a):
             _, o_res = game.datafile(base, tid)
             have = {r.id for r in res}
             o_have = {r.id for r in o_res}
-            need(o_have <= have and (have - o_have) <= sel_new, f"{tid:#x}: resources other than the new selectors")
+            need(o_have <= have and (have - o_have) <= sel_all, f"{tid:#x}: resources other than the new selectors")
             o_pl = {o.id: o.payload for o in o_res}
             for r in res:
                 if r.id in copies and copies[r.id][0] == o_pl.get(r.id):  # copies that were the same still are
@@ -792,16 +902,18 @@ def cmd_check(a):
                             need(False, f"{r.name}: still refers to the source's selector {s:#x}")
 
     # the cloned entries: new ids only for their own resources, no old own id left, references resolve
-    known = new_ids | set(game.all_resource_ids())
+    known = {int(d, 16) for o in every for d in o["ids"].values()} | set(game.all_resource_ids())
     n = 0
     for p in sorted(glob.glob(os.path.join(out, "DataPC_extra_chr", "*"))):
         if not os.path.isdir(p):
             continue
-        n += 1
         m, res = forge.load_unpacked(p)
+        if m.get("clone", {}).get("item", rep["name"]) != rep["name"]:
+            continue  # another costume's entry
+        n += 1
         need(res[0].id in new_ids, f"{p}: entry id is not new")
         src_id = int(m["clone"]["from"], 16)
-        over = source_override(a.source_dir, src_id)
+        over = source_override(source_dirs, src_id)
         src = {r.id: r for r in (over if over is not None else game.datafile("DataPC_extra_chr", src_id)[1])}
         for r in res:
             s = src.get(inv.get(r.id, r.id))
@@ -958,7 +1070,15 @@ def main(argv=None):
     p.add_argument("--level", type=int, default=9, help="zstd level for the patched datafiles")
     p.add_argument("-o", "--out", required=True, help="output: <out>/DataPC/ and <out>/DataPC_extra_chr/")
     p.set_defaults(fn=cmd_add_costume)
-    p = sub.add_parser("check", help="check add-costume's output (the <name>.json it wrote) against the game")
+    p = sub.add_parser("add-costumes", help="add several costumes in one go (shared resources patched once), from a "
+                       "TOML file of [[costume]] tables")
+    p.add_argument("game")
+    p.add_argument("spec", help="[[costume]] name, like|costume, label, source, title, keep_price")
+    p.add_argument("--level", type=int, default=9, help="zstd level for the patched datafiles")
+    p.add_argument("-o", "--out", required=True, help="output: <out>/DataPC/ and <out>/DataPC_extra_chr/")
+    p.set_defaults(fn=cmd_add_costumes)
+    p = sub.add_parser("check", help="check add-costume(s)' output (a <name>.json it wrote) against the game; the "
+                       "other costumes of the same run are taken into account")
     p.add_argument("game")
     p.add_argument("report", help="<out>/<name>.json")
     p.add_argument("--source-dir", action="append", default=[], help="as given to add-costume")
