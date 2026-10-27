@@ -285,6 +285,12 @@ API. Everything below is on `rework/rust-server`.
 2. New items instead of replacements: new ids (entity, template selector entry, bootstrap item, prefetch), e.g.
    Master Chief as a new costume (asked 2026-10-26; today it replaces costume 016). Game Bootstrap Settings
    (0x800) is one 146 MB datafile of 17,292 resources. The skeleton resource (hierarchy) is still not decoded.
+   2026-10-27: decoded and tooled (tools/forge/items.py + ITEMS.md): item -> tag -> STP_M/F_Clothing branch ->
+   costume selector -> entity / texture selector -> materials; `items.py add-costume` clones a costume under new
+   ids (item in GEAR_COSTUMES, tag registry, branches + selectors in all 4 templates, entities/materials/textures),
+   `check` verifies it. Test mod mods/custom_costume_test (NOT yet tried in-game; first questions: does the game
+   load DataPC_patch_03, and does the menu list an item without a store GUID). Costume 016 is only the
+   COSTUME_MF_URBAN_OUTFIT_JAPAN_139-141 items, which have no store GUID (not the military costume).
 3. Stuck "binoculars" viewpoint icons after today's restores: set exactly the missing bits (map viewpoints to
    unlockable_exploration:2:* bits, e.g. via the save's DropZoneFlags) - never mass-set stats (that brings the
    intro back). A server admin command "roll stats back to a time" (fold stat_events) would make repairs routine.
