@@ -309,4 +309,10 @@ API. Everything below is on `rework/rust-server`.
    (needs the view matrix); Tier 3 new rideable geometry: static meshes (formats 6/8) now round-trip through
    Blender, so the steps are (a) replace a prop's mesh in-game (every placement changes), (b) decode the
    collision shapes (0xB22B3E61 `MeshShape`/`Merged Shape`; a visual mesh alone is not rideable), (c) decode the
-   world cells (0xAC2BBF68 DataBlocks) to place new instances.
+   world cells (0xAC2BBF68 DataBlocks) to place new instances. (c) DONE on the file side 2026-10-27
+   (tools/forge/world.py + WORLD.md): the world's cell tables (quadtree, 128 m cells, finest level first, two
+   tables per open-world map), the cell list, entities/groups with their world matrix, proxies (collision
+   stand-ins in neighbour cells), the prop -> LOD mesh / shape links; `world.py edit` moves/turns/removes objects
+   (and their proxies) and copies entities under fresh ids. NOT yet tried in-game: mods/world_test (two firs added
+   and a boulder moved next to the menu rider, WhiteRoom). Open: open-world vegetation is baked in
+   `HAS_PackedInstance` groups (not decoded); copies get no proxies yet; group copies not done.
