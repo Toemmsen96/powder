@@ -196,6 +196,17 @@ master_chief's entries.
    logged the game out. Next experiment: serve the **whole** list (this dump) plus one record for the new item
    (a fresh GUID, tags `COSTUME_MF_POWDER_TEST_01`, `COSUTME`, `GEAR`, ...) under a new fingerprint, and a free
    offer for it; the download's exact format (and whether sha256/md5 must match the body) is unknown.
+   **The download (2026-10-27, from the unpacked exe):** `items/all` without `fields` answers
+   `{"compressedItems", "lastModified", "sha256", "md5"}` (all required strings; JobGetDataAll), `compressedItems` =
+   base64(zlib(JSON)) (JobGetDataDecompressed: base64Decode, zlibInit 1.2.8, decompressData, extractData), the JSON
+   most likely a bare array (extractData names no key; G) of items `{itemId, spaceId, type, nameId, duration,
+   revision, lastModified, tags, obj}` (+ optional `maximumQuantity`; the parser's field table, 0x1b996e0 in the
+   2026-10-26 dump). The game's cache is AES-like encrypted (size a multiple of 16), so the original list cannot be
+   read from it. Served by the Rust server when `<data>/item_list.json` exists (assets::item_list; fingerprint =
+   sha256/md5 of the JSON, G); `tools/trainer/itemlist.py` adds custom items to it and to the store. NOT yet tried:
+   the base list must be the game's complete list, and `storemap.py --item-list` (a heuristic walk) lost the name tag
+   of 522 records (387 medals) and picked up offers, so it needs a structural reader first (with the game running).
+   Back up `Documents/My Games/STEEP/Default/tmp/` before the game first takes a custom list (it overwrites its copy).
 3. **Drawing it.** The new tag -> new Clothing branch -> new selector -> new entity in DataPC_extra_chr_patch_03.
    If the rider shows the default clothes instead, the selector side was not found (registry, list order, or the
    template copies); if the game crashes when the costume is equipped, suspect the entity / material clones.

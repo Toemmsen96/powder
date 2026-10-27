@@ -31,4 +31,26 @@ check=("$M"/*.json)
 src=()
 [ "${args[4]:-}" = --source-dir ] && src=(--source-dir "${args[5]}")
 python3 "$I" check "$G" "${check[0]}" ${src[@]+"${src[@]}"}
+# --chief: the clone shows the urban outfit's menu picture (its icon is shared, not cloned); that outfit is not in the
+# store, so its picture becomes Chief's (rendered with Blender, as mods/master_chief does)
+B=${BLENDER:-$(ls -d "$HOME"/Executables/Blender/blender-*/blender 2>/dev/null | sort -V | tail -n 1 || true)}
+[ -n "$B" ] || B=$(command -v blender || true)
+if [ "${args[4]:-}" = --source-dir ] && [ -n "$B" ]; then
+    chief="$here/../master_chief"
+    png=$(mktemp --suffix=.png) && pic=$(mktemp --suffix=.png)
+    trap 'rm -f "$png" "$pic"' EXIT
+    "$B" --factory-startup -b --python "$chief/render_icon.py" -- "$here/../../models/master_chief_high_poly/scene.gltf" \
+        "$png" 256 >/dev/null 2>&1 && python3 - "$G" "$png" "$pic" "$M" <<'PY'
+import os, sys
+game, png, pic, out = sys.argv[1:]
+here = os.path.dirname(os.path.abspath(out))
+sys.path.insert(0, os.path.join(here, "..", "..", "master_chief"))
+import make_chief
+name = "STP_ICON_COSTUME_MF_URBAN_OUTFIT_JAPAN_139_00006_Map"
+make_chief.picture(game, name, png, pic)
+make_chief.run(os.path.join(make_chief.TOOLS, "texture.py"), "replace", os.path.join(game, "DataPC_extra_2.forge"), name,
+               "--image", pic, "-o", os.path.join(out, "DataPC_extra_2"))
+print(f"  picture: {name}")
+PY
+fi
 echo "generated $M"

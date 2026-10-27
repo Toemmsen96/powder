@@ -319,6 +319,66 @@ pub fn local_store(path: &Path) -> OfferCatalog {
     OfferCatalog::new(offers)
 }
 
+/// The space's item list (`GET /v1/spaces/<space>/items/all`), served when `<data>/item_list.json` exists: the
+/// game's whole list (`storemap.py --item-list`, read from the running game) plus custom items. Steep keeps its own
+/// copy of the list (an encrypted cache) and asks only for the list's version (`?fields=lastModified,sha256,md5`);
+/// when that differs from its copy it downloads the list: `{compressedItems, lastModified, sha256, md5}`, all
+/// strings, `compressedItems` = base64(zlib(JSON array of items)) (the UbiServices SDK's JobGetDataAll and
+/// JobGetDataDecompressed: base64Decode, zlibInit, decompressData, extractData). An item is
+/// `{itemId, spaceId, type, nameId, duration, revision, lastModified, tags, obj}` (+ optional maximumQuantity);
+/// the game ties an item to its own object by a tag (the object's name). Without the file the server answers with
+/// the fingerprint of Ubisoft's list (builtin/http.rs), so the game keeps its own copy.
+/// G: the array root (extractData names no key), what sha256/md5 are taken over (here the JSON), and that the game
+/// takes a list that is not Ubisoft's ({} made it log out).
+pub struct ItemList {
+    pub version: Value,
+    pub full: Value,
+}
+
+pub fn item_list(path: &Path) -> Option<ItemList> {
+    use base64::Engine;
+    use std::io::Write;
+    let raw = std::fs::read(path).ok()?;
+    let items = match serde_json::from_slice::<Value>(&raw) {
+        Ok(Value::Array(items)) => items,
+        Ok(Value::Object(mut o)) => match o.remove("items") {
+            Some(Value::Array(items)) => items,
+            _ => vec![],
+        },
+        _ => vec![],
+    };
+    if items.is_empty() {
+        log::warn!(target: "powder.economy", "{}: no items, the game keeps its own list", path.display());
+        return None;
+    }
+    let modified: chrono::DateTime<chrono::Utc> = std::fs::metadata(path).and_then(|m| m.modified()).ok()?.into();
+    let stamp = modified.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let full: Vec<Value> = items.into_iter().filter_map(|mut it| {
+        let o = it.as_object_mut()?;
+        o.get("itemId")?.as_str()?;
+        let defaults = [("spaceId", Value::from(crate::constants::SPACE_ID)), ("type", Value::from("")),
+                        ("nameId", Value::from("")), ("duration", Value::from(0)), ("revision", Value::from(1)),
+                        ("lastModified", Value::from(stamp.as_str())), ("tags", Value::Array(vec![])),
+                        ("obj", Value::Object(Map::new()))];
+        for (k, v) in defaults {
+            o.entry(k).or_insert(v);
+        }
+        Some(it)
+    }).collect();
+    let json = serde_json::to_vec(&full).ok()?;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    z.write_all(&json).ok()?;
+    let compressed = base64::engine::general_purpose::STANDARD.encode(z.finish().ok()?);
+    let sha256 = hex::encode_upper(sha2::Sha256::digest(&json));
+    let md5 = hex::encode_upper(md5::Md5::digest(&json));
+    log::info!(target: "powder.economy", "{}: the space's item list, {} items (sha256 {})", path.display(), full.len(),
+               &sha256[..12]);
+    Some(ItemList {
+        version: serde_json::json!({"lastModified": stamp, "sha256": sha256, "md5": md5}),
+        full: serde_json::json!({"compressedItems": compressed, "lastModified": stamp, "sha256": sha256, "md5": md5}),
+    })
+}
+
 /// The item of a synthetic offer id (see synthetic_offer).
 pub fn synthetic_item(offer_id: &str) -> Option<String> {
     xor_uuid(offer_id)
@@ -361,6 +421,8 @@ pub struct Assets {
     pub catalog: OfferCatalog,
     /// Without a pack: the game's own store items as free offers (local_store).
     pub local_store: OfferCatalog,
+    /// The space's item list, when one is served instead of Ubisoft's (item_list).
+    pub item_list: Option<ItemList>,
     pub actions: Vec<Value>,
     pub connect_http: HttpFixtures,
     pub products: ConnectProducts,
@@ -525,6 +587,36 @@ mod tests {
         assert_eq!(synthetic_item(offer["offerId"].as_str().unwrap()).as_deref(), Some(costume));
         assert!(store.query(Some("COSUTME"), Some("progression"), None, 0, 10).is_empty());
         assert!(local_store(&dir.path().join("missing.json")).is_empty());
+    }
+
+    #[test]
+    fn item_list_is_compressed_json_with_every_required_field() {
+        use base64::Engine;
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("item_list.json");
+        std::fs::write(&path, json!({"items": [
+            {"itemId": "28b58162-91b9-4030-905c-05da7f5b6549", "spaceId": crate::constants::SPACE_ID,
+             "tags": ["GEAR", "COSTUME_M_MILITARY_GREY_94", "COSUTME"]},
+            {"tags": ["no id: left out"]},
+        ]}).to_string()).unwrap();
+        let list = item_list(&path).unwrap();
+        let full = list.full.as_object().unwrap();
+        assert_eq!(full.keys().collect::<Vec<_>>(), ["compressedItems", "lastModified", "sha256", "md5"]);
+        for k in ["lastModified", "sha256", "md5"] {
+            assert_eq!(list.version[k], full[k]);
+        }
+        let z = base64::engine::general_purpose::STANDARD.decode(full["compressedItems"].as_str().unwrap()).unwrap();
+        let mut json = vec![];
+        flate2::read::ZlibDecoder::new(&z[..]).read_to_end(&mut json).unwrap();
+        assert_eq!(full["sha256"], hex::encode_upper(sha2::Sha256::digest(&json)));
+        let items: Value = serde_json::from_slice(&json).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        for field in ["itemId", "spaceId", "type", "nameId", "duration", "revision", "lastModified", "tags", "obj"] {
+            assert!(items[0].get(field).is_some(), "the game requires {field}");
+        }
+        assert!(item_list(&dir.path().join("missing.json")).is_none());
     }
 
     #[test]

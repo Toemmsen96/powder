@@ -68,6 +68,9 @@ const CORS_EXPOSE: &str = "X-Total-Count, Ubi-TransactionId";
 
 static GAME_CONFIG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?i)^/v\d+/applications/{APP_ID}/configuration$")).unwrap());
+/// The game's space item list (assets::item_list).
+static ITEMS_ALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?i)^/v1/spaces/{}/items/all$", crate::constants::SPACE_ID)).unwrap());
 
 /// What every request needs; shared by all connections. The services are reached through it
 /// (`state.accounts`, `state.economy`, ...).
@@ -398,6 +401,10 @@ fn fallback(state: &HttpState, req: &Req) -> Reply {
         return Reply { status: 304, headers: vec![], body: vec![], how: "not-modified".into() };
     }
     let query = builtin_http::Query::parse(req.path_qs.split_once('?').map(|(_, q)| q).unwrap_or(""));
+    if let Some(list) = assets.item_list.as_ref().filter(|_| req.method == "GET" && ITEMS_ALL.is_match(req.path())) {
+        let (body, how) = if query.get("fields").is_some() { (&list.version, "items(version)") } else { (&list.full, "items") };
+        return Reply::json(body, how, 200);
+    }
     if let Some(built) = builtin_http::lookup(&req.method, req.path(), &query) {
         // no pack (or not in it): the server's own reply
         let body = storm_config(state, req.path(), &builtin_http::body(&built));
