@@ -436,6 +436,7 @@ async fn run(config: Config) -> Result<()> {
     if assets.synthesizes_offers() {
         assets.local_store = powder_server::assets::local_store(&config.data_dir().join("store_items.json"));
         assets.item_list = powder_server::assets::item_list(&config.data_dir().join("item_list.json"));
+        assets.content_grants = powder_server::assets::content_grants(&config.data_dir().join("content_grants.json"));
     }
     let assets = Arc::new(assets);
     let repos = Arc::new(Repos::new(db));

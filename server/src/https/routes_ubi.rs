@@ -274,7 +274,7 @@ fn get_inventory(c: &Ctx) -> Reply {
     match c.state.repos.player(&pid) {
         // someone this server has no record of: owns nothing
         Ok(None) => Reply::json(&json!({"items": []}), "inventory(unknown player)", 200),
-        Ok(Some(_)) => match c.state.economy.inventory_reply(&pid) {
+        Ok(Some(_)) => match grant_content(c, &pid).and_then(|_| c.state.economy.inventory_reply(&pid)) {
             Ok(body) => Reply::json(&body, "inventory", 200),
             Err(e) => Reply::internal_error(&e),
         },
@@ -335,6 +335,19 @@ fn post_inventory(c: &Ctx) -> Reply {
 /// in the inventory (Ubisoft's store gave it; Powder has no such offer, and the game ignores a synthetic one). So
 /// the lookup is the signal: the asking player is granted the token once. Without it every later save makes the
 /// game replay the intro (found and confirmed in-game 2026-10-26). Never asked before the intro is done.
+/// The content mods' items every player owns (assets::content_grants): granted once, when the inventory is read.
+fn grant_content(c: &Ctx, pid: &str) -> anyhow::Result<()> {
+    for item in &c.state.assets.content_grants {
+        if c.state.repos.quantity(pid, item)? == 0 {
+            match c.state.economy.grant(pid, item, 1, "content mod")? {
+                Ok(_) => log::info!(target: "powder.economy", "{pid}: content item {item} granted"),
+                Err(e) => log::warn!(target: "powder.economy", "content item {item} for {pid}: {}", e.message),
+            }
+        }
+    }
+    Ok(())
+}
+
 pub const ONBOARDING_TOKEN: &str = "8d9430c2-d08f-493e-8028-2fc2d448fdb0";
 
 fn grant_onboarding_token(c: &Ctx, item_ids: &str) {
@@ -1217,6 +1230,28 @@ mod tests {
         let r = handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?type=shop"), &[]));
         assert_eq!(r.how, "catalog(2)");
         assert_eq!(handle(&st, &req("GET", &format!("/v1/spaces/{SPACE_ID}/offers?limit=x"), &[])).status, 500);
+    }
+
+    #[test]
+    fn content_items_are_granted_when_the_inventory_is_read() {
+        let item = "6f1546da-c76a-550d-a133-f4cc39893ecb";
+        let db = Arc::new(crate::db::Db::memory().unwrap());
+        db.migrate().unwrap();
+        let assets = Assets { content_grants: vec![item.into()], ..Default::default() };
+        let services = Services::new(Arc::new(Config::default()), Arc::new(assets),
+                                     Arc::new(crate::repos::Repos::new(db)), None);
+        let st = HttpState { services: Arc::new(services), nex_public_key: "TESTKEY".into(), demux: None };
+        let pid = st.accounts.default_profile_id().unwrap();
+        st.accounts.player(&pid).unwrap();
+        let auth = auth_for(&st, &pid);
+        let auth = [("Authorization", auth.as_str())];
+        let inv = format!("/v1/profiles/{pid}/inventory");
+        for _ in 0..2 {
+            let r = handle(&st, &req("GET", &inv, &auth));
+            assert_eq!((r.status, r.how.as_str()), (200, "inventory"));
+            assert!(body(&r)["items"].as_array().unwrap().iter().any(|i| i["itemId"] == item));
+            assert_eq!(st.repos.quantity(&pid, item).unwrap(), 1, "granted once");
+        }
     }
 
     #[test]

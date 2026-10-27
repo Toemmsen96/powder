@@ -381,6 +381,22 @@ pub fn item_list(path: &Path) -> Option<ItemList> {
     })
 }
 
+/// Items every player gets (`<data>/content_grants.json`, a JSON array of item GUIDs written by
+/// tools/forge/compose.py from the content mods' `grant = true` items): granted when the player's inventory is read
+/// and they lack one. Missing file: none.
+pub fn content_grants(path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read(path) else { return vec![] };
+    let ids: Vec<String> = match serde_json::from_slice::<Vec<String>>(&raw) {
+        Ok(ids) => ids.into_iter().filter(|i| xor_uuid(i).is_some()).map(|i| i.to_lowercase()).collect(),
+        Err(e) => {
+            log::warn!(target: "powder.economy", "{}: not a list of item ids ({e}), left out", path.display());
+            return vec![];
+        }
+    };
+    log::info!(target: "powder.economy", "{}: {} item(s) every player gets", path.display(), ids.len());
+    ids
+}
+
 /// The item of a synthetic offer id (see synthetic_offer).
 pub fn synthetic_item(offer_id: &str) -> Option<String> {
     xor_uuid(offer_id)
@@ -425,6 +441,8 @@ pub struct Assets {
     pub local_store: OfferCatalog,
     /// The space's item list, when one is served instead of Ubisoft's (item_list).
     pub item_list: Option<ItemList>,
+    /// Items every player owns: the content mods' grants (content_grants).
+    pub content_grants: Vec<String>,
     pub actions: Vec<Value>,
     pub connect_http: HttpFixtures,
     pub products: ConnectProducts,
