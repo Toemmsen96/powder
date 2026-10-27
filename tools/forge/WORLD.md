@@ -234,6 +234,18 @@ In every cell the placed objects come first, and the placed count equals the num
 7. Far LODs: whether a moved object also lives in baked far-LOD data (`LodData`, 4 MB in the Alps world datafile,
    `STP_ProxyLOD`), so that it would still show at its old place from afar.
 
+## Live edits: what memory writes do (2026-10-27)
+
+`tools/trainer/findobj.py` finds a placed object's matrix in the running game: each static prop (bench, barrier,
+icicles in the Alps) is held as the cell's exact 4x4 about 6-8 times (3 copies 0x150 apart, a pair 0x40 apart, one
+more) plus a "bare" position copy; searching by rotation rows finds no other copy (no origin-relative one). Writing
+a new position into all of them (51 copies of 7 props, +3 m) changes **nothing visible**; moving one 256 m away made
+no difference either. The values stay as written until the cell streams out; on the way back the cell is read from
+the archives again (the writes are gone). So static props are drawn from data built at cell load (GPU instance
+buffers, `FillBatchInstanceBuffer...`), not from these copies. Live edits need either the engine's own
+"transform changed" path for an entity (RE: what dynamic objects call) or the cell's data replaced when it is read
+(a file-read hook in the client serving edited cells as the player rides back in). Not pursued yet.
+
 ## Related work
 
 - Sean Shmulevich's [steep-gameplay-research](https://github.com/Sean-Shmulevich/steep-gameplay-research) (gameplay
