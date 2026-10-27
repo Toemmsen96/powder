@@ -50,22 +50,35 @@ BASE = "DataPC_extra_chr"
 QUARTERS = [("chiefarmor", (0.0, 0.0, 0.5, 0.5)), ("chiefsuit", (0.5, 0.0, 0.5, 0.5)),
             ("chiefhelmet", (0.0, 0.5, 0.5, 0.5)), ("chiefvisor", (0.5, 0.5, 0.5, 0.5))]
 PRESETS = {
+    # the military costume (COSTUME_M_MILITARY_GREY_94 / _RED_95) is a gear set: Chief goes into its coat
+    # (JACKET_MF_C_Military_233/234 -> STP_M_Jacket_013 / STP_F_Jacket_010), the set's pants, helmet (with the skull
+    # mask) and harness shrink (hide); the gloves are the shared STP_MF_Gloves_001 and stay. The coat's embedded
+    # material holds the shared placeholder set, its colourways T01/T02 the real ones.
+    "military": {"costumes": {"M": "STP_M_Jacket_013", "F": "STP_F_Jacket_010"},
+                 "layout": {"STP_MF_Jacket_013_ALL": QUARTERS},
+                 "collapse": [], "embedded": False,
+                 "colourways": {"STP_MF_Jacket_013_ALL": r"STP_MF_Jacket_013_T\d+"},
+                 "hide": ["STP_M_Pants_011", "STP_F_Pants_009", "STP_M_HelmetFun_048", "STP_F_HelmetFun_048",
+                          "STP_M_Backpack_002", "STP_F_Backpack_002", "STP_M_BackpackBelt_002_Default",
+                          "STP_M_BackpackBelt_002_Large", "STP_M_BackpackBelt_NoBellyStrap_002",
+                          "STP_F_BackpackBelt_Default_002", "STP_F_BackpackBelt_Large_002",
+                          "STP_F_BackpackBelt_NoBellyStrap_002"]},
     "penguin": {"costumes": {"M": "STP_M_Costume_005", "F": "STP_F_Costume_005"},
                 "layout": {"STP_MF_Costume_005": QUARTERS},
                 "collapse": ["STP_MF_Costume_005_HEAD", "0x9c6dd89793", "0x9c6dd897bb"],  # head, goggle, glass
-                "colourways": {}},
+                "colourways": {}, "embedded": True, "hide": []},
     "urban_japan": {"costumes": {"M": "STP_M_Costume_016", "F": "STP_F_Costume_016"},
                     "layout": {"STP_MF_Costume_016_Jacket_ALL": [("chiefarmor", (0.0, 0.0, 1.0, 1.0))],
                                "STP_MF_Costume_016_Pants_ALL": [("chiefsuit", (0.0, 0.0, 1.0, 1.0))],
                                "STP_MF_Costume_016_Helmet_ALL": [("chiefhelmet", (0.0, 0.0, 0.5, 1.0)),
                                                                  ("chiefvisor", (0.5, 0.0, 0.5, 1.0))]},
-                    "collapse": ["STP_MF_Glass_ALL"],
+                    "collapse": ["STP_MF_Glass_ALL"], "embedded": True, "hide": [],
                     "colourways": {f"STP_MF_Costume_016_{p}_ALL": rf"STP_MF_Costume_016_{p}_T\d+"
                                    for p in ("Jacket", "Pants", "Helmet")}},
 }
-DEFAULT_TARGET = "penguin"
-COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS = (PRESETS[DEFAULT_TARGET][k] for k in ("costumes", "layout", "collapse",
-                                                                              "colourways"))
+DEFAULT_TARGET = "military"
+KEYS = ("costumes", "layout", "collapse", "colourways", "embedded", "hide")
+COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[DEFAULT_TARGET][k] for k in KEYS)
 SLOTS = {0: "diffuse", 1: "normal", 2: "specular", 7: "mask"}  # TextureSet slot -> map
 FALLBACK = ("Pants", "Glove", "Jacket")  # gear of the same gender searched for bones the costume lacks
 SIZE, PAD = 2048, 6 / 2048
@@ -243,7 +256,8 @@ def texture_sets(game: str) -> dict:
     out = {}
     for mat in LAYOUT:
         payload = by_name[mat].payload
-        sets = [slots(next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload))]
+        sets = [slots(next(r for r in s.resources if r.type == 0xD70E6670 and struct.pack("<Q", r.id) in payload))
+                ] if EMBEDDED else []  # without: the embedded set is a shared placeholder
         pattern = COLOURWAYS.get(mat)
         for e in fg.entries if pattern else ():
             if e.type == 0x85C817C3 and re.fullmatch(pattern, e.name):
@@ -258,8 +272,8 @@ def texture_sets(game: str) -> dict:
 # --- output ---------------------------------------------------------------------------------------------------------
 
 def maps(model: str, out: str) -> dict:
-    """Per Steep material its 4 maps from the model's materials, each in its rectangle (upright, as texture.py
-    takes them). Returns {material: {map: png path}}."""
+    """Per Steep material its 4 maps from the model's materials, each in its rectangle, row 0 at v = 0 (as the game
+    samples UV-mapped textures: texture.py replace --raw-rows). Returns {material: {map: png path}}."""
     tex = os.path.join(model, "textures")
     res = {}
     for mat, parts in LAYOUT.items():
@@ -372,9 +386,8 @@ def main():
     ap.add_argument("--glb", help="also keep the fitted models, <this>_M.glb and <this>_F.glb (to look at in Blender)")
     ap.add_argument("--target", choices=sorted(PRESETS), default=DEFAULT_TARGET, help="the costume Chief replaces")
     a = ap.parse_args()
-    global COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS
-    COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS = (PRESETS[a.target][k] for k in ("costumes", "layout", "collapse",
-                                                                            "colourways"))
+    global COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE
+    COSTUMES, LAYOUT, COLLAPSE, COLOURWAYS, EMBEDDED, HIDE = (PRESETS[a.target][k] for k in KEYS)
     g = gltf.load(os.path.join(a.model, "scene.gltf"))
     steep, skin, mpos = model_bones(g)
     parts = model_geometry(g, skin)
@@ -406,8 +419,18 @@ def main():
                 for k, tid in ids.items():
                     for base in sorted({b for b, e in where if int(e, 16) == tid}):
                         run(os.path.join(TOOLS, "texture.py"), "replace", os.path.join(a.game, base + ".forge"),
-                            f"{tid:#x}", "--image", pngs[mat][k], "-o", os.path.join(a.out, base))
+                            f"{tid:#x}", "--image", pngs[mat][k], "--raw-rows", "-o", os.path.join(a.out, base))
                 print(f"  {mat}: colourway {n + 1} of {len(lst)}, {len(ids)} maps")
+        # the rest of a gear-set costume, shrunk to a point wherever its meshes are
+        arch = os.path.join(a.game, BASE + ".forge")
+        def mesh_ids(name):
+            return [r.id for _, r in mesh.mesh_resources(mesh.load_source(arch, name), None)]
+        mine = holders(a.game, [i for c in COSTUMES.values() for i in mesh_ids(c)]) if HIDE else set()
+        for name in HIDE:
+            for base, entry in sorted(holders(a.game, mesh_ids(name)) - mine):
+                run(os.path.join(TOOLS, "mesh.py"), "edit", os.path.join(a.game, base + ".forge"), entry,
+                    "--scale", "0.001", "-o", os.path.join(a.out, base))
+            print(f"  hidden: {name}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

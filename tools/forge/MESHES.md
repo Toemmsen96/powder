@@ -112,8 +112,9 @@ Sections and draw lists:
   skinned meshes compared with UV-gradient frames, mean dot per mesh +0.6..+1.0 and -0.6..-1.0, mostly +-0.9..1).
 - **UVs**: i16x2, `* X / 32767`, with v pointing down (D3D). When X > 0, the largest |value| over the UV columns
   (uv0 and uv1 together) is exactly 32767, so X is the range the UVs were normalised to (C on all sampled meshes;
-  fmt 2 meshes reach it in uv1 when uv0 does not). Checked against the texture: the jacket's UV island borders,
-  drawn over its decoded 512x512 BC1 diffuse map, follow the painted panels exactly (C).
+  fmt 2 meshes reach it in uv1 when uv0 does not). v = 0 is the texture's first stored row (C: seam colours agree
+  that way, 45 against 131 with rows flipped, on the jacket; and an atlas written flipped showed swapped quarters
+  in the game; TEXTURES.md). The earlier check against texture.py's upright export did not tell the two apart.
 - **Skinning**: up to 4 influences. `bones` are u8 slots into the submesh's bone map, the map entry is an index
   into the mesh's bone list, and `weights` are u8 summing to 255 (C: every sampled skinned vertex). Unused slots
   trail, as bone 0 / weight 0; the used ones are in no fixed order (C: 20 % of the onboarding archive's 502,887

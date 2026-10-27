@@ -1180,8 +1180,9 @@ def guess_parents(rest: dict[int, list]) -> dict[int, int | None]:
 
 
 def diffuse_png(s: Source, mat_id: int, archive: str | None, cache: dict) -> tuple[bytes, str] | None:
-    """The material's diffuse texture (TextureSet slot 0) as PNG, upright as texture.py exports it: the top level
-    stored inline in its TextureMap (Mip levels are not fetched). Needs numpy; None where it cannot be found."""
+    """The material's diffuse texture (TextureSet slot 0) as PNG in storage order, row 0 at v = 0 as the game samples
+    it (seam colours agree that way; texture.py export flips rows, which is right for UI textures only): the top
+    level stored inline in its TextureMap (Mip levels are not fetched). Needs numpy; None where it cannot be found."""
     try:
         import texture
     except ImportError:
@@ -1209,7 +1210,7 @@ def diffuse_png(s: Source, mat_id: int, archive: str | None, cache: dict) -> tup
     if t.fmt not in texture.FORMATS or t.dim != 1:
         return None
     w, h, _ = texture.level_dims(t.width, t.height, t.depth, t.first_level)
-    img = texture.decode_level(t.fmt, t.data, w, h)[::-1]  # rows are stored bottom-up
+    img = texture.decode_level(t.fmt, t.data, w, h)
     return texture.png_bytes(img[:, :, :3]), res.name
 
 

@@ -73,9 +73,14 @@ largest first, each tightly packed (C). A level is `ceil(w/4) * ceil(h/4) * bloc
 `w * h * pixel bytes`. Each side halves (rounding down, at least 1) per level. With mip count 0 or 1 the data holds
 only level n.
 
-**Rows are stored bottom-up** (C on UI textures: logos, button glyphs, figures and the crash-test dummy all come
-out upside down when decoded in storage order. G for the UV-mapped textures, whose orientation the eye cannot
-judge). `export` therefore flips the image upright and `replace` flips it back (`--raw-rows` turns this off).
+**UI textures are stored bottom-up** (C: logos, button glyphs, figures and the crash-test dummy all come out upside
+down when decoded in storage order). `export` therefore flips the image upright and `replace` flips it back.
+**UV-mapped textures (characters, props) are not: the game samples row 0 at v = 0** (C, 2026-10-27). At a UV seam
+(two vertices at one position with different UVs) the texture colours on both sides should agree. Sampled in
+storage order they differ by 45 on average over the jacket's 573 seam pairs, and by 131 with the flip. The pants
+give 178 against 222. In-game proof: Master Chief's atlas written with the flip showed its suit quarter's
+texture swapped with the visor's (the quarters below). **Use `--raw-rows` for textures of meshes**, and PNGs whose
+row 0 is v = 0, as `mesh.py export --textures` now writes them.
 `texture.py`'s round trip was checked: export the jacket's diffuse, `replace --image` with that PNG, and level 0
 comes back at 48.8 dB (12 dB if the flip were wrong).
 

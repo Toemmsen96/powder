@@ -1,23 +1,18 @@
 # master_chief: a costume from a downloaded model
 
-This mod turns the **penguin costume** into Master Chief, for male and female riders. A skinned glTF model from
-Sketchfab is fitted onto Steep's skeleton and replaces the costume's mesh in all 4 LODs, and its textures replace the
-costume's. A costume is a whole-body item: the game takes the rest of the
-outfit off while it is worn, so nothing else is touched.
+This mod turns the **military costume** (`COSTUME_M_MILITARY_GREY_94` / `_RED_95`) into Master Chief, for male and
+female riders. A skinned glTF model from Sketchfab is fitted onto Steep's skeleton. Chief replaces the costume's coat
+in all 4 LODs, his textures replace the coat's, and the rest of the set (pants, helmet, harness) shrinks to a point.
+`make_chief.py --target penguin` or `--target urban_japan` puts him on those costumes instead.
 
 **Model:** "Master Chief High Poly" by HarrisonHag1, licensed CC-BY-4.0
 (https://sketchfab.com/3d-models/master-chief-high-poly-18f5ee1d13904939971601055102c91b). This work is based on it.
 The model is not in git (`models/` is ignored). Download it as glTF and unpack it into
 `models/master_chief_high_poly/` (`scene.gltf`, `scene.bin`, `textures/`), then run `mods/master_chief/generate.sh`.
 
-**An addition instead of a replacement is not possible yet** (TODO.md). A new costume needs:
-- a new item in `Game Bootstrap Settings`, one 146 MB datafile of 17,292 resources, and whatever lists reference
-  it (store, unlocks);
-- a selector entry in the character template;
-- an icon and a localized name;
-- ownership from the server.
-
-Most of those formats are not decoded.
+**An addition instead of a replacement** is the next step: `tools/forge/items.py add-costume` (mods/custom_costume_test)
+adds a new costume, and the game loads it into its costume list (seen in its memory, 2026-10-27). How to make it
+show up and be owned (it has no store GUID) is still open.
 
 ## Which costume
 
@@ -38,21 +33,21 @@ selectors map a tag of the item to the costume's own selector, which names the e
 | `_017` | 90s* |
 
 The first costume version replaced 016 on the guess that it was the military costume. It is not: the military
-costume is made of regular gear (coat, pants, gloves, harness, helmet). And 016's items are not in the store, so
-nobody could equip it. The penguin is in the store and covers the head. `make_chief.py --target urban_japan` still
-builds the 016 version.
+costume is a bundle of regular gear: coat `JACKET_MF_C_Military_233/234` -> `STP_M_Jacket_013` / `STP_F_Jacket_010`,
+pants -> `STP_M_Pants_011` / `STP_F_Pants_009`, helmet with the skull mask -> `STP_M/F_HelmetFun_048`, harness ->
+`STP_M/F_Backpack_002` + belts, gloves -> the shared `STP_MF_Gloves_001` (`items.py show <item>`). 016's items are not
+in the store, so nobody could equip it. The penguin version was seen in the game (with flipped textures, below).
 
 ## What changes
 
 | what | entries (all in `DataPC_extra_chr`) | how |
 |---|---|---|
-| the male costume | `STP_M_Costume_005` (entity) with LOD0..3 | `mesh.py import --glb`: the whole model into the body submesh (`STP_MF_Costume_005`); the head, the goggle and the glass submeshes shrunk to one 1 mm triangle each; 63,200 vertices, 56,074 triangles in every LOD |
-| the female costume | `STP_F_Costume_005` with LOD0..3 | the same, fitted to the female skeleton |
-| the textures | the penguin's texture set (4 maps, with `_Mip0`/`_Mip1`) | `texture.py replace`: armour, suit, helmet and visor packed 2x2 |
+| the coat | `STP_M_Jacket_013`, `STP_F_Jacket_010` (entities, LOD0..3) | `mesh.py import --glb`: the whole model into the coat's one submesh; 63,200 vertices, 56,074 triangles in every LOD |
+| the textures | the coat's two colourways (`STP_MF_Jacket_013_T01`, `_T02`: 2 texture sets x 4 maps, with `_Mip0`/`_Mip1`) | `texture.py replace --raw-rows`: armour, suit, helmet and visor packed 2x2. The coat's embedded material holds the shared placeholder set, which stays |
+| the rest of the set | pants, helmet, harness and belts (M and F, 12 entities) | `mesh.py edit --scale 0.001` |
 
-The goggle and glass materials are shared with other gear (`STP_MF_Goggle_001_T15`, `STP_MF_Glass_T23`), so their
-textures stay as they are and only the costume's geometry goes. Every penguin costume a rider wears becomes Master
-Chief.
+Every item that uses these models becomes Chief (or vanishes): the coat model in other colourways, the pants,
+helmet and harness on their own.
 
 `mods/shoulder_pads`, `mods/mesh_edit` and `mods/custom_texture` change the jacket, not this costume, so they can
 run alongside this mod.
@@ -60,7 +55,7 @@ run alongside this mod.
 ## What you should see
 
 With Powder's store (no game-data pack, `data/store_items.json` from `tools/trainer/storemap.py`), every costume is a
-free offer. Take the **penguin** under Costumes & Equipments and equip it. The rider becomes Master Chief: green
+free offer. Take the **military** costume (grey or red) under Costumes & Equipments and equip it. The rider becomes Master Chief: green
 armour, black undersuit and the gold visor, about 1.9 m tall (a little smaller on female riders). He moves with the
 rider's animations (arms, legs, fingers), because his own skin weights were renamed to Steep's bones.
 
@@ -83,6 +78,8 @@ rider's animations (arms, legs, fingers), because his own skin weights were rena
      ambient occlusion), is set to the default jacket's average.
    - **Specular:** from metalness and roughness.
    - **Mask1:** R = 0. With R = 255 (the jackets' "fabric"), the dark undersuit turned pale cream in the game.
+   - Written with `--raw-rows`: the game samples row 0 at v = 0. The first costume versions were written flipped,
+     so the suit's quarter showed the visor's texture (pale tan patches) - TEXTURES.md.
 
 ## History
 
